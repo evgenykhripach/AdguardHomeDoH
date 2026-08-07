@@ -1,0 +1,16 @@
+openai.com.,suffix
+chatgpt.com.,suffix
+oaistatic.com.,suffix
+oaiusercontent.com.,suffix
+api.anthropic.com.,fqdn
+claude.ai.,suffix
+gemini.google.com.,fqdn
+generativelanguage.googleapis.com.,fqdn
+githubcopilot.com.,suffix
+copilot.microsoft.com.,fqdn
+perplexity.ai.,suffix
+grok.com.,suffix
+cli-chat-proxy.grok.com.,fqdn
+auth.x.ai.,fqdn
+api.x.ai.,fqdn
+midjourney.com.,suffix
