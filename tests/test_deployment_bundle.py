@@ -147,6 +147,28 @@ class DeploymentBundleTests(unittest.TestCase):
             self.assertNotEqual(0, bad.returncode)
             self.assertFalse((bad_root / "usr/local/libexec/sniproxy/v2.3.0/sniproxy").exists())
 
+    def test_mmdb_validator_uses_ubuntu_mmdblookup_ip_option(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            database = fixture / "GeoIP.mmdb"
+            database.write_bytes(b"non-empty-test-fixture")
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            lookup = fake_bin / "mmdblookup"
+            lookup.write_text(
+                "#!/bin/sh\n"
+                'test "$1" = --file && test "$2" = "$EXPECTED_MMDB" && '
+                'test "$3" = --ip && test "$4" = 1.1.1.1\n',
+                encoding="utf-8",
+            )
+            lookup.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            env["EXPECTED_MMDB"] = str(database)
+            result = run(str(VALIDATE_MMDB), "--path", str(database), env=env)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("valid MMDB", result.stdout)
+
     def test_install_forwards_verified_prebuilt_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "sandbox"
@@ -173,7 +195,10 @@ class DeploymentBundleTests(unittest.TestCase):
         self.assertLess(sync.index('if ((CHECK_ONLY)); then'), sync.index('CERT="$(dohdns_under_root'))
         hook = (ROOT / "deploy/templates/certbot-deploy-hook.sh.tmpl").read_text(encoding="utf-8")
         self.assertLess(hook.index("sync-cert.sh"), hook.index("try-restart"))
-        self.assertIn("RuntimeDirectory=sniproxy", (ROOT / "deploy/templates/sniproxy.service.tmpl").read_text())
+        service = (ROOT / "deploy/templates/sniproxy.service.tmpl").read_text()
+        self.assertIn("RuntimeDirectory=sniproxy", service)
+        self.assertIn("sniproxy --config /etc/sniproxy/current/sniproxy.yaml", service)
+        self.assertNotIn("sniproxy -config ", service)
 
     def test_nft_rate_limits_have_terminal_drops_and_persistent_unit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

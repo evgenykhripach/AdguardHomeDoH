@@ -37,5 +37,5 @@ command -v mmdblookup >/dev/null 2>&1 || dohdns_die "mmdblookup is required to v
 # A known public address exercises both metadata parsing and the database
 # reader. The result may be any country; policy enforcement happens in
 # sniproxy with the local RU database.
-mmdblookup --file "$PATH_VALUE" 1.1.1.1 >/dev/null 2>&1 || dohdns_die "mmdblookup rejected GeoIP database: $PATH_VALUE"
+mmdblookup --file "$PATH_VALUE" --ip 1.1.1.1 >/dev/null 2>&1 || dohdns_die "mmdblookup rejected GeoIP database: $PATH_VALUE"
 printf 'valid MMDB: %s\n' "$PATH_VALUE"

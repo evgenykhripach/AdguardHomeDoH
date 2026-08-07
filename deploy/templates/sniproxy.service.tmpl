@@ -13,7 +13,7 @@ RuntimeDirectory=sniproxy
 Environment=NO_COLOR=true
 ExecStartPre=/usr/local/libexec/dohdns/validate-mmdb.sh --path /var/lib/dohdns/geoip/Country-without-asn.mmdb
 ExecStartPre=/usr/local/libexec/dohdns/sync-cert.sh --root / --check
-ExecStart=/usr/local/libexec/sniproxy/current/sniproxy -config /etc/sniproxy/current/sniproxy.yaml
+ExecStart=/usr/local/libexec/sniproxy/current/sniproxy --config /etc/sniproxy/current/sniproxy.yaml
 Restart=on-failure
 RestartSec=2s
 AmbientCapabilities=CAP_NET_BIND_SERVICE
