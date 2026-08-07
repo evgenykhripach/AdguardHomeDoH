@@ -24,10 +24,20 @@ if [[ -z "$RULES" ]]; then
     RULES="$(dohdns_under_root "$ROOT" /etc/nftables.d/dohdns.nft)"
 fi
 [[ -f "$RULES" ]] || dohdns_die "nftables include missing: $RULES"
-grep -Eq '^[[:space:]]*table[[:space:]]+inet[[:space:]]+dohdns[[:space:]]*\{' "$RULES" || dohdns_die "rules must define table inet dohdns"
-if grep -Eq 'flush[[:space:]]+ruleset|delete[[:space:]]+table[[:space:]]+(ip|ip6|bridge|arp)' "$RULES"; then
-    dohdns_die "rules may only describe table inet dohdns"
-fi
+awk '
+    {
+        line = $0
+        sub(/[[:space:]]*#.*/, "", line)
+        if (line ~ /^[[:space:]]*table[[:space:]]+/) {
+            tables++
+            if (line !~ /^[[:space:]]*table[[:space:]]+inet[[:space:]]+dohdns[[:space:]]*\{[[:space:]]*$/) bad_table=1
+        }
+        if (line ~ /(^|[[:space:]])(include|define|flush|add|delete)([[:space:]]|$)/) bad_directive=1
+    }
+    END {
+        if (tables != 1 || bad_table || bad_directive) exit 1
+    }
+' "$RULES" || dohdns_die "rules must contain exactly one table inet dohdns and no include/define/flush/add/delete directives"
 
 if dohdns_is_sandbox "$ROOT"; then
     destination="$(dohdns_under_root "$ROOT" /etc/nftables.d/dohdns.nft)"
@@ -37,8 +47,20 @@ if dohdns_is_sandbox "$ROOT"; then
 fi
 
 command -v nft >/dev/null 2>&1 || dohdns_die "nft is required on the real host"
-# Delete only our own table. A first install has no table, so tolerate that
-# error; never flush the complete ruleset or touch fail2ban/other tables.
-nft delete table inet dohdns >/dev/null 2>&1 || true
-nft -f "$RULES"
+# Syntax-check the input before changing any live rules. When replacing an
+# existing table, delete and recreate only our table in one nft transaction;
+# nft keeps the prior transaction intact if either statement fails. The
+# existing-table preflight must use the same delete-plus-rules batch, because a
+# standalone check of the create-only file can conflict with live objects.
+if nft list table inet dohdns >/dev/null 2>&1; then
+    nft_batch() {
+        printf 'delete table inet dohdns\n'
+        cat -- "$RULES"
+    }
+    nft_batch | nft -c -f -
+    nft_batch | nft -f -
+else
+    nft -c -f "$RULES"
+    nft -f "$RULES"
+fi
 printf 'applied isolated nftables table inet dohdns\n'

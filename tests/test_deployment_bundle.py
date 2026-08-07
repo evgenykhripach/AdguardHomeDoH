@@ -252,6 +252,33 @@ class DeploymentBundleTests(unittest.TestCase):
             self.assertEqual(0, rolled.returncode, rolled.stderr)
             self.assertEqual(generation_a, os.readlink(current))
 
+    def test_inventory_is_generation_owned_and_rollback_restores_previous_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            sandbox = base / "sandbox"
+            inventory_a = json.loads(json.dumps(self.inventory))
+            inventory_b = json.loads(json.dumps(self.inventory))
+            inventory_a["rates"]["dns_packets_per_second"] = 100
+            inventory_b["rates"]["dns_packets_per_second"] = 101
+            path_a = base / "inventory-a.json"
+            path_b = base / "inventory-b.json"
+            path_a.write_text(json.dumps(inventory_a), encoding="utf-8")
+            path_b.write_text(json.dumps(inventory_b), encoding="utf-8")
+
+            first = run(str(INSTALL), "--inventory", str(path_a), "--root", str(sandbox))
+            self.assertEqual(0, first.returncode, first.stderr)
+            installed_inventory = sandbox / "etc/dohdns/inventory.json"
+            self.assertEqual(100, json.loads(installed_inventory.read_text())["rates"]["dns_packets_per_second"])
+            second = run(
+                str(INSTALL), "--inventory", str(path_b), "--root", str(sandbox), "--force-new-generation"
+            )
+            self.assertEqual(0, second.returncode, second.stderr)
+            self.assertEqual(101, json.loads(installed_inventory.read_text())["rates"]["dns_packets_per_second"])
+
+            rolled = run(str(ROLLBACK), "--root", str(sandbox))
+            self.assertEqual(0, rolled.returncode, rolled.stderr)
+            self.assertEqual(100, json.loads(installed_inventory.read_text())["rates"]["dns_packets_per_second"])
+
     def test_failed_post_activation_install_restores_previous_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sandbox = Path(directory) / "sandbox"
@@ -282,6 +309,223 @@ class DeploymentBundleTests(unittest.TestCase):
             self.assertIn("tcp dport { 53, 80, 443, 853 }", nft)
             self.assertIn("udp dport { 443, 853 } drop", nft)
             result = run(str(APPLY_NFT), "--root", str(Path(directory) / "sandbox"), "--rules", str(output / "etc/nftables.d/dohdns.nft"))
+            self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_root_rejects_lexical_parent_and_symlink_escape_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            escaped = base / "escaped"
+            lexical = base / "sandbox" / ".." / "escaped"
+            lexical_result = run(
+                str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(lexical), "--dry-run"
+            )
+            self.assertNotEqual(0, lexical_result.returncode)
+            self.assertFalse(escaped.exists())
+
+            outside = base / "outside"
+            outside.mkdir()
+            link = base / "root-link"
+            link.symlink_to(outside, target_is_directory=True)
+            linked_result = run(
+                str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(link), "--dry-run"
+            )
+            self.assertNotEqual(0, linked_result.returncode)
+            self.assertEqual([], list(outside.iterdir()))
+            with self.assertRaises(ValueError):
+                render_deployment(self.inventory, base / "sandbox" / ".." / "escaped-stage")
+            with self.assertRaises(ValueError):
+                render_deployment(self.inventory, link / "escaped-stage")
+
+    def test_apply_nftables_rejects_extra_table_and_mutating_directives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "root"
+            valid = "table inet dohdns { chain input { type filter hook input priority filter; policy accept; } }\n"
+            invalid = {
+                "extra-table": valid + "table inet other {}\n",
+                "include": "include \"other.nft\"\n" + valid,
+                "define": "define bad = 1\n" + valid,
+                "flush": "flush ruleset\n" + valid,
+                "add": "add table inet other\n" + valid,
+                "delete": "delete table inet dohdns\n" + valid,
+            }
+            for name, body in invalid.items():
+                with self.subTest(name=name):
+                    rules = base / f"{name}.nft"
+                    rules.write_text(body, encoding="utf-8")
+                    result = run(str(APPLY_NFT), "--root", str(root), "--rules", str(rules))
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertFalse((root / "etc/nftables.d/dohdns.nft").exists())
+
+    def test_install_host_restore_contract_covers_resolver_nginx_nft_and_units(self) -> None:
+        """Host rollback is source-checked because the sandbox skips host tooling."""
+        install = INSTALL.read_text(encoding="utf-8")
+        for expected in (
+            "DOHDNS_PREVIOUS_RESOLV_KIND",
+            "DOHDNS_PREVIOUS_RESOLV_BACKUP",
+            "DOHDNS_PREVIOUS_NGINX_SITE",
+            "/etc/resolv.conf",
+            "/etc/nginx/sites-enabled/dohdns.conf",
+            "apply-nftables.sh\" --root / --rules",
+            "nft delete table inet dohdns",
+            "systemctl stop dohdns-nftables.service",
+            "systemctl disable dohdns-nftables.service",
+            "systemctl stop dohdns-geoip-update.timer",
+            "systemctl disable dohdns-geoip-update.timer",
+            "systemctl stop sniproxy",
+            "systemctl disable sniproxy",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, install)
+
+    def test_dirty_first_install_refuses_before_build_and_preserves_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sandbox"
+            inventory_destination = root / "etc/dohdns/inventory.json"
+            inventory_destination.parent.mkdir(parents=True)
+            sentinel = b'{"sentinel":"preexisting-policy"}\n'
+            inventory_destination.write_bytes(sentinel)
+            result = run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(root))
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(sentinel, inventory_destination.read_bytes())
+            self.assertFalse((root / "var/lib/dohdns").exists())
+            self.assertFalse((root / "usr/local/libexec/sniproxy/v2.3.0/sniproxy").exists())
+            self.assertFalse((root / "etc/sniproxy/current").exists())
+
+    def test_dirty_first_install_refuses_over_preexisting_runtime_artifacts(self) -> None:
+        protected = (
+            "var/lib/dohdns",
+            "usr/local/libexec/sniproxy/v2.3.0",
+            "etc/sniproxy/tls",
+            "var/www/acme",
+            "etc/letsencrypt/live/dns.pressroll.ru",
+            "etc/letsencrypt/archive/dns.pressroll.ru",
+            "etc/letsencrypt/renewal/dns.pressroll.ru.conf",
+        )
+        for relative in protected:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "sandbox"
+                path = root / relative
+                if path.suffix == ".conf":
+                    path.parent.mkdir(parents=True)
+                    path.write_bytes(b"preexisting-certificate-state")
+                    sentinel = path
+                else:
+                    path.mkdir(parents=True)
+                    sentinel = path / "sentinel"
+                    sentinel.write_bytes(b"preexisting-runtime-state")
+                result = run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(root))
+                self.assertNotEqual(0, result.returncode)
+                self.assertTrue(sentinel.exists())
+                self.assertIn(b"preexisting", sentinel.read_bytes())
+                self.assertFalse((root / "etc/sniproxy/current").exists())
+
+    def test_update_refuses_tampered_generation_owned_symlink_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "sandbox"
+            first = run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(root))
+            self.assertEqual(0, first.returncode, first.stderr)
+            inventory = root / "etc/dohdns/inventory.json"
+            external = base / "external-inventory"
+            external.write_bytes(b"external-sentinel")
+            inventory.unlink()
+            inventory.symlink_to(external)
+            active_before = (root / "var/lib/dohdns/active-generation").read_bytes()
+
+            result = run(
+                str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(root),
+                "--force-new-generation",
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertTrue(inventory.is_symlink())
+            self.assertEqual(b"external-sentinel", external.read_bytes())
+            self.assertEqual(active_before, (root / "var/lib/dohdns/active-generation").read_bytes())
+
+    def test_generation_state_rejects_path_traversal_before_install_or_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sandbox"
+            first = run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(root))
+            self.assertEqual(0, first.returncode, first.stderr)
+            state = root / "var/lib/dohdns"
+            active = state / "active-generation"
+            previous = state / "previous-generation"
+            valid_active = active.read_text(encoding="utf-8")
+            external = root / "outside-gen"
+            external.mkdir()
+            malicious = "../../../../outside-gen"
+
+            active.write_text(malicious + "\n", encoding="utf-8")
+            update = run(
+                str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(root),
+                "--force-new-generation",
+            )
+            self.assertNotEqual(0, update.returncode)
+            self.assertEqual([], list(external.iterdir()))
+
+            active.write_text(valid_active, encoding="utf-8")
+            previous.write_text(malicious + "\n", encoding="utf-8")
+            rollback = run(str(ROLLBACK), "--root", str(root))
+            self.assertNotEqual(0, rollback.returncode)
+            self.assertEqual([], list(external.iterdir()))
+
+    def test_install_clean_first_preflight_covers_runtime_and_artifact_contract(self) -> None:
+        install = INSTALL.read_text(encoding="utf-8")
+        self.assertLess(install.index("assert_clean_first_install"), install.index("apt-get update"))
+        self.assertIn("etc/dohdns/inventory.json", install)
+        self.assertIn("systemctl list-unit-files", install)
+        self.assertIn("nft list table inet dohdns", install)
+        for expected in (
+            "DOHDNS_PREVIOUS_NGINX_ACTIVE",
+            "DOHDNS_PREVIOUS_NGINX_ENABLED",
+            "DOHDNS_PREVIOUS_RESOLVED_ACTIVE",
+            "/var/www/acme",
+            "/etc/sniproxy/tls",
+            "/var/lib/dohdns/geoip",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, install)
+
+    def test_apply_nftables_replaces_existing_table_transactionally(self) -> None:
+        """The real-host path must preflight and batch replacement through nft stdin."""
+        apply = APPLY_NFT.read_text(encoding="utf-8")
+        self.assertIn("nft -c -f", apply)
+        self.assertIn("nft -f -", apply)
+        self.assertNotIn("nft delete table inet dohdns >/dev/null", apply)
+
+    def test_rollback_failure_restores_original_state_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = Path(directory) / "sandbox"
+            self.assertEqual(0, run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(sandbox)).returncode)
+            current = sandbox / "usr/local/libexec/sniproxy/current"
+            generation_a = os.readlink(current)
+            self.assertEqual(0, run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(sandbox), "--force-new-generation").returncode)
+            generation_b = os.readlink(current)
+            active_before = (sandbox / "var/lib/dohdns/active-generation").read_text(encoding="utf-8")
+            previous_before = (sandbox / "var/lib/dohdns/previous-generation").read_text(encoding="utf-8")
+            failed = run(
+                str(ROLLBACK), "--root", str(sandbox),
+                env={**os.environ, "DOHDNS_TEST_FAIL_ROLLBACK_AFTER_ACTIVATION": "1"},
+            )
+            self.assertNotEqual(0, failed.returncode)
+            self.assertEqual(generation_b, os.readlink(current))
+            self.assertEqual(active_before, (sandbox / "var/lib/dohdns/active-generation").read_text(encoding="utf-8"))
+            self.assertEqual(previous_before, (sandbox / "var/lib/dohdns/previous-generation").read_text(encoding="utf-8"))
+            self.assertNotEqual(generation_a, generation_b)
+
+    def test_installed_update_has_renderer_resources_and_uses_root_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sandbox = Path(directory) / "sandbox"
+            first = run(str(INSTALL), "--inventory", str(INVENTORY_PATH), "--root", str(sandbox))
+            self.assertEqual(0, first.returncode, first.stderr)
+            app = sandbox / "usr/local/libexec/dohdns"
+            self.assertTrue((app / "tools/render_deployment.py").is_file())
+            self.assertTrue((app / "tools/validator.py").is_file())
+            self.assertTrue((app / "deploy/templates/sniproxy.yaml.tmpl").is_file())
+            result = run(
+                str(app / "update.sh"), "--root", str(sandbox), "--force-new-generation",
+                env={**os.environ, "DOHDNS_PROJECT_ROOT": str(base := Path(directory) / "removed-checkout")},
+            )
             self.assertEqual(0, result.returncode, result.stderr)
 
     def test_resolver_has_no_loop(self) -> None:

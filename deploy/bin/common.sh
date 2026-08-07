@@ -16,8 +16,37 @@ dohdns_die() {
 dohdns_abs_root() {
     local value="${1:-/}"
     [[ "$value" == /* ]] || dohdns_die "root must be an absolute path: $value"
+    case "/$value/" in
+        */../*|*/./*) dohdns_die "root must not contain lexical traversal: $value" ;;
+    esac
     value="${value%/}"
     [[ -n "$value" ]] || value=/
+    if [[ "$value" == "/" ]]; then
+        printf '/\n'
+        return 0
+    fi
+
+    # macOS exposes /tmp and /var as compatibility symlinks. Canonicalize those
+    # two system aliases, then reject every caller-owned symlink component.
+    local alias target suffix probe canonical_probe
+    for alias in /tmp /var; do
+        if [[ "$value" == "$alias" || "$value" == "$alias"/* ]] && [[ -L "$alias" ]]; then
+            target="$(cd -- "$alias" && pwd -P)"
+            suffix="${value#"$alias"}"
+            value="$target$suffix"
+            break
+        fi
+    done
+
+    probe="$value"
+    while [[ ! -e "$probe" && "$probe" != "/" ]]; do
+        probe="${probe%/*}"
+        [[ -n "$probe" ]] || probe=/
+    done
+    [[ -d "$probe" ]] || dohdns_die "root parent is not a directory: $probe"
+    canonical_probe="$(cd -- "$probe" && pwd -P)" || dohdns_die "cannot canonicalize root parent: $probe"
+    [[ "$probe" == "$canonical_probe" ]] || dohdns_die "root contains symlink traversal: $value"
+    [[ ! -e "$value" || -d "$value" ]] || dohdns_die "root is not a directory: $value"
     printf '%s\n' "$value"
 }
 
@@ -65,6 +94,12 @@ dohdns_lock_acquire() {
 
 dohdns_sha256() {
     sha256sum -- "$1" | awk '{print $1}'
+}
+
+dohdns_require_generation_name() {
+    local value="${1:-}"
+    [[ "$value" =~ ^gen-[0-9a-f]{16}(-[1-9][0-9]*)?$ ]] || \
+        dohdns_die "invalid generation name in state: $value"
 }
 
 dohdns_require_root_for_host() {

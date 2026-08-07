@@ -83,10 +83,15 @@ def validate_inventory_for_render(inventory: Mapping[str, Any], *, register_unsa
 
 
 def _safe_output(path: Path) -> Path:
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    else:
-        path = path.resolve()
+    raw = path if path.is_absolute() else Path.cwd() / path
+    if ".." in raw.parts:
+        raise ValueError(f"refusing lexical traversal in staging root {raw}")
+    probe = Path(raw.anchor)
+    for component in raw.parts[1:]:
+        probe /= component
+        if probe.is_symlink() and str(probe) not in {"/tmp", "/var"}:
+            raise ValueError(f"refusing symlink traversal in staging root {raw}")
+    path = raw.resolve()
     forbidden = {
         Path("/"),
         Path("/etc"),
@@ -257,6 +262,15 @@ def render_deployment(
         for script in sorted(SCRIPT_ROOT.glob("*.sh")):
             if script.is_file():
                 _write(app_root / "deploy/bin" / script.name, script.read_bytes(), 0o755)
+
+        # Keep the validated policy with the generation. The active
+        # /etc/dohdns/inventory.json is therefore restored together with the
+        # executable and rendered configuration during rollback.
+        _write(
+            temporary / "etc/dohdns/inventory.json",
+            json.dumps(dict(inventory), indent=2, sort_keys=True) + "\n",
+            0o640,
+        )
 
         relative_files = sorted(
             str(path.relative_to(temporary))

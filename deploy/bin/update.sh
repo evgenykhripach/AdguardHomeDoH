@@ -21,7 +21,10 @@ while (($#)); do
 done
 ROOT="$(dohdns_abs_root "$ROOT")"
 if [[ -z "$INVENTORY" ]]; then
-    if [[ "$ROOT" == "/" ]]; then
+    if [[ -f "$SCRIPT_DIR/tools/render_deployment.py" ]]; then
+        # Installed bundle owns its persistent inventory under /etc.
+        INVENTORY="$(dohdns_under_root "$ROOT" /etc/dohdns/inventory.json)"
+    elif [[ "$ROOT" == "/" ]]; then
         INVENTORY="$DOHDNS_PROJECT_ROOT/inventory.example.json"
     else
         INVENTORY="$(dohdns_under_root "$ROOT" /etc/dohdns/inventory.json)"
