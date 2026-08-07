@@ -10,8 +10,9 @@ Canonical data shapes are small mappings:
 * inventory: ``{"hostname": str, "ipv4": str, "publication": {…}}``;
 * sniproxy: ``{"listeners": [{"protocol", "port", "interface"}],
   "closed": [{"protocol", "port"}]}``;
-* domain CSV: one ``fqdn.,mode`` record per line, with ``suffix`` or
-  ``exact`` mode.  Domains are lowercase ASCII/Punycode and end in one dot;
+* domain CSV: one ``fqdn,mode`` record per line, with ``prefix``, ``suffix``,
+  or ``fqdn`` mode.  Domains are lowercase ASCII/Punycode and omit a trailing
+  dot in their canonical form;
 * Apple profile: XML plist containing the expected outer and DNS Settings
   payload identifiers, HTTPS DoH URL, and IPv4 server address.
 """
@@ -38,20 +39,23 @@ EXPECTED_DOH_URL = "https://dns.pressroll.ru/dns-query"
 EXPECTED_OUTER_PAYLOAD_IDENTIFIER = "ru.pressroll.dns.profile"
 EXPECTED_INNER_PAYLOAD_IDENTIFIER = "ru.pressroll.dns.settings"
 EXPECTED_INNER_PAYLOAD_TYPE = "com.apple.dnsSettings.managed"
-VALID_DOMAIN_MODES = frozenset({"suffix", "exact"})
+VALID_DOMAIN_MODES = frozenset({"prefix", "suffix", "fqdn"})
 REQUIRED_LISTENERS = frozenset(
     {
         ("udp", 53),
         ("tcp", 53),
-        ("tcp", 80),
         ("tcp", 443),
         ("tcp", 853),
     }
 )
+REQUIRED_NGINX_LISTENERS = frozenset({("tcp", 80)})
 REQUIRED_CLOSED = frozenset({("udp", 443), ("udp", 853)})
 
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _TEMPLATE_TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}|\$\{([^{}]+?)\}")
+_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
 
 
 def _is_nonempty(value: Any) -> bool:
@@ -118,7 +122,9 @@ def _walk_publication(value: Any, path: str = "publication") -> list[str]:
     return errors
 
 
-def validate_inventory(inventory: Mapping[str, Any], expected_hostname: str | None = None) -> list[str]:
+def validate_inventory(
+    inventory: Mapping[str, Any], expected_hostname: str = EXPECTED_HOSTNAME
+) -> list[str]:
     """Return invariant violations for an IPv4-only deployment inventory."""
 
     errors: list[str] = []
@@ -129,7 +135,10 @@ def validate_inventory(inventory: Mapping[str, Any], expected_hostname: str | No
     hostname_error = _fqdn_error(hostname)
     if hostname_error:
         errors.append(f"hostname: {hostname_error}")
-    if expected_hostname is not None and hostname != expected_hostname:
+    # ``None`` cannot disable the fixed deployment invariant accidentally.
+    if expected_hostname is None:
+        expected_hostname = EXPECTED_HOSTNAME
+    if hostname != expected_hostname:
         errors.append(f"hostname must equal {expected_hostname!r}")
 
     ipv4_value = inventory.get("ipv4")
@@ -165,9 +174,10 @@ def _domain_error(domain: Any) -> str | None:
         return "domain is missing or not a string"
     if domain != domain.strip() or any(character.isspace() for character in domain):
         return "domain is not normalized (whitespace is not allowed)"
-    if not domain.endswith(".") or domain.endswith(".."):
-        return "domain is not normalized (exactly one trailing dot is required)"
-    return _fqdn_error(domain, trailing_dot=True)
+    if domain.endswith(".."):
+        return "domain is not normalized (multiple trailing dots are not allowed)"
+    canonical = domain[:-1] if domain.endswith(".") else domain
+    return _fqdn_error(canonical)
 
 
 def _domain_rows(records: Any) -> tuple[list[tuple[int, Any, Any]], list[str]]:
@@ -206,7 +216,7 @@ def _domain_rows(records: Any) -> tuple[list[tuple[int, Any, Any]], list[str]]:
 
 
 def validate_domain_csv(records: Any, *, allow_comments: bool = False, allow_blank: bool = False) -> list[str]:
-    """Return violations for headerless ``fqdn.,mode`` domain records."""
+    """Return violations for headerless ``fqdn,mode`` domain records."""
 
     errors: list[str] = []
     rows, row_errors = _domain_rows(records)
@@ -224,11 +234,12 @@ def validate_domain_csv(records: Any, *, allow_comments: bool = False, allow_bla
         domain_error = _domain_error(domain)
         if domain_error:
             errors.append(f"domain CSV line {line_number}: {domain_error}")
-        if isinstance(domain, str) and domain.endswith("."):
-            normalized = domain.lower()
+        if isinstance(domain, str):
+            canonical = domain[:-1] if domain.endswith(".") else domain
+            normalized = canonical.lower()
             # Keep duplicate detection independent of case-normalization errors.
-            if _fqdn_error(normalized, trailing_dot=True) is None:
-                if domain != normalized and not domain_error:
+            if _fqdn_error(normalized) is None:
+                if domain != normalized:
                     errors.append(f"domain CSV line {line_number}: domain is not normalized")
                 if normalized in seen:
                     errors.append(f"domain CSV line {line_number}: duplicate domain {normalized}")
@@ -281,7 +292,14 @@ def _endpoint(spec: Mapping[str, Any], label: str) -> tuple[str | None, int | No
     return protocol, port, None
 
 
-def validate_sniproxy(config: Mapping[str, Any]) -> list[str]:
+def _public_listener_interface(address: ipaddress.IPv4Address, expected_ipv4: str | None) -> bool:
+    if address.is_unspecified:
+        return True
+    expected = _ipv4(expected_ipv4)
+    return expected is not None and address == expected
+
+
+def validate_sniproxy(config: Mapping[str, Any], expected_ipv4: str | None = None) -> list[str]:
     """Return port, protocol, interface, and metrics-binding violations."""
 
     if not isinstance(config, Mapping):
@@ -318,7 +336,7 @@ def validate_sniproxy(config: Mapping[str, Any]) -> list[str]:
     for required in sorted(REQUIRED_LISTENERS):
         if required not in found:
             errors.append(f"required {required[0].upper()} {required[1]} listener is missing")
-        elif interfaces[required].is_loopback:
+        elif not _public_listener_interface(interfaces[required], expected_ipv4):
             errors.append(f"required {required[0].upper()} {required[1]} listener must use a public interface")
 
     closed = config.get("closed", [])
@@ -348,6 +366,74 @@ def validate_sniproxy(config: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_required_service_listeners(
+    config: Mapping[str, Any],
+    service: str,
+    required: Iterable[tuple[str, int]],
+    expected_ipv4: str | None = None,
+) -> list[str]:
+    if not isinstance(config, Mapping):
+        return [f"{service} config must be a mapping"]
+    errors: list[str] = []
+    listeners, listener_errors = _listener_rows(config)
+    errors.extend(listener_errors)
+    found: set[tuple[str, int]] = set()
+    interfaces: dict[tuple[str, int], ipaddress.IPv4Address] = {}
+    for name, spec in listeners:
+        label = f"{service} listener {name!r}"
+        protocol, port, endpoint_error = _endpoint(spec, label)
+        if endpoint_error:
+            errors.append(endpoint_error)
+            continue
+        assert protocol is not None and port is not None
+        key = (protocol, port)
+        if key in found:
+            errors.append(f"{label}: duplicate {protocol.upper()} {port} listener")
+        found.add(key)
+        interface = spec.get("interface", spec.get("bind", spec.get("address")))
+        assert isinstance(interface, str)
+        parsed_interface = _ipv4(interface)
+        assert parsed_interface is not None
+        interfaces[key] = parsed_interface
+    for listener in required:
+        if listener not in found:
+            errors.append(f"required {service} {listener[0].upper()} {listener[1]} listener is missing")
+        elif not _public_listener_interface(interfaces[listener], expected_ipv4):
+            errors.append(
+                f"required {service} {listener[0].upper()} {listener[1]} listener must use a public interface"
+            )
+    return errors
+
+
+def validate_nginx(config: Mapping[str, Any], expected_ipv4: str | None = None) -> list[str]:
+    """Validate nginx-owned public HTTP listener(s), currently TCP 80."""
+
+    return _validate_required_service_listeners(config, "nginx", REQUIRED_NGINX_LISTENERS, expected_ipv4)
+
+
+def validate_deployment_ports(services: Mapping[str, Any], expected_ipv4: str | None = None) -> list[str]:
+    """Validate service ownership: sniproxy excludes nginx's TCP 80 listener."""
+
+    if not isinstance(services, Mapping):
+        return ["deployment services must be a mapping"]
+    errors: list[str] = []
+    if "sniproxy" not in services:
+        errors.append("deployment sniproxy config is missing")
+    else:
+        errors.extend(
+            f"sniproxy: {error}"
+            for error in validate_sniproxy(services["sniproxy"], expected_ipv4=expected_ipv4)
+        )
+    if "nginx" not in services:
+        errors.append("deployment nginx config is missing (TCP 80 ownership)")
+    else:
+        errors.extend(
+            f"nginx: {error}"
+            for error in validate_nginx(services["nginx"], expected_ipv4=expected_ipv4)
+        )
+    return errors
+
+
 def _load_plist(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Path):
         value = value.read_bytes()
@@ -357,6 +443,10 @@ def _load_plist(value: Any) -> Mapping[str, Any] | None:
         return None
     parsed = plistlib.loads(bytes(value))
     return parsed if isinstance(parsed, Mapping) else None
+
+
+def _valid_uuid(value: Any) -> bool:
+    return isinstance(value, str) and _UUID.fullmatch(value) is not None
 
 
 def validate_mobileconfig(xml: Any, *, expected_ipv4: str | None = None) -> list[str]:
@@ -371,18 +461,27 @@ def validate_mobileconfig(xml: Any, *, expected_ipv4: str | None = None) -> list
         return ["mobileconfig is not a valid XML plist dictionary"]
     if profile.get("PayloadType") != "Configuration":
         errors.append("mobileconfig outer PayloadType must be Configuration")
+    if profile.get("PayloadVersion") != 1:
+        errors.append("mobileconfig outer PayloadVersion must be 1")
+    if not _valid_uuid(profile.get("PayloadUUID")):
+        errors.append("mobileconfig outer PayloadUUID must be a valid UUID")
     if profile.get("PayloadIdentifier") != EXPECTED_OUTER_PAYLOAD_IDENTIFIER:
         errors.append("mobileconfig outer PayloadIdentifier is invalid")
     content = profile.get("PayloadContent")
-    if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
-        return errors + ["mobileconfig PayloadContent must be an array"]
-    matching_payloads = [payload for payload in content if isinstance(payload, Mapping)]
-    if len(matching_payloads) != 1:
-        errors.append("mobileconfig must contain exactly one DNS Settings payload")
-        return errors
-    payload = matching_payloads[0]
+    if (
+        not isinstance(content, Sequence)
+        or isinstance(content, (str, bytes, bytearray))
+        or len(content) != 1
+        or not isinstance(content[0], Mapping)
+    ):
+        return errors + ["mobileconfig PayloadContent must contain exactly one mapping"]
+    payload = content[0]
     if payload.get("PayloadType") != EXPECTED_INNER_PAYLOAD_TYPE:
         errors.append("mobileconfig inner PayloadType is invalid")
+    if payload.get("PayloadVersion") != 1:
+        errors.append("mobileconfig inner PayloadVersion must be 1")
+    if not _valid_uuid(payload.get("PayloadUUID")):
+        errors.append("mobileconfig inner PayloadUUID must be a valid UUID")
     if payload.get("PayloadIdentifier") != EXPECTED_INNER_PAYLOAD_IDENTIFIER:
         errors.append("mobileconfig inner PayloadIdentifier is invalid")
     settings = payload.get("DNSSettings")
@@ -430,6 +529,8 @@ def render_template(template: str, inventory: Mapping[str, Any]) -> str:
         rendered = string.Template(rendered).substitute(values)
     except (KeyError, ValueError) as exc:
         raise ValueError(f"template contains unresolved token: {exc}") from exc
+    if any(marker in rendered for marker in ("${", "{{", "}}")):
+        raise ValueError("template contains unresolved marker")
     return rendered
 
 
@@ -456,8 +557,11 @@ def validate_artifacts(
 
     errors = [f"inventory: {error}" for error in validate_inventory(inventory)]
     errors.extend(f"domain CSV: {error}" for error in validate_domain_csv(domain_csv))
-    errors.extend(f"sniproxy: {error}" for error in validate_sniproxy(sniproxy))
     expected_ipv4 = inventory.get("ipv4") if isinstance(inventory, Mapping) else None
+    errors.extend(
+        f"sniproxy: {error}"
+        for error in validate_sniproxy(sniproxy, expected_ipv4=expected_ipv4)
+    )
     errors.extend(
         f"mobileconfig: {error}"
         for error in validate_mobileconfig(mobileconfig, expected_ipv4=expected_ipv4)
@@ -478,7 +582,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--sniproxy", required=True, help="sniproxy JSON path")
     parser.add_argument("--mobileconfig", required=True, help="Apple mobileconfig XML path")
     parser.add_argument("--template", action="append", default=[], help="template text path (repeatable)")
-    parser.add_argument("--expected-hostname", default=None)
+    parser.add_argument("--expected-hostname", default=EXPECTED_HOSTNAME)
     args = parser.parse_args(argv)
     try:
         inventory = _read_json(args.inventory)
@@ -488,8 +592,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             for error in validate_inventory(inventory, expected_hostname=args.expected_hostname)
         ]
         errors.extend(f"domain CSV: {error}" for error in validate_domain_csv(Path(args.domains)))
-        errors.extend(f"sniproxy: {error}" for error in validate_sniproxy(sniproxy))
         expected_ipv4 = inventory.get("ipv4") if isinstance(inventory, Mapping) else None
+        errors.extend(
+            f"sniproxy: {error}"
+            for error in validate_sniproxy(sniproxy, expected_ipv4=expected_ipv4)
+        )
         errors.extend(
             f"mobileconfig: {error}"
             for error in validate_mobileconfig(Path(args.mobileconfig), expected_ipv4=expected_ipv4)
