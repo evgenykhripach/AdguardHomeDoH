@@ -175,6 +175,14 @@ class ValidatorTests(unittest.TestCase):
         errors = validate_deployment_ports({"sniproxy": SNIPROXY, "nginx": {"listeners": []}})
         self.assertTrue(any("nginx" in error.lower() and "80" in error for error in errors))
 
+    def test_deployment_rejects_sniproxy_owning_nginx_tcp80(self):
+        sniproxy = copy.deepcopy(SNIPROXY)
+        sniproxy["listeners"].append(
+            {"name": "conflicting-http", "protocol": "tcp", "port": 80, "interface": "0.0.0.0"}
+        )
+        errors = validate_deployment_ports({"sniproxy": sniproxy, "nginx": NGINX})
+        self.assertTrue(any("sniproxy" in error.lower() and "tcp 80" in error.lower() for error in errors))
+
     def test_sniproxy_rejects_loopback_public_listener(self):
         invalid = copy.deepcopy(SNIPROXY)
         invalid["listeners"][0]["interface"] = "127.0.0.1"

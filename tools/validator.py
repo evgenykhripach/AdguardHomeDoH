@@ -50,6 +50,7 @@ REQUIRED_LISTENERS = frozenset(
 )
 REQUIRED_NGINX_LISTENERS = frozenset({("tcp", 80)})
 REQUIRED_CLOSED = frozenset({("udp", 443), ("udp", 853)})
+FORBIDDEN_SNIPROXY_LISTENERS = frozenset({("tcp", 80)})
 
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _TEMPLATE_TOKEN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}|\$\{([^{}]+?)\}")
@@ -333,6 +334,12 @@ def validate_sniproxy(config: Mapping[str, Any], expected_ipv4: str | None = Non
             errors.append(f"required {required[0].upper()} {required[1]} listener is missing")
         elif not _public_listener_interface(interfaces[required], expected_ipv4):
             errors.append(f"required {required[0].upper()} {required[1]} listener must use a public interface")
+
+    for forbidden in sorted(FORBIDDEN_SNIPROXY_LISTENERS):
+        if forbidden in found:
+            errors.append(
+                f"{forbidden[0].upper()} {forbidden[1]} is owned by nginx and must not be a sniproxy listener"
+            )
 
     closed = config.get("closed", [])
     closed_keys: set[tuple[str, int]] = set()
