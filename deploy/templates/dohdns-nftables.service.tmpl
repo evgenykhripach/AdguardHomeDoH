@@ -1,0 +1,13 @@
+[Unit]
+Description=DoHDNS isolated nftables policy
+Wants=network-pre.target
+After=network-pre.target
+Before=sniproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/dohdns/apply-nftables.sh --root /
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

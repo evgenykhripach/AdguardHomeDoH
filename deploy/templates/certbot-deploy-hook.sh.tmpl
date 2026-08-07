@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+/usr/local/libexec/dohdns/sync-cert.sh --root / --cert "$RENEWED_LINEAGE/fullchain.pem" --key "$RENEWED_LINEAGE/privkey.pem"
+exec systemctl try-restart sniproxy
