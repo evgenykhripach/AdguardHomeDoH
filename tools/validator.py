@@ -10,9 +10,9 @@ Canonical data shapes are small mappings:
 * inventory: ``{"hostname": str, "ipv4": str, "publication": {…}}``;
 * sniproxy: ``{"listeners": [{"protocol", "port", "interface"}],
   "closed": [{"protocol", "port"}]}``;
-* domain CSV: one ``fqdn,mode`` record per line, with ``prefix``, ``suffix``,
-  or ``fqdn`` mode.  Domains are lowercase ASCII/Punycode and omit a trailing
-  dot in their canonical form;
+* domain CSV: one ``fqdn.,mode`` record per line, with ``prefix``, ``suffix``,
+  or ``fqdn`` mode.  Domains are lowercase ASCII/Punycode and have exactly one
+  trailing dot, matching sniproxy v2.3.0's query normalization;
 * Apple profile: XML plist containing the expected outer and DNS Settings
   payload identifiers, HTTPS DoH URL, and IPv4 server address.
 """
@@ -122,9 +122,7 @@ def _walk_publication(value: Any, path: str = "publication") -> list[str]:
     return errors
 
 
-def validate_inventory(
-    inventory: Mapping[str, Any], expected_hostname: str = EXPECTED_HOSTNAME
-) -> list[str]:
+def validate_inventory(inventory: Mapping[str, Any]) -> list[str]:
     """Return invariant violations for an IPv4-only deployment inventory."""
 
     errors: list[str] = []
@@ -135,11 +133,8 @@ def validate_inventory(
     hostname_error = _fqdn_error(hostname)
     if hostname_error:
         errors.append(f"hostname: {hostname_error}")
-    # ``None`` cannot disable the fixed deployment invariant accidentally.
-    if expected_hostname is None:
-        expected_hostname = EXPECTED_HOSTNAME
-    if hostname != expected_hostname:
-        errors.append(f"hostname must equal {expected_hostname!r}")
+    if hostname != EXPECTED_HOSTNAME:
+        errors.append(f"hostname must equal {EXPECTED_HOSTNAME!r}")
 
     ipv4_value = inventory.get("ipv4")
     ipv4 = _ipv4(ipv4_value)
@@ -174,9 +169,9 @@ def _domain_error(domain: Any) -> str | None:
         return "domain is missing or not a string"
     if domain != domain.strip() or any(character.isspace() for character in domain):
         return "domain is not normalized (whitespace is not allowed)"
-    if domain.endswith(".."):
-        return "domain is not normalized (multiple trailing dots are not allowed)"
-    canonical = domain[:-1] if domain.endswith(".") else domain
+    if not domain.endswith(".") or domain.endswith(".."):
+        return "domain is not normalized (exactly one trailing dot is required)"
+    canonical = domain[:-1]
     return _fqdn_error(canonical)
 
 
@@ -235,11 +230,11 @@ def validate_domain_csv(records: Any, *, allow_comments: bool = False, allow_bla
         if domain_error:
             errors.append(f"domain CSV line {line_number}: {domain_error}")
         if isinstance(domain, str):
-            canonical = domain[:-1] if domain.endswith(".") else domain
+            canonical = domain.rstrip(".")
             normalized = canonical.lower()
             # Keep duplicate detection independent of case-normalization errors.
             if _fqdn_error(normalized) is None:
-                if domain != normalized:
+                if domain != normalized + ".":
                     errors.append(f"domain CSV line {line_number}: domain is not normalized")
                 if normalized in seen:
                     errors.append(f"domain CSV line {line_number}: duplicate domain {normalized}")
@@ -550,6 +545,7 @@ def validate_artifacts(
     inventory: Mapping[str, Any],
     domain_csv: Any,
     sniproxy: Mapping[str, Any],
+    nginx: Mapping[str, Any],
     mobileconfig: Any,
     templates: Mapping[str, str] | Iterable[str] | None = None,
 ) -> list[str]:
@@ -559,8 +555,10 @@ def validate_artifacts(
     errors.extend(f"domain CSV: {error}" for error in validate_domain_csv(domain_csv))
     expected_ipv4 = inventory.get("ipv4") if isinstance(inventory, Mapping) else None
     errors.extend(
-        f"sniproxy: {error}"
-        for error in validate_sniproxy(sniproxy, expected_ipv4=expected_ipv4)
+        f"ports: {error}"
+        for error in validate_deployment_ports(
+            {"sniproxy": sniproxy, "nginx": nginx}, expected_ipv4=expected_ipv4
+        )
     )
     errors.extend(
         f"mobileconfig: {error}"
@@ -580,22 +578,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--inventory", required=True, help="inventory JSON path")
     parser.add_argument("--domains", required=True, help="headerless domain CSV path")
     parser.add_argument("--sniproxy", required=True, help="sniproxy JSON path")
+    parser.add_argument("--nginx", required=True, help="nginx JSON path")
     parser.add_argument("--mobileconfig", required=True, help="Apple mobileconfig XML path")
     parser.add_argument("--template", action="append", default=[], help="template text path (repeatable)")
-    parser.add_argument("--expected-hostname", default=EXPECTED_HOSTNAME)
     args = parser.parse_args(argv)
     try:
         inventory = _read_json(args.inventory)
         sniproxy = _read_json(args.sniproxy)
-        errors = [
-            f"inventory: {error}"
-            for error in validate_inventory(inventory, expected_hostname=args.expected_hostname)
-        ]
+        nginx = _read_json(args.nginx)
+        errors = [f"inventory: {error}" for error in validate_inventory(inventory)]
         errors.extend(f"domain CSV: {error}" for error in validate_domain_csv(Path(args.domains)))
         expected_ipv4 = inventory.get("ipv4") if isinstance(inventory, Mapping) else None
         errors.extend(
-            f"sniproxy: {error}"
-            for error in validate_sniproxy(sniproxy, expected_ipv4=expected_ipv4)
+            f"ports: {error}"
+            for error in validate_deployment_ports(
+                {"sniproxy": sniproxy, "nginx": nginx}, expected_ipv4=expected_ipv4
+            )
         )
         errors.extend(
             f"mobileconfig: {error}"

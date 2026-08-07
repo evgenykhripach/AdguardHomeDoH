@@ -28,7 +28,7 @@ INVENTORY = {
     "publication": {"A": ["203.0.113.10"], "AAAA": []},
 }
 
-DOMAIN_CSV = "openai.com,suffix\nexample.com,prefix\nexample.net,fqdn\n"
+DOMAIN_CSV = "openai.com.,suffix\nexample.com.,prefix\nexample.net.,fqdn\n"
 
 SNIPROXY = {
     "listeners": [
@@ -94,6 +94,7 @@ class ValidatorTests(unittest.TestCase):
                 inventory=INVENTORY,
                 domain_csv=DOMAIN_CSV,
                 sniproxy=SNIPROXY,
+                nginx=NGINX,
                 mobileconfig=make_mobileconfig(),
             ),
         )
@@ -110,6 +111,7 @@ class ValidatorTests(unittest.TestCase):
             inventory=invalid,
             domain_csv=DOMAIN_CSV,
             sniproxy=SNIPROXY,
+            nginx=NGINX,
             mobileconfig=make_mobileconfig(),
         )))
         with self.assertRaises(ValueError):
@@ -133,14 +135,25 @@ class ValidatorTests(unittest.TestCase):
         self.assertTrue(any("aaaa" in error.lower() or "ipv6" in error.lower() for error in errors))
 
     def test_domain_csv_rejects_non_normalized_and_duplicate_domains(self):
-        errors = validate_domain_csv("Example.com,suffix\nexample.com.,fqdn\n")
+        errors = validate_domain_csv("Example.com.,suffix\nexample.com.,fqdn\n")
         self.assertTrue(any("normal" in error.lower() for error in errors))
         self.assertTrue(any("duplicate" in error.lower() for error in errors))
 
-    def test_domain_csv_rejects_invalid_mode_and_extra_trailing_dot(self):
+    def test_domain_csv_rejects_missing_or_extra_trailing_dot_and_invalid_mode(self):
         errors = validate_domain_csv("example.com,suffix\nservice.example.com..,exact\n")
-        self.assertTrue(any("normal" in error.lower() or "trailing" in error.lower() for error in errors))
+        self.assertTrue(any("line 1" in error and ("normal" in error.lower() or "trailing" in error.lower()) for error in errors))
+        self.assertTrue(any("line 2" in error and ("normal" in error.lower() or "trailing" in error.lower()) for error in errors))
         self.assertTrue(any("mode" in error.lower() for error in errors))
+
+    def test_validate_artifacts_requires_nginx_tcp80(self):
+        errors = validate_artifacts(
+            inventory=INVENTORY,
+            domain_csv=DOMAIN_CSV,
+            sniproxy=SNIPROXY,
+            nginx={"listeners": []},
+            mobileconfig=make_mobileconfig(),
+        )
+        self.assertTrue(any("nginx" in error.lower() and "80" in error for error in errors))
 
     def test_sniproxy_rejects_public_prometheus_and_udp_tls_ports(self):
         invalid = copy.deepcopy(SNIPROXY)
@@ -225,21 +238,32 @@ class ValidatorTests(unittest.TestCase):
             (root / "inventory.json").write_text(json.dumps(INVENTORY), encoding="utf-8")
             (root / "domains.csv").write_text(DOMAIN_CSV, encoding="utf-8")
             (root / "sniproxy.json").write_text(json.dumps(SNIPROXY), encoding="utf-8")
+            (root / "nginx.json").write_text(json.dumps(NGINX), encoding="utf-8")
             (root / "profile.mobileconfig").write_text(make_mobileconfig(), encoding="utf-8")
             args = [
                 "--inventory", str(root / "inventory.json"),
                 "--domains", str(root / "domains.csv"),
                 "--sniproxy", str(root / "sniproxy.json"),
+                "--nginx", str(root / "nginx.json"),
                 "--mobileconfig", str(root / "profile.mobileconfig"),
             ]
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(0, main(args))
 
+            (root / "nginx.json").write_text(json.dumps({"listeners": []}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(1, main(args))
+
+            (root / "nginx.json").write_text(json.dumps(NGINX), encoding="utf-8")
             invalid_inventory = copy.deepcopy(INVENTORY)
             invalid_inventory["hostname"] = "evil.example"
             (root / "inventory.json").write_text(json.dumps(invalid_inventory), encoding="utf-8")
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(1, main(args))
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    main(args + ["--expected-hostname", "evil.example"])
 
 
 if __name__ == "__main__":
