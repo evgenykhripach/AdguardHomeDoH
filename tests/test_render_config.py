@@ -90,7 +90,7 @@ class RenderConfigTests(unittest.TestCase):
             "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com", "/var/www/html"
         )
         self.assertIn("password: $2a$10$hash", adguard)
-        self.assertIn("domain: example.com", adguard)
+        self.assertIn("domain: 'example.com'", adguard)
         self.assertIn("location = /doh/" + "a" * 48, http)
         self.assertNotIn("listen 443 ssl", http)
 
