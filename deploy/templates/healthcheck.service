@@ -1,0 +1,33 @@
+[Unit]
+Description=Pressroll Smart DNS health gate
+After=network-online.target nginx.service AdGuardHome.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/pressroll-smart-dns/healthcheck.py
+EnvironmentFile=/etc/pressroll-smart-dns/runtime.env
+User=root
+Group=root
+RuntimeDirectory=pressroll-smart-dns
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pressroll-smart-dns
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallArchitectures=native
+TimeoutStartSec=180s
+
+[Install]
+WantedBy=multi-user.target

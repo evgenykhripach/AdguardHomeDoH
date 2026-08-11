@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Pressroll Smart DNS health gate periodically
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=60s
+Unit=pressroll-smart-dns-health.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
