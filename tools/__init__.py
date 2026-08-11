@@ -1,1 +1,1 @@
-"""Small, dependency-free deployment tools."""
+"""Pressroll Smart DNS tooling."""
