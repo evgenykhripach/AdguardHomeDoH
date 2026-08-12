@@ -1,7 +1,7 @@
 # Pressroll AdGuard Home DoH Smart DNS
 
 Персональный Smart DNS на базе AdGuard Home и nginx. Установка выполняется
-одной командой на чистом Ubuntu 24.04.
+одной командой на чистом Ubuntu 24.04 или более новой версии.
 
 Поддерживаются адреса ChatGPT и загрузки OpenAI, Google Gemini и AI Studio,
 Claude, Copilot, Perplexity, Grok, Midjourney и Fitbit. Полный список находится
@@ -23,7 +23,7 @@ Claude, Copilot, Perplexity, Grok, Midjourney и Fitbit. Полный списо
 
 Перед установкой:
 
-1. Сервер Ubuntu 24.04 с публичным IPv4.
+1. Сервер Ubuntu 24.04 или новее с публичным IPv4.
 2. Доступ root или `sudo`.
 3. A-запись домена направлена на IPv4 сервера.
 4. Открыты TCP/UDP 53, TCP 80 и TCP 443.

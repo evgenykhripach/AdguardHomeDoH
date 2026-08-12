@@ -68,8 +68,7 @@ fi
 pressroll_require_root
 [[ "$ROOT" == "/" ]] || pressroll_die "non-root installation only supports --dry-run"
 command -v systemctl >/dev/null || pressroll_die "systemd is required"
-[[ -f /etc/os-release ]] && . /etc/os-release
-[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || pressroll_die "Ubuntu 24.04 is required"
+pressroll_require_ubuntu
 
 if ((ROLLBACK)); then
     latest="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort | tail -1 || true)"

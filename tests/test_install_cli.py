@@ -44,6 +44,21 @@ class InstallerCliTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("--public-ip is required", result.stderr)
 
+    def test_ubuntu_24_04_or_newer_is_supported(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            os_release = Path(directory) / "os-release"
+            for version, expected in (("24.04", 0), ("24.10", 0), ("25.04", 0), ("22.04", 1)):
+                os_release.write_text(
+                    f'ID=ubuntu\nVERSION_ID="{version}"\n', encoding="utf-8"
+                )
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; pressroll_require_ubuntu "$2"',
+                     "bash", str(common), str(os_release)],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(expected, result.returncode, version)
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)

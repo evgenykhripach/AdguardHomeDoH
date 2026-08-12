@@ -7,6 +7,23 @@ pressroll_require_root() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] || pressroll_die "run as root (or use --root for dry-run tests)"
 }
 
+pressroll_require_ubuntu() {
+    local os_release="${1:-/etc/os-release}"
+    local version major minor
+    [[ -r "$os_release" ]] || pressroll_die "Ubuntu 24.04 or newer is required"
+    # shellcheck disable=SC1090
+    . "$os_release"
+    [[ "${ID:-}" == "ubuntu" ]] || pressroll_die "Ubuntu 24.04 or newer is required"
+    version="${VERSION_ID:-}"
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+)$ ]] || pressroll_die "Ubuntu 24.04 or newer is required"
+    major="${BASH_REMATCH[1]#0}"
+    minor="${BASH_REMATCH[2]#0}"
+    [[ -n "$major" ]] || major=0
+    [[ -n "$minor" ]] || minor=0
+    (( major > 24 || (major == 24 && minor >= 4) )) || \
+        pressroll_die "Ubuntu 24.04 or newer is required"
+}
+
 pressroll_validate_hostname() {
     [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || \
         pressroll_die "invalid hostname: $1"
