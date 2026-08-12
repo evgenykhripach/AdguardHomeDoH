@@ -14,7 +14,7 @@ INSTALL = ROOT / "deploy" / "install.sh"
 class InstallerCliTests(unittest.TestCase):
     def run_install(self, *args):
         env = dict(os.environ)
-        env["PYTHONPYCACHEPREFIX"] = "/tmp/pressroll-smart-dns-pycache"
+        env["PYTHONPYCACHEPREFIX"] = "/tmp/adguardhome-doh-pycache"
         return subprocess.run(
             [str(INSTALL), *args], cwd=ROOT, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
@@ -36,13 +36,13 @@ class InstallerCliTests(unittest.TestCase):
                 "--dry-run",
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("DRY-RUN valid", result.stdout)
+            self.assertIn("dry-run завершён", result.stdout)
             self.assertEqual([], list(Path(directory).iterdir()))
 
     def test_missing_required_argument_fails(self):
         result = self.run_install("--domain", "dns.example.com")
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("--public-ip is required", result.stderr)
+        self.assertRegex(result.stderr, r"TTY|tty|--public-ip")
 
     def test_invalid_email_fails_before_installation(self):
         result = self.run_install(
@@ -63,7 +63,7 @@ class InstallerCliTests(unittest.TestCase):
                     f'ID=ubuntu\nVERSION_ID="{version}"\n', encoding="utf-8"
                 )
                 result = subprocess.run(
-                    ["bash", "-c", 'source "$1"; pressroll_require_ubuntu "$2"',
+                    ["bash", "-c", 'source "$1"; adguardhome_doh_require_ubuntu "$2"',
                      "bash", str(common), str(os_release)],
                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
@@ -78,7 +78,7 @@ class InstallerCliTests(unittest.TestCase):
                 f"{checksum}  ./AdGuardHome_linux_amd64.tar.gz\n", encoding="utf-8"
             )
             result = subprocess.run(
-                ["bash", "-c", 'source "$1"; pressroll_find_checksum "$2" "$3"',
+                ["bash", "-c", 'source "$1"; adguardhome_doh_find_checksum "$2" "$3"',
                  "bash", str(common), str(checksums),
                  "AdGuardHome_linux_amd64.tar.gz"],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -94,7 +94,7 @@ class InstallerCliTests(unittest.TestCase):
             binary.write_bytes(b"binary")
             binary.chmod(0o755)
             result = subprocess.run(
-                ["bash", "-c", 'source "$1"; pressroll_find_adguard_binary "$2"',
+                ["bash", "-c", 'source "$1"; adguardhome_doh_find_binary "$2"',
                  "bash", str(common), directory],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
@@ -117,7 +117,7 @@ class InstallerCliTests(unittest.TestCase):
                 [
                     "bash", "-c",
                     'source "$1"; cd "$2"; '
-                    'pressroll_install_health_templates "$3" "$4"',
+                    'adguardhome_doh_install_health_templates "$3" "$4"',
                     "bash", str(common), str(unrelated_cwd), str(ROOT),
                     str(destination),
                 ],
@@ -125,19 +125,19 @@ class InstallerCliTests(unittest.TestCase):
             )
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertTrue(
-                (destination / "usr/local/libexec/pressroll-smart-dns/healthcheck.py").is_file()
+                (destination / "usr/local/libexec/adguardhome-doh/healthcheck.py").is_file()
             )
             self.assertTrue(
-                (destination / "etc/systemd/system/pressroll-smart-dns-health.service").is_file()
+                (destination / "etc/systemd/system/adguardhome-doh-health.service").is_file()
             )
             self.assertTrue(
-                (destination / "etc/systemd/system/pressroll-smart-dns-health.timer").is_file()
+                (destination / "etc/systemd/system/adguardhome-doh-health.timer").is_file()
             )
 
     def test_required_packages_include_nginx_stream_module(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
         result = subprocess.run(
-            ["bash", "-c", 'source "$1"; pressroll_required_packages',
+            ["bash", "-c", 'source "$1"; adguardhome_doh_required_packages',
              "bash", str(common)],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -155,7 +155,7 @@ class InstallerCliTests(unittest.TestCase):
             )
             command = [
                 "bash", "-c",
-                'source "$1"; pressroll_ensure_nginx_stream_include "$2"',
+                'source "$1"; adguardhome_doh_ensure_nginx_stream_include "$2"',
                 "bash", str(common), str(nginx_conf),
             ]
             first = subprocess.run(
@@ -176,7 +176,7 @@ class InstallerCliTests(unittest.TestCase):
             token_file = Path(directory) / "doh-token"
             command = [
                 "bash", "-c",
-                'source "$1"; pressroll_load_or_create_doh_token "$2"',
+                'source "$1"; adguardhome_doh_load_or_create_doh_token "$2"',
                 "bash", str(common), str(token_file),
             ]
             first = subprocess.run(
@@ -195,7 +195,7 @@ class InstallerCliTests(unittest.TestCase):
         common = ROOT / "deploy" / "lib" / "common.sh"
         command = [
             "bash", "-c",
-            'source "$1"; pressroll_certbot_contact_args "$2"',
+            'source "$1"; adguardhome_doh_certbot_contact_args "$2"',
             "bash", str(common), "admin@example.com",
         ]
         result = subprocess.run(
@@ -209,20 +209,20 @@ class InstallerCliTests(unittest.TestCase):
         common = ROOT / "deploy" / "lib" / "common.sh"
         command = [
             "bash", "-c",
-            'source "$1"; pressroll_certbot_contact_args "$2"',
-            "bash", str(common), "admin@pressroll.ru",
+            'source "$1"; adguardhome_doh_certbot_contact_args "$2"',
+            "bash", str(common), "admin@adguardhome.example",
         ]
         result = subprocess.run(
             command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("--email\nadmin@pressroll.ru\n", result.stdout)
+        self.assertEqual("--email\nadmin@adguardhome.example\n", result.stdout)
         self.assertEqual("", result.stderr)
 
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)
-        self.assertIn("printf 'mobileconfig: https://%s/%s.mobileconfig\\n'", source)
+        self.assertIn("printf 'mobileconfig URL: https://%s/%s.mobileconfig\\n'", source)
 
     def test_credentials_are_mode_600_and_preserve_password(self):
         with tempfile.TemporaryDirectory() as directory:

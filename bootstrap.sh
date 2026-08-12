@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -eEuo pipefail
 
-REPOSITORY="${PRESSROLL_REPOSITORY:-evgenykhripach/AdguardHomeDoH}"
-REF="${PRESSROLL_REF:-main}"
-CACHE_BUSTER="${PRESSROLL_CACHE_BUSTER:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+REPOSITORY="${ADGUARDHOME_DOH_REPOSITORY:-evgenykhripach/AdguardHomeDoH}"
+REF="${ADGUARDHOME_DOH_REF:-main}"
+CACHE_BUSTER="${ADGUARDHOME_DOH_CACHE_BUSTER:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$WORK_DIR"' EXIT
 

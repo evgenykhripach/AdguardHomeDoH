@@ -54,17 +54,17 @@ class RepositoryContractTests(unittest.TestCase):
                 "    *) shift ;;\n"
                 "  esac\n"
                 "done\n"
-                "printf '%s\\n' \"$url\" > \"$PRESSROLL_TEST_URL_LOG\"\n"
-                "cp \"$PRESSROLL_TEST_ARCHIVE\" \"$output\"\n",
+                "printf '%s\\n' \"$url\" > \"$ADGUARDHOME_DOH_TEST_URL_LOG\"\n"
+                "cp \"$ADGUARDHOME_DOH_TEST_ARCHIVE\" \"$output\"\n",
                 encoding="utf-8",
             )
             fake_curl.chmod(0o755)
             env = dict(os.environ)
             env.update({
                 "PATH": f"{fake_bin}:{env['PATH']}",
-                "PRESSROLL_CACHE_BUSTER": "fixed-nonce",
-                "PRESSROLL_TEST_ARCHIVE": str(archive),
-                "PRESSROLL_TEST_URL_LOG": str(url_log),
+                "ADGUARDHOME_DOH_CACHE_BUSTER": "fixed-nonce",
+                "ADGUARDHOME_DOH_TEST_ARCHIVE": str(archive),
+                "ADGUARDHOME_DOH_TEST_URL_LOG": str(url_log),
             })
             result = subprocess.run(
                 [str(ROOT / "bootstrap.sh")], env=env, text=True,
