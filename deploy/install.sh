@@ -218,7 +218,9 @@ if ((FIRST_INSTALL)); then
 fi
 systemctl daemon-reload
 nginx -t
-systemctl enable --now AdGuardHome nginx
+systemctl enable AdGuardHome nginx
+systemctl restart AdGuardHome
+systemctl start nginx
 systemctl reload nginx
 if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
     mapfile -t certbot_contact_args < <(pressroll_certbot_contact_args "$EMAIL")
@@ -231,8 +233,8 @@ fi
 install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/pressroll-smart-dns
 nginx -t
 systemctl reload nginx
+systemctl start pressroll-smart-dns-health.service
 systemctl enable --now pressroll-smart-dns-health.timer
-systemctl start pressroll-smart-dns-health.service || true
 rm -rf -- "$stage"
 install -m 600 /dev/null "$INSTALL_COMPLETE_FILE"
 

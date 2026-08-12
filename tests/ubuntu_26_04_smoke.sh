@@ -16,7 +16,16 @@ EOF
 chmod 755 /usr/sbin/policy-rc.d
 
 cat > "$MOCK_BIN/systemctl" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> /tmp/pressroll-systemctl.log
+if [[ "$*" == "start pressroll-smart-dns-health.service" ]]; then
+    if [[ -e /tmp/pressroll-force-health-failure ]]; then
+        exit 1
+    fi
+    grep -Fq 'restart AdGuardHome' /tmp/pressroll-systemctl.log || exit 1
+    touch /tmp/pressroll-health-started
+fi
 exit 0
 EOF
 chmod 755 "$MOCK_BIN/systemctl"
@@ -74,6 +83,7 @@ active_token() {
 }
 
 install_once | tee /tmp/pressroll-first-install.out
+test -e /tmp/pressroll-health-started
 nginx -t
 /opt/AdGuardHome/AdGuardHome --check-config \
     -c /opt/AdGuardHome/AdGuardHome.yaml \
@@ -105,4 +115,10 @@ curl --fail --silent --show-error --insecure \
     "https://$DOMAIN/$second_token.mobileconfig" \
     -o /tmp/pressroll.mobileconfig
 grep -Fq "https://$DOMAIN/doh/$second_token" /tmp/pressroll.mobileconfig
+
+touch /tmp/pressroll-force-health-failure
+if install_once >/tmp/pressroll-failed-health.out 2>&1; then
+    printf 'installer ignored a failed health-check\n' >&2
+    exit 1
+fi
 printf 'ubuntu 26.04 install smoke: ok\n'
