@@ -64,7 +64,8 @@ install_once() {
     "$PROJECT_ROOT/deploy/install.sh" \
         --domain "$DOMAIN" \
         --public-ip "$PUBLIC_IP" \
-        --email admin@example.com
+        --email admin@example.com \
+        --yes
 }
 
 active_token() {
