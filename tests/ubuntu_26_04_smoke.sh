@@ -55,6 +55,11 @@ chmod 755 "$MOCK_BIN/certbot"
 export PATH="$MOCK_BIN:$PATH"
 cd /root
 
+# Existing servers may have a private default webroot.  The installer must not
+# depend on or relax its permissions to serve the generated profile.
+mkdir -p /var/www/html
+chmod 700 /var/www/html
+
 install_once() {
     "$PROJECT_ROOT/deploy/install.sh" \
         --domain "$DOMAIN" \
@@ -76,8 +81,10 @@ nginx -t
 test "$(grep -Fxc 'include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf)" -eq 1
 test -s /var/lib/pressroll-smart-dns/admin-credentials
 test -f /var/lib/pressroll-smart-dns/install-complete
+test "$(stat -c '%a' /var/www/pressroll-smart-dns)" = 755
 first_token="$(active_token)"
 test -n "$first_token"
+test -s "/var/www/pressroll-smart-dns/$first_token.mobileconfig"
 grep -Fq 'AdGuard Home admin credentials' /tmp/pressroll-first-install.out
 
 rm /var/lib/pressroll-smart-dns/install-complete

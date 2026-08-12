@@ -57,6 +57,7 @@ CREDENTIALS_FILE="$STATE_DIR/admin-credentials"
 DOH_TOKEN_FILE="$STATE_DIR/doh-token"
 INSTALL_COMPLETE_FILE="$STATE_DIR/install-complete"
 BACKUP_ROOT="$(pressroll_under_root "$ROOT" /var/backups/pressroll-smart-dns)"
+WEBROOT="$(pressroll_under_root "$ROOT" /var/www/pressroll-smart-dns)"
 PRINT_INSTALL_SUMMARY=0
 [[ -f "$INSTALL_COMPLETE_FILE" ]] || PRINT_INSTALL_SUMMARY=1
 
@@ -94,8 +95,9 @@ mapfile -t required_packages < <(pressroll_required_packages)
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     "${required_packages[@]}"
 
-mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" /var/www/html /etc/nginx/stream.d
+mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" "$WEBROOT" /etc/nginx/stream.d
 chmod 700 "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"
+chmod 755 "$WEBROOT"
 if ! id adguardhome >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/AdGuardHome --create-home --shell /usr/sbin/nologin adguardhome
 fi
@@ -134,7 +136,6 @@ fi
 ADMIN_HASH="$(htpasswd -bnBC 10 admin "$ADMIN_PASSWORD" | tr -d '\r' | cut -d: -f2-)"
 DOH_TOKEN="$(pressroll_load_or_create_doh_token "$DOH_TOKEN_FILE")"
 CERT_ROOT="/etc/letsencrypt/live/$DOMAIN"
-WEBROOT=/var/www/html
 PROFILE_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1)-a$(openssl rand -hex 1)-$(openssl rand -hex 6)"
 PAYLOAD_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1)-b$(openssl rand -hex 1)-$(openssl rand -hex 6)"
 stage="$(mktemp -d "$STATE_DIR/.stage.XXXXXX")"
