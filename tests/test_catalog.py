@@ -68,6 +68,29 @@ class CatalogTests(unittest.TestCase):
         )
         self.assertEqual("files.oaiusercontent.com", row.probe)
 
+    def test_sensitive_and_infrastructure_domains_are_not_default_chatgpt(self):
+        catalog = Catalog.load(ROOT / "config")
+        default_rows = {row.domain for row in catalog.enabled_policy(catalog.default_service_ids)}
+        self.assertNotIn("crixet.com", default_rows)
+        self.assertNotIn("gpt3-openai.com", default_rows)
+        self.assertNotIn("openaiapi-site.azureedge.net", default_rows)
+        self.assertNotIn("openaipublic.blob.core.windows.net", default_rows)
+        for domain in (
+            "crixet.com",
+            "gpt3-openai.com",
+            "openaiapi-site.azureedge.net",
+            "openaipublic.blob.core.windows.net",
+        ):
+            service_ids = catalog.associations[domain]
+            self.assertTrue(service_ids)
+            self.assertTrue(
+                all(
+                    service.risk_level == "experimental"
+                    for service in catalog.services
+                    if service.id in service_ids
+                )
+            )
+
     def test_policy_is_deterministic_full_catalog_projection(self):
         catalog = Catalog.load(ROOT / "config")
         with (ROOT / "config/policy.csv").open(
@@ -100,6 +123,24 @@ class CatalogTests(unittest.TestCase):
             service_domains = config_dir / "service-domains.csv"
             with service_domains.open("a", encoding="utf-8") as stream:
                 stream.write("missing_service,example.com\n")
+            with self.assertRaises(ValueError):
+                Catalog.load(config_dir)
+
+    def test_catalog_rejects_probe_outside_associated_domain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory)
+            for name in (
+                "services.csv",
+                "domains.csv",
+                "service-domains.csv",
+                "service-probes.csv",
+            ):
+                (config_dir / name).write_text(
+                    (ROOT / "config" / name).read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            with (config_dir / "service-probes.csv").open("a", encoding="utf-8") as stream:
+                stream.write("chatgpt,probe.unrelated.example\n")
             with self.assertRaises(ValueError):
                 Catalog.load(config_dir)
 

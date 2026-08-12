@@ -208,6 +208,17 @@ class Catalog:
                 raise ValueError(
                     "service-probes.csv line %d: unknown service %s" % (line_number, service_id)
                 )
+            associated_domains = [
+                row.domain for row in service_domains if row.service_id == service_id
+            ]
+            if not any(
+                hostname == domain or hostname.endswith("." + domain)
+                for domain in associated_domains
+            ):
+                raise ValueError(
+                    "service-probes.csv line %d: hostname %s is not associated with service %s"
+                    % (line_number, hostname, service_id)
+                )
             key = (service_id, hostname)
             if key in probe_ids:
                 raise ValueError(

@@ -61,7 +61,7 @@ github_copilot,copilot-workspace.githubnext.com
 microsoft_copilot,copilot.cloud.microsoft
 microsoft_copilot,copilot.com
 microsoft_copilot,copilot.microsoft.com
-chatgpt,crixet.com
+misc_experimental,crixet.com
 microsoft_shared,d.docs.live.net
 developer_infrastructure,daily-cloudcode-pa.googleapis.com
 google_apps,datastudio.google.com
@@ -107,7 +107,7 @@ gemini,generativeai.google
 developer_infrastructure,generativelanguage.googleapis.com
 developer_infrastructure,geolocation.onetrust.com
 github_copilot,githubcopilot.com
-chatgpt,gpt3-openai.com
+misc_experimental,gpt3-openai.com
 twitch,gql.twitch.tv
 grok,grok.com
 grok,grok.x.com
@@ -156,8 +156,8 @@ google_apps,opal.google.com
 google_apps,opal.withgoogle.com
 chatgpt,openai.com
 openai_shared,openai.com
-chatgpt,openaiapi-site.azureedge.net
-chatgpt,openaipublic.blob.core.windows.net
+openai_shared,openaiapi-site.azureedge.net
+openai_shared,openaipublic.blob.core.windows.net
 oracle,oracle.com
 developer_infrastructure,people-pa.clients6.google.com
 perplexity,perplexity.ai
