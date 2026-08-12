@@ -1,0 +1,79 @@
+id,name_ru,category,default_enabled,risk_level
+chatgpt,ChatGPT,ИИ,true,standard
+claude,Claude,ИИ,true,standard
+gemini,Gemini,ИИ,true,standard
+microsoft_copilot,Microsoft Copilot,ИИ,true,standard
+github_copilot,GitHub Copilot,Разработка,true,standard
+grok,Grok,ИИ,true,standard
+perplexity,Perplexity,ИИ,false,standard
+midjourney,Midjourney,ИИ,false,standard
+fitbit,Fitbit,Здоровье,false,standard
+google_apps,Google AI и приложения,Продуктивность,false,standard
+spotify,Spotify,Музыка,false,standard
+xbox,Xbox,Игры,false,standard
+adobe,Adobe,Дизайн,false,standard
+amd,AMD,Технологии,false,standard
+canva,Canva,Дизайн,false,standard
+autodesk,Autodesk,Дизайн,false,standard
+badoo,Badoo,Общение,false,standard
+basecamp,Basecamp,Продуктивность,false,standard
+brave,Brave,Браузеры,false,standard
+chess,Chess.com,Игры,false,standard
+cici,Cici,ИИ,false,standard
+clickup,ClickUp,Продуктивность,false,standard
+codeium,Codeium,Разработка,false,standard
+deepl,DeepL,ИИ,false,standard
+deezer,Deezer,Музыка,false,standard
+dell,Dell,Технологии,false,standard
+designify,Designify,Дизайн,false,standard
+dola,Dola,Продуктивность,false,standard
+dyson,Dyson,Технологии,false,standard
+elevenlabs,ElevenLabs,ИИ,false,standard
+elgato,Elgato,Технологии,false,standard
+flowmusic,Flow Music,Музыка,false,standard
+fmhy,FMHY,Справка,false,standard
+framer,Framer,Дизайн,false,standard
+guidedhacking,Guided Hacking,Разработка,false,standard
+guilded,Guilded,Общение,false,standard
+intel,Intel,Технологии,false,standard
+jetbrains,JetBrains,Разработка,false,standard
+kaleido,Kaleido,Дизайн,false,standard
+lastfm,Last.fm,Музыка,false,standard
+linear,Linear,Продуктивность,false,standard
+make,Make,Автоматизация,false,standard
+manus,Manus,ИИ,false,standard
+meta_ai,Meta AI,ИИ,false,standard
+mongodb,MongoDB,Разработка,false,standard
+naukri,Naukri,Работа,false,standard
+notion,Notion,Продуктивность,false,standard
+nvidia,NVIDIA,Технологии,false,standard
+oracle,Oracle,Технологии,false,standard
+parsec,Parsec,Игры,false,standard
+pump_fun,Pump.fun,Финансы,false,standard
+qualtrics,Qualtrics,Продуктивность,false,standard
+qwant,Qwant,Поиск,false,standard
+remove_bg,Remove.bg,Дизайн,false,standard
+reve,Reve,Дизайн,false,standard
+sketchup,SketchUp и Trimble,Дизайн,false,standard
+strava,Strava,Спорт,false,standard
+tableau,Tableau,Аналитика,false,standard
+teamviewer,TeamViewer,Технологии,false,standard
+trae,Trae,Разработка,false,standard
+truthsocial,Truth Social,Общение,false,standard
+tria,Tria,Безопасность,false,standard
+twitch,Twitch,Видео,false,standard
+tuta,Tuta,Почта,false,standard
+unscreen,Unscreen,Видео,false,standard
+weather,Погода,Погода,false,standard
+wbgames,WB Games,Игры,false,standard
+web_archive,Internet Archive,Справка,false,standard
+windsurf,Windsurf,Разработка,false,standard
+xerox,Xerox,Технологии,false,standard
+zapier,Zapier,Автоматизация,false,standard
+openai_shared,Общие сервисы OpenAI,Общие зависимости,false,experimental
+google_shared,Общие сервисы Google,Общие зависимости,false,experimental
+cdn_shared,Общие CDN,Общие зависимости,false,experimental
+microsoft_shared,Общие сервисы Microsoft,Общие зависимости,false,experimental
+xbox_shared,Служебные сервисы Xbox,Общие зависимости,false,experimental
+developer_infrastructure,Инфраструктура разработчиков,Инфраструктура,false,experimental
+misc_experimental,Неподтверждённые домены,Экспериментальные,false,experimental

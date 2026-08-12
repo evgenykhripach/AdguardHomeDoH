@@ -8,7 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
@@ -19,6 +19,249 @@ class PolicyRow:
     domain: str
     kind: str
     probe: str
+
+
+@dataclass(frozen=True)
+class ServiceRow:
+    id: str
+    name_ru: str
+    category: str
+    default_enabled: bool
+    risk_level: str
+
+
+@dataclass(frozen=True)
+class DomainRow:
+    domain: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class ServiceDomainRow:
+    service_id: str
+    domain: str
+
+
+@dataclass(frozen=True)
+class ServiceProbeRow:
+    service_id: str
+    hostname: str
+
+
+class Catalog:
+    """Validated product/service/domain catalog used by all renderers."""
+
+    _CSV_HEADERS = {
+        "services.csv": ["id", "name_ru", "category", "default_enabled", "risk_level"],
+        "domains.csv": ["domain", "kind"],
+        "service-domains.csv": ["service_id", "domain"],
+        "service-probes.csv": ["service_id", "hostname"],
+    }
+
+    def __init__(
+        self,
+        services: Sequence[ServiceRow],
+        domains: Sequence[DomainRow],
+        service_domains: Sequence[ServiceDomainRow],
+        service_probes: Sequence[ServiceProbeRow],
+    ):
+        self.services = tuple(services)
+        self.domains = tuple(domains)
+        self.service_domains = tuple(service_domains)
+        self.service_probes = tuple(service_probes)
+        self._service_ids = {service.id for service in self.services}
+        self._domain_ids = {domain.domain for domain in self.domains}
+        associations: Dict[str, List[str]] = {domain.domain: [] for domain in self.domains}
+        for row in self.service_domains:
+            associations[row.domain].append(row.service_id)
+        self._associations = {
+            domain: tuple(sorted(service_ids))
+            for domain, service_ids in associations.items()
+        }
+        probes: Dict[str, List[str]] = {service.id: [] for service in self.services}
+        for row in self.service_probes:
+            probes[row.service_id].append(row.hostname)
+        self._probes = {
+            service_id: tuple(sorted(hostnames))
+            for service_id, hostnames in probes.items()
+        }
+
+    @property
+    def default_service_ids(self) -> Tuple[str, ...]:
+        return tuple(service.id for service in self.services if service.default_enabled)
+
+    @property
+    def associations(self) -> Mapping[str, Tuple[str, ...]]:
+        return self._associations
+
+    @classmethod
+    def _read_rows(cls, config_dir: Path, filename: str) -> List[dict]:
+        path = config_dir / filename
+        try:
+            stream = path.open("r", encoding="utf-8", newline="")
+        except OSError as exc:
+            raise ValueError("cannot read %s: %s" % (path, exc)) from exc
+        with stream:
+            reader = csv.DictReader(stream)
+            expected = cls._CSV_HEADERS[filename]
+            if reader.fieldnames != expected:
+                raise ValueError(
+                    "%s header must be exactly: %s"
+                    % (filename, ",".join(expected))
+                )
+            return [
+                raw
+                for raw in reader
+                if raw and any((value or "").strip() for value in raw.values())
+            ]
+
+    @staticmethod
+    def _identifier(value: str, field: str) -> str:
+        value = (value or "").strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", value):
+            raise ValueError("%s must be a normalized identifier: %r" % (field, value))
+        return value
+
+    @classmethod
+    def load(cls, config_dir: Path) -> "Catalog":
+        config_dir = Path(config_dir)
+        service_rows = cls._read_rows(config_dir, "services.csv")
+        domain_rows = cls._read_rows(config_dir, "domains.csv")
+        relation_rows = cls._read_rows(config_dir, "service-domains.csv")
+        probe_rows = cls._read_rows(config_dir, "service-probes.csv")
+
+        services: List[ServiceRow] = []
+        service_ids = set()
+        for line_number, raw in enumerate(service_rows, 2):
+            service_id = cls._identifier(raw.get("id", ""), "service id")
+            if service_id in service_ids:
+                raise ValueError("services.csv line %d: duplicate service %s" % (line_number, service_id))
+            name_ru = (raw.get("name_ru") or "").strip()
+            category = (raw.get("category") or "").strip()
+            if not name_ru or not category:
+                raise ValueError("services.csv line %d: name_ru and category are required" % line_number)
+            default_value = (raw.get("default_enabled") or "").strip().lower()
+            if default_value not in ("true", "false"):
+                raise ValueError(
+                    "services.csv line %d: default_enabled must be true or false" % line_number
+                )
+            risk_level = (raw.get("risk_level") or "").strip().lower()
+            if risk_level not in ("standard", "experimental"):
+                raise ValueError(
+                    "services.csv line %d: risk_level must be standard or experimental" % line_number
+                )
+            if default_value == "true" and risk_level == "experimental":
+                raise ValueError(
+                    "services.csv line %d: experimental service cannot be default-enabled" % line_number
+                )
+            services.append(
+                ServiceRow(service_id, name_ru, category, default_value == "true", risk_level)
+            )
+            service_ids.add(service_id)
+        if not services:
+            raise ValueError("services.csv is empty")
+
+        domains: List[DomainRow] = []
+        domain_ids = set()
+        for line_number, raw in enumerate(domain_rows, 2):
+            domain = _hostname(raw.get("domain", ""), "domain")
+            kind = (raw.get("kind") or "").strip().lower()
+            if kind not in ("fqdn", "suffix"):
+                raise ValueError("domains.csv line %d: kind must be fqdn or suffix" % line_number)
+            if domain in domain_ids:
+                raise ValueError("domains.csv line %d: duplicate domain %s" % (line_number, domain))
+            domains.append(DomainRow(domain, kind))
+            domain_ids.add(domain)
+        if not domains:
+            raise ValueError("domains.csv is empty")
+
+        service_domains: List[ServiceDomainRow] = []
+        relation_ids = set()
+        for line_number, raw in enumerate(relation_rows, 2):
+            service_id = cls._identifier(raw.get("service_id", ""), "service_id")
+            domain = _hostname(raw.get("domain", ""), "domain")
+            if service_id not in service_ids:
+                raise ValueError(
+                    "service-domains.csv line %d: unknown service %s" % (line_number, service_id)
+                )
+            if domain not in domain_ids:
+                raise ValueError(
+                    "service-domains.csv line %d: unknown domain %s" % (line_number, domain)
+                )
+            key = (service_id, domain)
+            if key in relation_ids:
+                raise ValueError(
+                    "service-domains.csv line %d: duplicate relation %s/%s"
+                    % (line_number, service_id, domain)
+                )
+            service_domains.append(ServiceDomainRow(service_id, domain))
+            relation_ids.add(key)
+        if not service_domains:
+            raise ValueError("service-domains.csv is empty")
+
+        service_probes: List[ServiceProbeRow] = []
+        probe_ids = set()
+        for line_number, raw in enumerate(probe_rows, 2):
+            service_id = cls._identifier(raw.get("service_id", ""), "service_id")
+            hostname = _hostname(raw.get("hostname", ""), "hostname")
+            if service_id not in service_ids:
+                raise ValueError(
+                    "service-probes.csv line %d: unknown service %s" % (line_number, service_id)
+                )
+            key = (service_id, hostname)
+            if key in probe_ids:
+                raise ValueError(
+                    "service-probes.csv line %d: duplicate probe %s/%s"
+                    % (line_number, service_id, hostname)
+                )
+            service_probes.append(ServiceProbeRow(service_id, hostname))
+            probe_ids.add(key)
+
+        service_domain_ids = {row.service_id for row in service_domains}
+        if missing := service_ids - service_domain_ids:
+            raise ValueError("services without domains: %s" % ",".join(sorted(missing)))
+        domain_service_ids = {row.domain for row in service_domains}
+        if missing := domain_ids - domain_service_ids:
+            raise ValueError("domains without services: %s" % ",".join(sorted(missing)))
+
+        return cls(services, domains, service_domains, service_probes)
+
+    def enabled_policy(
+        self,
+        service_ids: Collection[str],
+        healthy_service_ids: Optional[Collection[str]] = None,
+    ) -> List[PolicyRow]:
+        selected = {self._identifier(service_id, "service id") for service_id in service_ids}
+        unknown = selected - self._service_ids
+        if unknown:
+            raise ValueError("unknown services: %s" % ",".join(sorted(unknown)))
+        if healthy_service_ids is None:
+            active = selected
+        else:
+            healthy = {self._identifier(service_id, "healthy service id") for service_id in healthy_service_ids}
+            unknown = healthy - self._service_ids
+            if unknown:
+                raise ValueError("unknown healthy services: %s" % ",".join(sorted(unknown)))
+            active = selected & healthy
+
+        rows: List[PolicyRow] = []
+        for domain in self.domains:
+            associated = [service_id for service_id in self._associations[domain.domain] if service_id in active]
+            if not associated:
+                continue
+            probe = domain.domain
+            for service_id in associated:
+                for hostname in self._probes[service_id]:
+                    if hostname == domain.domain or hostname.endswith("." + domain.domain):
+                        probe = hostname
+                        break
+                if probe != domain.domain:
+                    break
+            rows.append(PolicyRow(domain.domain, domain.kind, probe))
+        return rows
+
+    def full_policy(self) -> List[PolicyRow]:
+        return self.enabled_policy(self._service_ids)
 
 
 def _hostname(value: str, field: str, allow_empty: bool = False) -> str:
@@ -63,10 +306,14 @@ def _public_ipv4(value: str) -> str:
     return str(address)
 
 
+def _ordered_rows(rows: Iterable[PolicyRow]) -> List[PolicyRow]:
+    return sorted(rows, key=lambda row: (row.domain, row.kind))
+
+
 def render_rewrites(rows: Sequence[PolicyRow], public_ip: str):
     public_ip = _public_ipv4(public_ip)
     output = []
-    for row in rows:
+    for row in _ordered_rows(rows):
         names = [row.domain]
         if row.kind == "suffix":
             names.append("*." + row.domain)
@@ -313,7 +560,7 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
         "        default 127.0.0.1:9;",
         "        %s 127.0.0.1:4443;" % doh_host,
     ]
-    for row in rows:
+    for row in _ordered_rows(rows):
         name = "." + row.domain if row.kind == "suffix" else row.domain
         lines.append("        %s $ssl_preread_server_name:443;" % name)
     lines.extend([
@@ -337,13 +584,29 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
 def render_health_policy(rows: Iterable[PolicyRow]) -> str:
     payload = [
         {"domain": row.domain, "kind": row.kind, "probe": row.probe}
-        for row in rows
+        for row in _ordered_rows(rows)
     ]
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
 
 
-def render(output: Path, policy: Path, public_ip: str, doh_host: str) -> None:
-    rows = load_policy(policy)
+def render(
+    output: Path,
+    policy: Optional[Path] = None,
+    public_ip: str = "",
+    doh_host: str = "",
+    *,
+    config_dir: Optional[Path] = None,
+    service_ids: Optional[Collection[str]] = None,
+    healthy_service_ids: Optional[Collection[str]] = None,
+) -> None:
+    if config_dir is not None:
+        catalog = Catalog.load(config_dir)
+        selected = catalog.default_service_ids if service_ids is None else service_ids
+        rows = catalog.enabled_policy(selected, healthy_service_ids)
+    elif policy is not None:
+        rows = load_policy(policy)
+    else:
+        raise ValueError("either policy or config-dir is required")
     output.mkdir(parents=True, exist_ok=True)
     (output / "nginx-stream.conf").write_text(
         render_nginx_stream(rows, doh_host), encoding="utf-8"
@@ -362,12 +625,33 @@ def render(output: Path, policy: Path, public_ip: str, doh_host: str) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--policy", type=Path)
+    parser.add_argument("--config-dir", type=Path)
+    parser.add_argument("--services", help="comma-separated service IDs")
+    parser.add_argument("--healthy-services", help="comma-separated healthy service IDs")
     parser.add_argument("--public-ip", required=True)
     parser.add_argument("--doh-host", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    render(args.output, args.policy, args.public_ip, args.doh_host)
+    if args.policy is None and args.config_dir is None:
+        parser.error("one of --policy or --config-dir is required")
+    if args.policy is not None and args.config_dir is not None:
+        parser.error("--policy and --config-dir are mutually exclusive")
+
+    def split_services(value):
+        if value is None:
+            return None
+        return [service_id.strip() for service_id in value.split(",") if service_id.strip()]
+
+    render(
+        args.output,
+        args.policy,
+        args.public_ip,
+        args.doh_host,
+        config_dir=args.config_dir,
+        service_ids=split_services(args.services),
+        healthy_service_ids=split_services(args.healthy_services),
+    )
     return 0
 
 

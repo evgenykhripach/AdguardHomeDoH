@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.render_config import (  # noqa: E402
+    Catalog,
     load_policy,
     render_adguard_yaml,
     render_health_policy,
@@ -20,7 +21,10 @@ from tools.render_config import (  # noqa: E402
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--policy", type=Path)
+    parser.add_argument("--config-dir", type=Path)
+    parser.add_argument("--services", help="comma-separated service IDs")
+    parser.add_argument("--healthy-services", help="comma-separated healthy service IDs")
     parser.add_argument("--public-ip", required=True)
     parser.add_argument("--doh-host", required=True)
     parser.add_argument("--doh-token", required=True)
@@ -30,7 +34,26 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    rows = load_policy(args.policy)
+    if args.policy is None and args.config_dir is None:
+        parser.error("one of --policy or --config-dir is required")
+    if args.policy is not None and args.config_dir is not None:
+        parser.error("--policy and --config-dir are mutually exclusive")
+
+    def split_services(value):
+        if value is None:
+            return None
+        return [service_id.strip() for service_id in value.split(",") if service_id.strip()]
+
+    if args.config_dir is not None:
+        catalog = Catalog.load(args.config_dir)
+        selected = catalog.default_service_ids
+        if args.services is not None:
+            selected = split_services(args.services)
+        rows = catalog.enabled_policy(selected, split_services(args.healthy_services))
+    else:
+        if args.services is not None or args.healthy_services is not None:
+            parser.error("--services and --healthy-services require --config-dir")
+        rows = load_policy(args.policy)
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     (args.output / "AdGuardHome.yaml").write_text(
         render_adguard_yaml(rows, args.password_hash), encoding="utf-8"

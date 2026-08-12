@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 from tools.render_config import (
+    Catalog,
     load_policy,
+    render,
     render_adguard_yaml,
     render_nginx_http,
     render_nginx_stream,
@@ -94,6 +96,36 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn("location = /doh/" + "a" * 48, http)
         self.assertIn("location = /" + "a" * 48 + ".mobileconfig {", http)
         self.assertNotIn("listen 443 ssl", http)
+
+    def test_catalog_rows_render_deterministically_for_selected_services(self):
+        root = Path(__file__).resolve().parents[1]
+        catalog = Catalog.load(root / "config")
+        rows = catalog.enabled_policy(["chatgpt"])
+        first = render_nginx_stream(rows, "dns.example.com")
+        second = render_nginx_stream(list(reversed(rows)), "dns.example.com")
+        self.assertEqual(first, second)
+        self.assertIn("chatgpt.com $ssl_preread_server_name:443;", first)
+
+    def test_render_accepts_catalog_and_selected_services(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            render(
+                output,
+                public_ip="203.0.113.10",
+                doh_host="dns.example.com",
+                config_dir=root / "config",
+                service_ids=["chatgpt"],
+            )
+            health = json.loads(
+                (output / "health-policy.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(health)
+            self.assertEqual(
+                "files.oaiusercontent.com",
+                next(row["probe"] for row in health if row["domain"] == "oaiusercontent.com"),
+            )
+            self.assertNotIn("anthropic.com", (output / "nginx-stream.conf").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
