@@ -16,7 +16,7 @@ def run_pty(*args, input_text="", timeout=5):
     master, slave = pty.openpty()
     env = dict(os.environ)
     env["PYTHONPYCACHEPREFIX"] = "/tmp/adguardhome-doh-pycache"
-    env["ADGUARDHOME_DOH_TTY_FD"] = "0"
+    env.pop("ADGUARDHOME_DOH_TTY_FD", None)
     process = subprocess.Popen(
         [str(INSTALL), *args], cwd=ROOT, env=env,
         stdin=slave, stdout=slave, stderr=slave,
@@ -105,6 +105,8 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertIn("chatgpt", output.lower())
         self.assertIn("install", output.lower())
+        self.assertEqual(1, output.count("Домен (например, dns.example.com):"), output)
+        self.assertIn("Сервисы:", output)
 
     def test_log_path_and_secrets_are_not_emitted_during_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:

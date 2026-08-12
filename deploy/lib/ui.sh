@@ -26,9 +26,13 @@ adguardhome_doh_read_tty() {
     if [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]]; then
         printf '%s' "$prompt" >&2
         IFS= read -r value || { adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2; }
-    elif printf '%s' "$prompt" > /dev/tty 2>/dev/null && exec 3<>/dev/tty 2>/dev/null; then
-        IFS= read -r value <&3 || { exec 3>&-; adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2; }
-        exec 3>&-
+    elif [[ -r /dev/tty && -w /dev/tty ]]; then
+        printf '%s' "$prompt" > /dev/tty 2>/dev/null || {
+            adguardhome_doh_ui_error "input terminal is unavailable"; return 2;
+        }
+        IFS= read -r value < /dev/tty || {
+            adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2;
+        }
     else
         printf '%s' "$prompt" >&2
         IFS= read -r value || { adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2; }
