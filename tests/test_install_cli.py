@@ -76,6 +76,21 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(checksum, result.stdout.strip())
 
+    def test_adguard_binary_is_found_after_archive_extraction(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "nested" / "AdGuardHome" / "AdGuardHome"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"binary")
+            binary.chmod(0o755)
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; pressroll_find_adguard_binary "$2"',
+                 "bash", str(common), directory],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(str(binary), result.stdout.strip())
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)

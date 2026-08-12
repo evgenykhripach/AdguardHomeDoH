@@ -108,8 +108,9 @@ if [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
     [[ "$checksum" =~ ^[0-9a-fA-F]{64}$ ]] || pressroll_die "AdGuard checksum missing for $archive"
     printf '%s  %s\n' "$checksum" "$work/$archive" | sha256sum -c -
     tar -xzf "$work/$archive" -C "$work"
-    install -d -m 755 /opt/AdGuardHome
-    install -m 755 "$work/AdGuardHome/AdGuardHome" /opt/AdGuardHome/AdGuardHome
+    adguard_binary="$(pressroll_find_adguard_binary "$work")"
+    [[ -n "$adguard_binary" ]] || pressroll_die "AdGuard binary missing after extraction"
+    install -D -m 755 "$adguard_binary" /opt/AdGuardHome/AdGuardHome
 fi
 
 if [[ -f "$CREDENTIALS_FILE" ]]; then

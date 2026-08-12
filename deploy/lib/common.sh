@@ -31,6 +31,11 @@ pressroll_find_checksum() {
         "$checksums_file"
 }
 
+pressroll_find_adguard_binary() {
+    local root="$1"
+    find "$root" -type f -path '*/AdGuardHome/AdGuardHome' -perm -u+x -print -quit
+}
+
 pressroll_validate_hostname() {
     [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || \
         pressroll_die "invalid hostname: $1"
