@@ -44,6 +44,11 @@ class InstallerCliTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("--public-ip is required", result.stderr)
 
+    def test_first_install_prints_doh_and_mobileconfig_urls(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)
+        self.assertIn("printf 'mobileconfig: https://%s/%s.mobileconfig\\n'", source)
+
     def test_credentials_are_mode_600_and_preserve_password(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "admin-credentials"

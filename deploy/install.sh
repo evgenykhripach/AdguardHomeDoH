@@ -229,7 +229,8 @@ if ((FIRST_INSTALL)); then
     printf '\nAdGuard Home admin credentials (save them now):\n'
     printf 'URL: https://%s/\nLogin: admin\nPassword: %s\n' "$DOMAIN" "$ADMIN_PASSWORD"
     printf 'Saved locally: %s (mode 0600)\n' "$CREDENTIALS_FILE"
-    printf 'Apple profile: https://%s/%s.mobileconfig\n' "$DOMAIN" "$DOH_TOKEN"
+    printf 'DoH URL: https://%s/doh/%s\n' "$DOMAIN" "$DOH_TOKEN"
+    printf 'mobileconfig: https://%s/%s.mobileconfig\n' "$DOMAIN" "$DOH_TOKEN"
 else
     printf 'Updated Smart DNS; existing AdGuard credentials were preserved.\n'
 fi
