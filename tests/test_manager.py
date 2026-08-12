@@ -48,6 +48,36 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("new_domains", preview)
         self.assertIn("removed_domains", preview)
 
+    def test_update_status_uses_installed_project_version_not_adguard_version(self):
+        manager = load_manager()
+        releases = manager._load_releases()
+        release = releases.parse_release(
+            {
+                "tag_name": "v1.0.9",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "adguardhome-doh.tar.gz", "browser_download_url": "archive"},
+                    {"name": "adguardhome-doh.tar.gz.sha256", "browser_download_url": "checksum"},
+                ],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "var/lib/adguardhome-doh"
+            state_dir.mkdir(parents=True)
+            (state_dir / "install.json").write_text(
+                '{"domain":"dns.example.com","public_ip":"203.0.113.10",'
+                '"email":"admin@example.com","version":"0.107.78",'
+                '"repository":"evgenykhripach/AdguardHomeDoH"}',
+                encoding="utf-8",
+            )
+            version_file = root / "usr/local/libexec/adguardhome-doh/VERSION"
+            version_file.parent.mkdir(parents=True)
+            version_file.write_text("1.0.8\n", encoding="utf-8")
+            status = manager.update_status(root, release_loader=lambda: release)
+            self.assertEqual("1.0.8", status["current"])
+
     def test_transaction_restores_all_targets_when_validation_fails(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:

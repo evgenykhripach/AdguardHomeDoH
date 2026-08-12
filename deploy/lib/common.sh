@@ -131,6 +131,7 @@ adguardhome_doh_install_health_templates() {
     [[ -f "$project_root/tools/render_config.py" ]] || adguardhome_doh_die "render_config.py is missing"
     [[ -f "$project_root/deploy/lib/render_runtime.py" ]] || adguardhome_doh_die "render_runtime.py is missing"
     [[ -f "$project_root/deploy/lib/releases.py" ]] || adguardhome_doh_die "releases.py is missing"
+    [[ -f "$project_root/VERSION" ]] || adguardhome_doh_die "VERSION is missing"
     mkdir -p "$libexec" "$systemd"
     chmod 700 "$libexec"
     cp "$templates/healthcheck.py" "$libexec/healthcheck.py"
@@ -144,6 +145,7 @@ adguardhome_doh_install_health_templates() {
     install -m 755 "$project_root/tools/render_config.py" "$libexec/render_config.py"
     install -m 755 "$project_root/deploy/lib/render_runtime.py" "$libexec/render_runtime.py"
     install -m 755 "$project_root/deploy/lib/releases.py" "$libexec/releases.py"
+    install -m 644 "$project_root/VERSION" "$libexec/VERSION"
 }
 
 adguardhome_doh_abs_root() {

@@ -81,6 +81,8 @@ BACKUP_ROOT="$(adguardhome_doh_under_root "$ROOT" /var/backups/adguardhome-doh)"
 WEBROOT="$(adguardhome_doh_under_root "$ROOT" /var/www/adguardhome-doh)"
 LOG_PATH="$(adguardhome_doh_under_root "$ROOT" /var/log/adguardhome-doh/install-$(date -u +%Y%m%dT%H%M%SZ).log)"
 VERSION_FILE="$PROJECT_ROOT/VERSION"
+PROJECT_VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
+[[ "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || adguardhome_doh_die "invalid project VERSION: $PROJECT_VERSION"
 
 adguardhome_doh_default_services() {
     python3 - "$PROJECT_ROOT" <<'PY'
@@ -347,7 +349,7 @@ chmod 600 /etc/adguardhome-doh/runtime.env
 if [[ ! -f "$CREDENTIALS_FILE" ]]; then
     python3 "$SCRIPT_DIR/lib/credentials.py" --path "$CREDENTIALS_FILE"         --url "https://$DOMAIN/" --password "$ADMIN_PASSWORD" >/dev/null
 fi
-python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$ADGUARD_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" <<'PY'
+python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path

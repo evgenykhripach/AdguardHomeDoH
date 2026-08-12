@@ -43,6 +43,7 @@ MANAGED_FILES = (
     "/etc/systemd/system/adguardhome-doh-health.service",
     "/etc/systemd/system/adguardhome-doh-health.timer",
     "/usr/local/libexec/adguardhome-doh",
+    "/usr/local/libexec/adguardhome-doh/VERSION",
     "/usr/local/sbin/adguardhome-doh",
 )
 
@@ -263,6 +264,7 @@ def _runtime_paths(root: Path) -> Dict[str, Path]:
         "enabled": under_root(root, "/var/lib/adguardhome-doh/enabled-services.json"),
         "health_state": under_root(root, "/var/lib/adguardhome-doh/health-state.json"),
         "webroot": under_root(root, "/var/www/adguardhome-doh"),
+        "manager_version": under_root(root, "/usr/local/libexec/adguardhome-doh/VERSION"),
     }
 
 
@@ -455,11 +457,26 @@ def _current_install_state(root: Path) -> Mapping[str, Any]:
     return state
 
 
+def _installed_project_version(root: Path, state: Mapping[str, Any]) -> Any:
+    """Read the adguardhome-doh version, never the bundled AdGuard version."""
+
+    paths = _runtime_paths(Path(root))
+    raw = ""
+    try:
+        raw = paths["manager_version"].read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = str(state.get("version", "0.0.0"))
+    try:
+        return _load_releases().parse_semver(raw or "0.0.0")
+    except ValueError:
+        return _load_releases().parse_semver("0.0.0")
+
+
 def update_status(root: Path = Path("/"), release_loader: Optional[Callable[[], Any]] = None) -> Dict[str, Any]:
     state = _current_install_state(Path(root))
     repository = str(state.get("repository", "evgenykhripach/AdguardHomeDoH"))
     releases = _load_releases()
-    current = releases.parse_semver(str(state.get("version", "0.0.0")))
+    current = _installed_project_version(root, state)
     latest = (release_loader or (lambda: releases.latest_release(repository)))()
     if latest is None:
         return {"available": False, "reason": "нет стабильного релиза", "current": current.text()}
@@ -499,7 +516,7 @@ def install_update(
     release = release or releases.latest_release(str(state.get("repository", "evgenykhripach/AdguardHomeDoH")))
     if release is None:
         return False
-    current = releases.parse_semver(str(state.get("version", "0.0.0")))
+    current = _installed_project_version(root, state)
     if release.version <= current:
         return False
     backup_dir = create_backup(root)

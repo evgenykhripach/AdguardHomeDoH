@@ -32,7 +32,8 @@ class InstallerCliTests(unittest.TestCase):
             'ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.78}"',
             source,
         )
-        self.assertNotIn('$(<"$PROJECT_ROOT/VERSION")', source)
+        self.assertIn('PROJECT_VERSION="$(tr -d \'\\r\\n\' < "$VERSION_FILE")"', source)
+        self.assertIn('"$PROJECT_VERSION" "$REPOSITORY"', source)
 
     def test_dry_run_validates_without_writing_root(self):
         with tempfile.TemporaryDirectory() as directory:
