@@ -315,6 +315,7 @@ def apply_service_change(
             paths["enabled"]: enabled_stage,
         }
         backup_dir = paths["backup"] / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        full_backup = create_backup(root, backup_dir / "full")
 
         def validate() -> None:
             if validator is not None:
@@ -326,7 +327,11 @@ def apply_service_change(
             subprocess.run(["nginx", "-t"], check=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        return activate_transaction(targets, backup_dir, validate=validate, root=root)
+        try:
+            return activate_transaction(targets, backup_dir, validate=validate, root=root)
+        except Exception:
+            _restore_backup(full_backup, root)
+            raise
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
