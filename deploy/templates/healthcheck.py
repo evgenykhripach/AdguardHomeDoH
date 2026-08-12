@@ -101,12 +101,16 @@ def service_probe_map(policy: Any) -> Dict[str, Tuple[str, ...]]:
         if isinstance(services, Mapping):
             for service_id, value in services.items():
                 result[str(service_id)] = set(_as_hosts(value))
+            # The service map is authoritative for the catalog format.  Domain
+            # ownership rows describe rewrite coverage, not extra TLS probes.
+            return {service_id: tuple(sorted(hosts)) for service_id, hosts in sorted(result.items())}
         elif isinstance(services, Sequence):
             for item in services:
                 if isinstance(item, Mapping):
                     service_id = item.get("id", item.get("service_id"))
                     if service_id:
                         result.setdefault(str(service_id), set()).update(_as_hosts(item))
+            return {service_id: tuple(sorted(hosts)) for service_id, hosts in sorted(result.items())}
         rows = policy.get("domains", [])
     else:
         rows = policy if isinstance(policy, Sequence) else []

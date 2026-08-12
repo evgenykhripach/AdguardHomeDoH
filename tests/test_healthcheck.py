@@ -47,6 +47,20 @@ class HealthcheckTests(unittest.TestCase):
         self.assertEqual({"chatgpt": False, "claude": True}, results)
         self.assertLessEqual(peak, 2)
 
+    def test_catalog_service_probes_do_not_expand_to_all_owned_domains(self):
+        health = load_healthcheck()
+        policy = {
+            "services": {"chatgpt": ["chatgpt.com", "files.oaiusercontent.com"]},
+            "domains": [
+                {"domain": "chat.com", "services": ["chatgpt"]},
+                {"domain": "chatgpt.livekit.cloud", "services": ["chatgpt"]},
+            ],
+        }
+        self.assertEqual(
+            ("chatgpt.com", "files.oaiusercontent.com"),
+            health.service_probe_map(policy)["chatgpt"],
+        )
+
     def test_success_and_failure_thresholds_transition_service_state(self):
         health = load_healthcheck()
         state = {}
