@@ -36,6 +36,22 @@ pressroll_find_adguard_binary() {
     find "$root" -type f -path '*/AdGuardHome/AdGuardHome' -perm -u+x -print -quit
 }
 
+pressroll_install_health_templates() {
+    local project_root="$1" root="${2:-/}"
+    local templates="$project_root/deploy/templates"
+    local libexec systemd
+    libexec="$(pressroll_under_root "$root" /usr/local/libexec/pressroll-smart-dns)"
+    systemd="$(pressroll_under_root "$root" /etc/systemd/system)"
+    [[ -f "$templates/healthcheck.py" ]] || pressroll_die "healthcheck.py template is missing"
+    [[ -f "$templates/healthcheck.service" ]] || pressroll_die "healthcheck.service template is missing"
+    [[ -f "$templates/healthcheck.timer" ]] || pressroll_die "healthcheck.timer template is missing"
+    mkdir -p "$libexec" "$systemd"
+    chmod 700 "$libexec"
+    install -m 755 "$templates/healthcheck.py" "$libexec/healthcheck.py"
+    install -m 644 "$templates/healthcheck.service" "$systemd/pressroll-smart-dns-health.service"
+    install -m 644 "$templates/healthcheck.timer" "$systemd/pressroll-smart-dns-health.timer"
+}
+
 pressroll_validate_hostname() {
     [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || \
         pressroll_die "invalid hostname: $1"

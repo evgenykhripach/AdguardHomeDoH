@@ -194,11 +194,7 @@ ReadWritePaths=/opt/AdGuardHome /var/lib/AdGuardHome
 [Install]
 WantedBy=multi-user.target
 UNIT
-mkdir -p /usr/local/libexec/pressroll-smart-dns
-chmod 700 /usr/local/libexec/pressroll-smart-dns
-install -m 755 deploy/templates/healthcheck.py /usr/local/libexec/pressroll-smart-dns/healthcheck.py
-install -m 644 deploy/templates/healthcheck.service /etc/systemd/system/pressroll-smart-dns-health.service
-install -m 644 deploy/templates/healthcheck.timer /etc/systemd/system/pressroll-smart-dns-health.timer
+pressroll_install_health_templates "$PROJECT_ROOT"
 install -m 640 "$stage/health-policy.json" "$CONFIG_DIR/health-policy.json"
 cat > /etc/pressroll-smart-dns/runtime.env <<EOF
 PRESSROLL_AGH_URL=http://127.0.0.1:3001

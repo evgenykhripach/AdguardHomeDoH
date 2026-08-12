@@ -97,6 +97,33 @@ class InstallerCliTests(unittest.TestCase):
             'mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"', source
         )
 
+    def test_health_templates_install_outside_repository_working_directory(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination"
+            unrelated_cwd = Path(directory) / "cwd"
+            unrelated_cwd.mkdir()
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; cd "$2"; '
+                    'pressroll_install_health_templates "$3" "$4"',
+                    "bash", str(common), str(unrelated_cwd), str(ROOT),
+                    str(destination),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue(
+                (destination / "usr/local/libexec/pressroll-smart-dns/healthcheck.py").is_file()
+            )
+            self.assertTrue(
+                (destination / "etc/systemd/system/pressroll-smart-dns-health.service").is_file()
+            )
+            self.assertTrue(
+                (destination / "etc/systemd/system/pressroll-smart-dns-health.timer").is_file()
+            )
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)
