@@ -5,7 +5,10 @@ ADGUARDHOME_DOH_LAST_PROGRESS=-1
 ADGUARDHOME_DOH_PROGRESS_MILESTONES=(0 5 20 35 50 65 75 85 95 100)
 
 adguardhome_doh_ui_tty() {
-    [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]] || [[ -r /dev/tty && ( -t 0 || -t 1 ) ]]
+    [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]] && return 0
+    [[ -r /dev/tty ]] || return 1
+    [[ -w /dev/tty ]] && return 0
+    [[ -t 0 || -t 1 ]]
 }
 
 adguardhome_doh_ui_error() { printf 'ошибка: %s\n' "$*" >&2; }

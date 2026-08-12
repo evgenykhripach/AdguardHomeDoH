@@ -131,6 +131,12 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(f"<{target_domain}>\n", result.stdout)
 
+    def test_selector_tty_detection_survives_command_substitution(self):
+        ui_source = UI.read_text(encoding="utf-8")
+        self.assertIn("[[ -r /dev/tty ]] || return 1", ui_source)
+        self.assertIn("[[ -w /dev/tty ]] && return 0", ui_source)
+        self.assertNotIn("( -t 0 || -t 1 )", ui_source)
+
     def test_log_path_and_secrets_are_not_emitted_during_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
