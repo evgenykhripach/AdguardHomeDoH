@@ -44,6 +44,11 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(all(row.domain in domains for row in catalog.service_domains))
         self.assertTrue(all(row.service_id in service_ids for row in catalog.service_probes))
         self.assertEqual(domains, set(catalog.associations))
+        self.assertEqual(
+            service_ids,
+            {row.service_id for row in catalog.service_probes},
+            "every service must have at least one mandatory TLS probe",
+        )
 
     def test_shared_domain_union_respects_selected_and_healthy_services(self):
         catalog = Catalog.load(ROOT / "config")
