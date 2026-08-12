@@ -88,7 +88,8 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates curl nginx certbot openssl apache2-utils tar gzip python3
 
-install -d -m 700 "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" /var/www/html /etc/nginx/stream.d
+mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" /var/www/html /etc/nginx/stream.d
+chmod 700 "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"
 if ! id adguardhome >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/AdGuardHome --create-home --shell /usr/sbin/nologin adguardhome
 fi
@@ -132,7 +133,8 @@ PROFILE_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1
 PAYLOAD_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1)-b$(openssl rand -hex 1)-$(openssl rand -hex 6)"
 stage="$(mktemp -d "$STATE_DIR/.stage.XXXXXX")"
 backup="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)"
-install -d -m 700 "$backup"
+mkdir -p "$backup"
+chmod 700 "$backup"
 pressroll_backup /opt/AdGuardHome/AdGuardHome.yaml "$backup/AdGuardHome.yaml"
 pressroll_backup /etc/nginx/sites-enabled/pressroll-smart-dns "$backup/nginx-http.conf"
 pressroll_backup /etc/nginx/stream.d/pressroll-smart-dns.conf "$backup/nginx-stream.conf"
@@ -192,7 +194,8 @@ ReadWritePaths=/opt/AdGuardHome /var/lib/AdGuardHome
 [Install]
 WantedBy=multi-user.target
 UNIT
-install -d -m 700 /usr/local/libexec/pressroll-smart-dns
+mkdir -p /usr/local/libexec/pressroll-smart-dns
+chmod 700 /usr/local/libexec/pressroll-smart-dns
 install -m 755 deploy/templates/healthcheck.py /usr/local/libexec/pressroll-smart-dns/healthcheck.py
 install -m 644 deploy/templates/healthcheck.service /etc/systemd/system/pressroll-smart-dns-health.service
 install -m 644 deploy/templates/healthcheck.timer /etc/systemd/system/pressroll-smart-dns-health.timer

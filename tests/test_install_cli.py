@@ -91,6 +91,12 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(str(binary), result.stdout.strip())
 
+    def test_runtime_directories_use_mkdir_p(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertIn(
+            'mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"', source
+        )
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)
