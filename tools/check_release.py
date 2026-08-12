@@ -20,11 +20,19 @@ def tracked_files():
 def main():
     required = [
         ROOT / "bootstrap.sh",
+        ROOT / "VERSION",
         ROOT / "deploy/install.sh",
+        ROOT / "deploy/manage.py",
+        ROOT / "deploy/lib/releases.py",
         ROOT / "config/policy.csv",
+        ROOT / "config/services.csv",
+        ROOT / "config/domains.csv",
+        ROOT / "config/service-domains.csv",
+        ROOT / "config/service-probes.csv",
         ROOT / "tools/render_config.py",
         ROOT / "deploy/templates/healthcheck.py",
         ROOT / "tests/ubuntu_26_04_smoke.sh",
+        ROOT / ".github/workflows/release.yml",
     ]
     missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
     if missing:
@@ -38,7 +46,7 @@ def main():
         "tools/render_deployment.py",
         "tools/validator.py",
         "inventory.production.json",
-        "profiles/dns.pressroll.ru.mobileconfig",
+        "profiles/dns.adguardhome-doh.mobileconfig",
     ]
     tracked = [str(path.relative_to(ROOT)) for path in tracked_files()]
     leftovers = [path for path in tracked if any(path.startswith(item) or path == item for item in forbidden)]
@@ -53,7 +61,7 @@ def main():
         if required_row not in policy:
             raise SystemExit("required policy row missing: " + required_row)
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for phrase in ("AdguardHomeDoH/main/bootstrap.sh", "admin-credentials", "Password:"):
+    for phrase in ("adguardhome-doh", "admin-credentials", "Password:"):
         if phrase not in readme:
             raise SystemExit("README missing: " + phrase)
     for shell_file in (

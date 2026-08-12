@@ -211,7 +211,7 @@ if ((YES == 0)) && ! adguardhome_doh_ui_tty; then
     adguardhome_doh_die "non-interactive installation requires --yes"
 fi
 
-((UPDATE || ROLLBACK)) && adguardhome_doh_die "update and rollback are available through sudo adguardhome-doh"
+((ROLLBACK)) && adguardhome_doh_die "rollback is available through sudo adguardhome-doh"
 adguardhome_doh_require_root
 [[ "$ROOT" == / ]] || adguardhome_doh_die "non-root installation only supports --dry-run"
 command -v systemctl >/dev/null 2>&1 || adguardhome_doh_die "systemd is required"
@@ -229,6 +229,10 @@ adguardhome_doh_progress 35 'зависимости установлены'
 mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" "$WEBROOT" /etc/nginx/stream.d /etc/adguardhome-doh
 chmod 700 "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"
 chmod 755 "$WEBROOT"
+mkdir -p "$CONFIG_DIR/catalog"
+for catalog_file in services.csv domains.csv service-domains.csv service-probes.csv; do
+    install -m 640 "$PROJECT_ROOT/config/$catalog_file" "$CONFIG_DIR/catalog/$catalog_file"
+done
 if ! id adguardhome >/dev/null 2>&1; then
     adguardhome_doh_run_logged useradd --system --home-dir /var/lib/AdGuardHome --create-home --shell /usr/sbin/nologin adguardhome
 fi

@@ -26,7 +26,7 @@ Password: <generated value>
 ```
 
 The same values are stored in
-`/var/lib/pressroll-smart-dns/admin-credentials` with mode `0600`. Use
+`/var/lib/adguardhome-doh/admin-credentials.json` with mode `0600`. Use
 `sudo chmod 600` if an operator accidentally changes its permissions. Updates
 preserve this password.
 
@@ -41,16 +41,16 @@ generated from the same CSV, preventing the previous configuration drift.
 Check status:
 
 ```bash
-systemctl status AdGuardHome nginx pressroll-smart-dns-health.timer
-journalctl -u pressroll-smart-dns-health.service -n 80 --no-pager
-cat /var/lib/pressroll-smart-dns/health-state.json
+systemctl status adguardhome-doh.service nginx adguardhome-doh-health.timer
+journalctl -u adguardhome-doh-health.service -n 80 --no-pager
+cat /var/lib/adguardhome-doh/health-state.json
 ```
 
 ## Update and rollback
 
 Run the same bootstrap command with `--update`, or execute the local installer.
 Before activation, the installer stores the previous AdGuard and nginx files in
-`/var/backups/pressroll-smart-dns/<UTC timestamp>/`. `--rollback` restores the
+`/var/backups/adguardhome-doh/<UTC timestamp>/`. The manager restores the
 newest complete backup after validating nginx configuration.
 
 ## Client setup
@@ -59,4 +59,3 @@ Use the generated DoH URL in the operating system or browser's custom DoH
 settings. If the client has cached the previous DNS answer, flush its DNS cache
 and restart the browser. Do not copy the server credential or DoH token into a
 public issue or chat.
-

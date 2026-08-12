@@ -1,1 +1,1 @@
-"""Pressroll Smart DNS tooling."""
+"""AdGuard Home DoH tooling."""

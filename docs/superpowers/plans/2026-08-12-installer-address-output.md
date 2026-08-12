@@ -13,7 +13,7 @@
 - URL formats remain `https://HOST/doh/<token>` and `https://HOST/<token>.mobileconfig`.
 - Initial install prints both URLs; update path does not print regenerated addresses.
 - The token is private and must not be committed or pasted into public issues/chats.
-- Credentials remain in `/var/lib/pressroll-smart-dns/admin-credentials` with mode `0600`.
+- Credentials remain in `/var/lib/adguardhome-doh/admin-credentials.json` with mode `0600`.
 
 ---
 
@@ -44,7 +44,7 @@ Add:
 Run:
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/pressroll-smart-dns-pycache python3 -m unittest tests.test_install_cli.InstallerCliTests.test_first_install_prints_doh_and_mobileconfig_urls -v
+PYTHONPYCACHEPREFIX=/tmp/adguardhome-doh-pycache python3 -m unittest tests.test_install_cli.InstallerCliTests.test_first_install_prints_doh_and_mobileconfig_urls -v
 ```
 
 Expected: failure because the current installer prints only `Apple profile:`.
@@ -64,8 +64,8 @@ replace the old profile line with:
 Run:
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/pressroll-smart-dns-pycache python3 -m unittest tests.test_install_cli.InstallerCliTests.test_first_install_prints_doh_and_mobileconfig_urls -v
-PYTHONPYCACHEPREFIX=/tmp/pressroll-smart-dns-pycache python3 -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=/tmp/adguardhome-doh-pycache python3 -m unittest tests.test_install_cli.InstallerCliTests.test_first_install_prints_doh_and_mobileconfig_urls -v
+PYTHONPYCACHEPREFIX=/tmp/adguardhome-doh-pycache python3 -m unittest discover -s tests -v
 ```
 
 Expected: focused test and all repository tests pass.
@@ -126,7 +126,7 @@ curl --fail --silent --show-error --location \
   | grep -Fq 'Установка одной командой'
 curl --fail --silent --show-error --location \
   https://raw.githubusercontent.com/evgenykhripach/AdguardHomeDoH/main/bootstrap.sh \
-  | grep -Fq 'PRESSROLL_REPOSITORY=evgenykhripach/AdguardHomeDoH'
+  | grep -Fq 'ADGUARDHOME_DOH_REPOSITORY=evgenykhripach/AdguardHomeDoH'
 ```
 
 Expected: both pushes succeed and anonymous raw checks return success.

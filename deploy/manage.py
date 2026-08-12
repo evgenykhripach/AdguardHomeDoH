@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optio
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_RELEASES_MODULE = None
 MENU_ENTRIES = (
     "Доступ к данным",
     "Изменить сервисы",
@@ -31,6 +32,7 @@ MANAGED_FILES = (
     "/etc/nginx/stream.d/adguardhome-doh.conf",
     "/etc/adguardhome-doh/health-policy.json",
     "/etc/adguardhome-doh/runtime.env",
+    "/etc/adguardhome-doh/catalog",
     "/var/lib/adguardhome-doh/install.json",
     "/var/lib/adguardhome-doh/enabled-services.json",
     "/var/lib/adguardhome-doh/health-state.json",
@@ -101,7 +103,7 @@ def create_backup(root: Path = Path("/"), backup_dir: Optional[Path] = None) -> 
 
     root = Path(root)
     if backup_dir is None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup_dir = under_root(root, "/var/backups/adguardhome-doh") / timestamp
     backup_dir = Path(backup_dir)
     backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -221,9 +223,29 @@ def _load_catalog(catalog_dir: Path) -> Any:
             spec = importlib.util.spec_from_file_location("adguardhome_doh_render_config", candidate)
             module = importlib.util.module_from_spec(spec)
             assert spec.loader is not None
+            sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             return module.Catalog.load(Path(catalog_dir))
     raise RuntimeError("catalog renderer is unavailable")
+
+
+def _load_releases() -> Any:
+    global _RELEASES_MODULE
+    if _RELEASES_MODULE is not None:
+        return _RELEASES_MODULE
+    candidates = [PROJECT_ROOT / "deploy" / "lib" / "releases.py",
+                  Path("/usr/local/libexec/adguardhome-doh/releases.py")]
+    for candidate in candidates:
+        if candidate.is_file():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("adguardhome_doh_releases", candidate)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            _RELEASES_MODULE = module
+            return _RELEASES_MODULE
+    raise RuntimeError("release validator is unavailable")
 
 
 def _runtime_paths(root: Path) -> Dict[str, Path]:
@@ -292,7 +314,7 @@ def apply_service_change(
             paths["health_policy"]: stage / "health-policy.json",
             paths["enabled"]: enabled_stage,
         }
-        backup_dir = paths["backup"] / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_dir = paths["backup"] / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
         def validate() -> None:
             if validator is not None:
@@ -406,6 +428,107 @@ def parse_service_selection(value: str, catalog: Any) -> Sequence[str]:
     return unique
 
 
+def _current_install_state(root: Path) -> Mapping[str, Any]:
+    state = _read_json(_runtime_paths(Path(root))["install"], {})
+    if not isinstance(state, Mapping) or not state.get("domain"):
+        raise RuntimeError("данные установки не найдены")
+    return state
+
+
+def update_status(root: Path = Path("/"), release_loader: Optional[Callable[[], Any]] = None) -> Dict[str, Any]:
+    state = _current_install_state(Path(root))
+    repository = str(state.get("repository", "evgenykhripach/AdguardHomeDoH"))
+    releases = _load_releases()
+    current = releases.parse_semver(str(state.get("version", "0.0.0")))
+    latest = (release_loader or (lambda: releases.latest_release(repository)))()
+    if latest is None:
+        return {"available": False, "reason": "нет стабильного релиза", "current": current.text()}
+    return {"available": latest.version > current, "current": current.text(),
+            "latest": latest.version.text(), "release": latest}
+
+
+def _safe_extract(archive: Path, destination: Path) -> Path:
+    import tarfile
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as stream:
+        members = stream.getmembers()
+        root_path = destination.resolve()
+        for member in members:
+            target = (destination / member.name).resolve()
+            if target != root_path and root_path not in target.parents:
+                raise RuntimeError("release archive contains path traversal")
+        stream.extractall(destination, members=members)
+    roots = [item for item in destination.iterdir()
+             if item.is_dir() and not item.name.startswith("._")]
+    if len(roots) != 1 or not (roots[0] / "deploy" / "install.sh").is_file():
+        raise RuntimeError("release archive has invalid layout")
+    return roots[0]
+
+
+def install_update(
+    *, root: Path = Path("/"), release: Any = None,
+    downloader: Optional[Callable[[str, Path], None]] = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> bool:
+    """Download, verify, and run a stable release installer preserving state."""
+
+    root = Path(root)
+    paths = _runtime_paths(root)
+    state = _current_install_state(root)
+    releases = _load_releases()
+    release = release or releases.latest_release(str(state.get("repository", "evgenykhripach/AdguardHomeDoH")))
+    if release is None:
+        return False
+    current = releases.parse_semver(str(state.get("version", "0.0.0")))
+    if release.version <= current:
+        return False
+    backup_dir = create_backup(root)
+    with tempfile.TemporaryDirectory(prefix=".adguardhome-doh-update-") as directory:
+        work = Path(directory)
+        archive = work / releases.ARCHIVE_NAME
+        checksum = work / releases.CHECKSUM_NAME
+        fetch = downloader or (lambda url, path: path.write_bytes(releases.urlopen(url, timeout=30).read()))
+        fetch(release.archive_url, archive)
+        fetch(release.checksum_url, checksum)
+        releases.verify_archive(archive, checksum, version=release.version.text())
+        source = _safe_extract(archive, work / "source")
+        catalog = _load_catalog(source / "config")
+        old_services = _read_json(paths["enabled"], list(catalog.default_service_ids))
+        if not isinstance(old_services, list):
+            old_services = list(catalog.default_service_ids)
+        known = {service.id for service in catalog.services}
+        selected = [str(item) for item in old_services if str(item) in known]
+        if not selected:
+            selected = list(catalog.default_service_ids)
+        command = [sys.executable, str(source / "deploy" / "install.sh"),
+                   "--domain", str(state["domain"]), "--public-ip", str(state["public_ip"]),
+                   "--email", str(state.get("email", "admin@example.com")),
+                   "--services", ",".join(selected), "--yes", "--update"]
+        try:
+            result = runner(command, check=False)
+            if getattr(result, "returncode", 1) != 0:
+                raise RuntimeError("обновление не прошло активацию")
+        except Exception:
+            _restore_backup(backup_dir, root)
+            raise
+    return True
+
+
+def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run) -> bool:
+    root = Path(root)
+    backup_root = _runtime_paths(root)["backup"]
+    candidates = sorted((item for item in backup_root.iterdir() if item.is_dir()), reverse=True) if backup_root.is_dir() else []
+    if not candidates:
+        return False
+    _restore_backup(candidates[0], root)
+    if root == Path("/"):
+        runner(["systemctl", "daemon-reload"], check=False)
+        runner(["nginx", "-t"], check=True)
+        for unit in ("adguardhome-doh.service", "adguardhome-doh-health.timer", "nginx.service"):
+            runner(["systemctl", "restart", unit], check=False)
+    return True
+
+
 def _load_enabled(paths: Mapping[str, Path], catalog: Any) -> list:
     value = _read_json(paths["enabled"], None)
     if isinstance(value, list) and value:
@@ -469,9 +592,25 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
         elif choice == "3":
             print_system_check(root, output)
         elif choice == "4":
-            print("Проверка стабильного обновления пока недоступна.", file=output)
+            try:
+                status = update_status(root)
+                if not status.get("available"):
+                    print("Обновлений нет: %s" % status.get("reason", "версия актуальна"), file=output)
+                else:
+                    print("Доступна версия %s (текущая %s)." % (status["latest"], status["current"]), file=output)
+                    print("Установить? [y/N]: ", end="", file=output, flush=True)
+                    if input_stream.readline().strip().lower() in ("y", "yes", "д", "да"):
+                        install_update(root=root)
+                        print("Обновление установлено.", file=output)
+            except Exception as exc:
+                print("Обновление не применено: %s" % type(exc).__name__, file=output)
         elif choice == "5":
-            print("Откат последнего обновления пока недоступен.", file=output)
+            try:
+                print("Откатить последнюю резервную копию? [y/N]: ", end="", file=output, flush=True)
+                if input_stream.readline().strip().lower() in ("y", "yes", "д", "да"):
+                    print("Откат выполнен." if rollback_last(root) else "Резервная копия не найдена.", file=output)
+            except Exception as exc:
+                print("Откат не применён: %s" % type(exc).__name__, file=output)
         elif choice == "6":
             return 0
         else:
@@ -481,7 +620,7 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--help", action="store_true")
-    args, _unknown = parser.parse_known_args(argv)
+    args = parser.parse_args(argv)
     if args.help:
         print("adguardhome-doh: root-only interactive manager")
         return 0

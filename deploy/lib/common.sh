@@ -128,6 +128,9 @@ adguardhome_doh_install_health_templates() {
     [[ -f "$templates/healthcheck.service" ]] || adguardhome_doh_die "healthcheck.service template is missing"
     [[ -f "$templates/healthcheck.timer" ]] || adguardhome_doh_die "healthcheck.timer template is missing"
     [[ -f "$project_root/deploy/manage.py" ]] || adguardhome_doh_die "manage.py is missing"
+    [[ -f "$project_root/tools/render_config.py" ]] || adguardhome_doh_die "render_config.py is missing"
+    [[ -f "$project_root/deploy/lib/render_runtime.py" ]] || adguardhome_doh_die "render_runtime.py is missing"
+    [[ -f "$project_root/deploy/lib/releases.py" ]] || adguardhome_doh_die "releases.py is missing"
     mkdir -p "$libexec" "$systemd"
     chmod 700 "$libexec"
     cp "$templates/healthcheck.py" "$libexec/healthcheck.py"
@@ -138,6 +141,9 @@ adguardhome_doh_install_health_templates() {
     manager="$(adguardhome_doh_under_root "$root" /usr/local/sbin/adguardhome-doh)"
     mkdir -p "$(dirname "$manager")"
     install -m 755 "$project_root/deploy/manage.py" "$manager"
+    install -m 755 "$project_root/tools/render_config.py" "$libexec/render_config.py"
+    install -m 755 "$project_root/deploy/lib/render_runtime.py" "$libexec/render_runtime.py"
+    install -m 755 "$project_root/deploy/lib/releases.py" "$libexec/releases.py"
 }
 
 adguardhome_doh_abs_root() {

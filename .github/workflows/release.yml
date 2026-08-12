@@ -1,0 +1,30 @@
+name: Stable release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate version and build archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          test "$(cat VERSION)" = "$tag"
+          archive="adguardhome-doh.tar.gz"
+          git archive --format=tar.gz --prefix="adguardhome-doh-${tag}/" "${GITHUB_REF_NAME}" > "$archive"
+          sha256sum "$archive" > "${archive}.sha256"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" adguardhome-doh.tar.gz adguardhome-doh.tar.gz.sha256 --generate-notes --verify-tag

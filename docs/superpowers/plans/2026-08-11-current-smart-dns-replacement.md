@@ -69,7 +69,7 @@
 **Interfaces:**
 - Bootstrap command: `curl --fail --silent --show-error --location https://raw.githubusercontent.com/evgenykhripach/DoHDNS/main/bootstrap.sh | sudo bash -s -- --domain dns.example.com --public-ip 203.0.113.10 --email admin@example.com`.
 - Installer flags: `--domain`, `--public-ip`, `--email`, `--policy`, `--dry-run`, `--update`, `--rollback`, `--root`.
-- Credential file: `/var/lib/pressroll-smart-dns/admin-credentials` mode `0600`, with `login`, `password`, and `url` lines.
+- Credential file: `/var/lib/adguardhome-doh/admin-credentials.json` mode `0600`, with JSON login, password, and URL fields.
 - First install generates `admin` plus `openssl rand -hex 24`; update reads and preserves the existing password.
 
 - [ ] **Step 1: Write failing CLI tests for required flags, dry-run no-write behavior, one-time credential output, and update password preservation.**
@@ -96,7 +96,7 @@
 - Nginx validates with `nginx -t`; AdGuard validates with its `--check-config` command before activation.
 
 - [ ] **Step 1: Add template tests for loopback binding, no public admin listener, exact DoH path, and generated SNI entries.**
-- [ ] **Step 2: Implement staged rendering under `/var/lib/pressroll-smart-dns/staging`.**
+- [ ] **Step 2: Implement staged rendering under `/var/lib/adguardhome-doh/staging`.**
 - [ ] **Step 3: Implement certificate issuance/renewal hook and secure file modes.**
 - [ ] **Step 4: Implement health state, three-success/two-failure gating, and automatic rewrite reconciliation.**
 - [ ] **Step 5: Implement atomic activation with backup and rollback on failed validation/reload.**
@@ -126,4 +126,3 @@
 - [ ] **Step 3: Push with tracking to `origin/feat/smart-dns`.**
 - [ ] **Step 4: Open a draft PR targeting the repository default branch with the replacement summary and verification evidence.**
 - [ ] **Step 5: Report branch, commit, PR, and the exact one-command install invocation.**
-

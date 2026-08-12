@@ -1,197 +1,113 @@
-# AdGuard Home DoH Smart DNS
+# adguardhome-doh
 
-Персональный Smart DNS на базе AdGuard Home и nginx. Установка выполняется
-одной командой на чистом Ubuntu 24.04 или более новой версии.
+Нейтральный персональный Smart DNS на базе AdGuard Home, nginx и приватного
+tokenized DoH. Проект поддерживает только чистую установку и обновление начиная
+с `v1.0.0`; миграции старых инсталляций не выполняются.
 
-Поддерживаются адреса ChatGPT и загрузки OpenAI, Google Gemini и AI Studio,
-Claude, Copilot, Perplexity, Grok, Midjourney и Fitbit. Полный список находится
-в [`config/policy.csv`](config/policy.csv).
+## Установка
 
-Это не VPN. HTTPS не расшифровывается: nginx использует только TLS SNI и
-перенаправляет выбранные домены на исходные HTTPS-серверы.
-
-## Что устанавливается
-
-- AdGuard Home v0.107.78 для DNS и приватного DoH;
-- nginx для TLS, SNI-маршрутизации и административной панели;
-- сертификат Let's Encrypt через Certbot;
-- health-gate: политика включается после 3 успешных TLS-проверок и
-  отключается после 2 последовательных ошибок;
-- Apple-профиль `.mobileconfig` с адресом DoH.
-
-## Требования
-
-Перед установкой:
-
-1. Сервер Ubuntu 24.04 или новее с публичным IPv4.
-2. Доступ root или `sudo`.
-3. A-запись домена направлена на IPv4 сервера.
-4. Открыты TCP/UDP 53, TCP 80 и TCP 443.
-
-Порт 80 нужен Certbot для первичной выдачи и автоматического обновления
-сертификата. На время HTTP-проверки Certbot кратко останавливает nginx, затем
-запускает его снова. После выдачи сертификата nginx перенаправляет обычный HTTP
-на HTTPS.
-
-## Установка одной командой
-
-Запустите на сервере:
+На чистом Ubuntu 24.04+ выполните:
 
 ```bash
 curl --fail --silent --show-error --location \
   https://raw.githubusercontent.com/evgenykhripach/AdguardHomeDoH/main/bootstrap.sh \
-  | sudo bash -s -- \
-      --domain dns.example.com \
-      --public-ip 203.0.113.10 \
-      --email admin@example.com
+  | sudo bash
 ```
 
-Замените:
+Мастер последовательно запросит домен, публичный IPv4, email для Let's Encrypt
+и сервисы. Каждый ответ проверяется сразу. Перед изменениями показываются
+параметры и запрашивается подтверждение. Для CI доступны флаги:
 
-- `dns.example.com` на свой DNS-домен;
-- `203.0.113.10` на публичный IPv4 сервера;
-- `admin@example.com` на email для Let's Encrypt.
+```bash
+sudo bash deploy/install.sh --domain dns.example.com \
+  --public-ip 203.0.113.10 --email admin@example.com \
+  --services chatgpt,claude --yes
+```
 
-Используйте реальный email: Certbot отправляет на него уведомления о проблемах
-с сертификатом. Если оставить адрес в зарезервированных доменах `example.com`,
-`example.net` или `example.org`, установщик продолжит работу без email-контакта
-и выведет предупреждение.
+`--dry-run --root PATH` рендерит конфигурацию без записи на сервер. Стадии
+показываются как 0/5/20/35/50/65/75/85/95/100 процентов; в TTY используется
+цветная ANSI-полоса, без TTY печатаются отдельные строки.
 
-## Данные после первоначальной установки
+## Каталог сервисов
 
-При первой установке установщик выводит логин, пароль и оба клиентских адреса:
+Каталог состоит из `config/services.csv`, `domains.csv`,
+`service-domains.csv` и `service-probes.csv`. В нём 205 уникальных доменов,
+включая все 178 строк из GeoHide и 60 прежних политик с сохранением `fqdn` или
+`suffix`. Общие домены остаются активными, пока здоров хотя бы один выбранный
+сервис. По умолчанию включены ChatGPT, Claude, Gemini, Microsoft Copilot,
+GitHub Copilot и Grok. Экспериментальные и чувствительные группы выключены и
+не включаются командой «выбрать все».
+
+## Экран после установки
+
+Успешная установка всегда выводит URL админки, логин, пароль, tokenized DoH,
+ссылку на Apple `.mobileconfig`, пути credentials и лога, а также команду:
 
 ```text
-AdGuard Home admin credentials (save them now):
-URL: https://dns.example.com/
-Login: admin
-Password: <сгенерированный пароль>
-Saved locally: /var/lib/pressroll-smart-dns/admin-credentials (mode 0600)
-DoH URL: https://dns.example.com/doh/<токен>
-mobileconfig: https://dns.example.com/<токен>.mobileconfig
+Password: <пароль администратора>
+sudo adguardhome-doh
 ```
 
-Логин всегда `admin`. Пароль генерируется случайно и сохраняется только на
-сервере в файле:
+Секреты хранятся только в root-only JSON:
 
 ```text
-/var/lib/pressroll-smart-dns/admin-credentials
+/var/lib/adguardhome-doh/admin-credentials.json  (0600)
+/var/lib/adguardhome-doh/doh-token                (0600)
+/var/lib/adguardhome-doh/install.json             (0600)
+/var/lib/adguardhome-doh/enabled-services.json    (0600)
+/var/log/adguardhome-doh/                         (каталог 0700, файлы 0600)
 ```
 
-## Повторный вывод адресов
+## Менеджер
 
-Если вывод установки потерян, выполните на VPS. Команда читает активный домен и
-токен из текущей конфигурации nginx:
+`sudo adguardhome-doh` открывает только интерактивное русское меню:
 
-```bash
-sudo bash -c '
-set -e
-config=/etc/nginx/sites-enabled/pressroll-smart-dns
-domain=$(awk "\$1 == \"server_name\" { sub(/;/, \"\", \$2); print \$2; exit }" "$config")
-token=$(grep -oE "location = /doh/[a-f0-9]{32,64}" "$config" | sed "s#location = /doh/##")
-printf "DoH URL: https://%s/doh/%s\\n" "$domain" "$token"
-printf "mobileconfig: https://%s/%s.mobileconfig\\n" "$domain" "$token"
-'
-```
+1. Доступ к данным;
+2. Изменить сервисы;
+3. Проверка системы;
+4. Проверить и установить обновление;
+5. Откатить последнее обновление;
+6. Выход.
 
-Повторный вывод логина и пароля:
+Изменение сервисов показывает количество доменов до и после, создаёт полный
+backup, рендерит все runtime-файлы, проверяет `AdGuardHome --check-config` и
+nginx в правильных `http`/`stream` контекстах, затем атомарно активирует staging.
+При ошибке автоматически восстанавливается backup.
 
-```bash
-sudo cat /var/lib/pressroll-smart-dns/admin-credentials
-```
+Health-gate проверяет TLS-пробы сервисов с максимумом 8 параллельных задач,
+хранит состояние по service ID и применяет пороги 3 успеха / 2 ошибки. Для
+ChatGPT отдельно проверяется `files.oaiusercontent.com`.
 
-Пароль и URL содержат секретные данные. Не публикуйте их в GitHub Issues,
-чатах или логах общего доступа.
+## Сеть и клиенты
 
-## Подключение клиентов
+AdGuard Home слушает DNS только на loopback. Наружу публикуются HTTPS-админка,
+tokenized DoH `/doh/<token>` и приватный `.mobileconfig`; публичный `/dns-query`
+закрыт. HTTPS не расшифровывается: nginx использует TLS SNI.
 
-### Apple: iPhone, iPad, macOS
+## Stable update и rollback
 
-Откройте адрес `mobileconfig` из вывода установки в Safari и установите
-профиль. В профиле уже записан приватный DoH-адрес.
+Bootstrap получает последний non-draft/non-prerelease GitHub Release, проверяет
+semver, SHA-256, совпадение `VERSION` с тегом и обязательные файлы архива. Новые
+service ID после обновления остаются выключенными; новые домены уже включённых
+сервисов подключаются автоматически. Менеджер сохраняет credentials, token и
+выбранные сервисы. Полный backup хранится в `/var/backups/adguardhome-doh/`.
 
-### Другие системы и браузеры
-
-Используйте строку `DoH URL` в настройках пользовательского DNS-over-HTTPS.
-После смены DNS очистите локальный DNS-кэш и перезапустите браузер.
-
-Публичный путь `/dns-query` намеренно закрыт и возвращает 404. Работает только
-сгенерированный приватный путь `/doh/<токен>`.
-
-## Проверка сервисов
+## Проверки
 
 ```bash
-systemctl status AdGuardHome nginx pressroll-smart-dns-health.timer
-journalctl -u pressroll-smart-dns-health.service -n 80 --no-pager
-cat /var/lib/pressroll-smart-dns/health-state.json
-```
-
-Проверка конфигурации nginx:
-
-```bash
-sudo nginx -t
-```
-
-## Обновление и откат
-
-Повторный запуск с `--update` обновляет политику и runtime-файлы, сохраняет
-пароль AdGuard Home и создаёт резервную копию:
-
-```bash
-curl --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/evgenykhripach/AdguardHomeDoH/main/bootstrap.sh \
-  | sudo bash -s -- \
-      --domain dns.example.com \
-      --public-ip 203.0.113.10 \
-      --email admin@example.com \
-      --update
-```
-
-После обновления повторно выведите адреса командой из раздела выше. Резервные
-копии хранятся в `/var/backups/pressroll-smart-dns/`.
-
-Откат к последней полной резервной копии:
-
-```bash
-curl --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/evgenykhripach/AdguardHomeDoH/main/bootstrap.sh \
-  | sudo bash -s -- \
-      --domain dns.example.com \
-      --public-ip 203.0.113.10 \
-      --email admin@example.com \
-      --rollback
-```
-
-## Локальная проверка без изменений сервера
-
-```bash
-./deploy/install.sh \
-  --domain dns.example.com \
-  --public-ip 203.0.113.10 \
-  --email admin@example.com \
-  --root /tmp/pressroll-smart-dns \
-  --dry-run
-```
-
-## Проверки репозитория
-
-```bash
-PYTHONPYCACHEPREFIX=/tmp/pressroll-smart-dns-pycache \
+PYTHONPYCACHEPREFIX=/tmp/adguardhome-doh-pycache \
   python3 -m unittest discover -s tests -v
 python3 tools/check_release.py
-bash -n bootstrap.sh deploy/install.sh deploy/lib/common.sh
+bash -n bootstrap.sh deploy/install.sh deploy/lib/common.sh deploy/lib/ui.sh
+git grep -n -i 'старое имя'  # должен вернуть пустой результат
 ```
 
-Полный smoke-тест запускает установку два раза в официальном контейнере Ubuntu
-26.04, проверяет реальные конфигурации nginx и AdGuard Home и скачивает
-сгенерированный `.mobileconfig` через HTTPS:
+Полный smoke-тест Ubuntu 26.04:
 
 ```bash
 docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
   /repo/tests/ubuntu_26_04_smoke.sh /repo
 ```
 
-Этот же тест автоматически запускается в GitHub Actions при каждом изменении
-установщика.
-
-Репозиторий: <https://github.com/evgenykhripach/AdguardHomeDoH>
+Публикация Release, push и применение на VPS выполняются только после отдельного
+разрешения владельца проекта.

@@ -4,7 +4,7 @@ set -eEuo pipefail
 PROJECT_ROOT="${1:-/repo}"
 DOMAIN=dns.example.com
 PUBLIC_IP=203.0.113.10
-MOCK_BIN=/tmp/pressroll-smoke-bin
+MOCK_BIN=/tmp/adguardhome-doh-smoke-bin
 
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || { printf 'run as root\n' >&2; exit 1; }
 mkdir -p "$MOCK_BIN"
@@ -69,40 +69,40 @@ install_once() {
 
 active_token() {
     grep -oE 'location = /doh/[a-f0-9]{32,64}' \
-        /etc/nginx/sites-enabled/pressroll-smart-dns |
+        /etc/nginx/sites-enabled/adguardhome-doh |
         sed 's#location = /doh/##'
 }
 
-install_once | tee /tmp/pressroll-first-install.out
+install_once | tee /tmp/adguardhome-doh-first-install.out
 nginx -t
 /opt/AdGuardHome/AdGuardHome --check-config \
     -c /opt/AdGuardHome/AdGuardHome.yaml \
     -w /var/lib/AdGuardHome
 test "$(grep -Fxc 'include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf)" -eq 1
-test -s /var/lib/pressroll-smart-dns/admin-credentials
-test -f /var/lib/pressroll-smart-dns/install-complete
-test "$(stat -c '%a' /var/www/pressroll-smart-dns)" = 755
+test -s /var/lib/adguardhome-doh/admin-credentials.json
+test -f /var/lib/adguardhome-doh/install-complete
+test "$(stat -c '%a' /var/www/adguardhome-doh)" = 755
 first_token="$(active_token)"
 test -n "$first_token"
-test -s "/var/www/pressroll-smart-dns/$first_token.mobileconfig"
-grep -Fq 'AdGuard Home admin credentials' /tmp/pressroll-first-install.out
+test -s "/var/www/adguardhome-doh/$first_token.mobileconfig"
+grep -Fq 'Admin URL:' /tmp/adguardhome-doh-first-install.out
 
-rm /var/lib/pressroll-smart-dns/install-complete
-install_once | tee /tmp/pressroll-recovered-install.out
+rm /var/lib/adguardhome-doh/install-complete
+install_once | tee /tmp/adguardhome-doh-recovered-install.out
 nginx -t
 second_token="$(active_token)"
 test "$second_token" = "$first_token"
 test "$(grep -Fxc 'include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf)" -eq 1
-test -f /var/lib/pressroll-smart-dns/install-complete
-grep -Fq 'AdGuard Home admin credentials' /tmp/pressroll-recovered-install.out
-grep -Fq "DoH URL: https://$DOMAIN/doh/$second_token" /tmp/pressroll-recovered-install.out
-grep -Fq "mobileconfig: https://$DOMAIN/$second_token.mobileconfig" /tmp/pressroll-recovered-install.out
+test -f /var/lib/adguardhome-doh/install-complete
+grep -Fq 'Admin URL:' /tmp/adguardhome-doh-recovered-install.out
+grep -Fq "DoH URL: https://$DOMAIN/doh/$second_token" /tmp/adguardhome-doh-recovered-install.out
+grep -Fq "mobileconfig URL: https://$DOMAIN/$second_token.mobileconfig" /tmp/adguardhome-doh-recovered-install.out
 
 nginx
 trap 'nginx -s quit >/dev/null 2>&1 || true' EXIT
 curl --fail --silent --show-error --insecure \
     --resolve "$DOMAIN:443:127.0.0.1" \
     "https://$DOMAIN/$second_token.mobileconfig" \
-    -o /tmp/pressroll.mobileconfig
-grep -Fq "https://$DOMAIN/doh/$second_token" /tmp/pressroll.mobileconfig
+    -o /tmp/adguardhome-doh.mobileconfig
+grep -Fq "https://$DOMAIN/doh/$second_token" /tmp/adguardhome-doh.mobileconfig
 printf 'ubuntu 26.04 install smoke: ok\n'
