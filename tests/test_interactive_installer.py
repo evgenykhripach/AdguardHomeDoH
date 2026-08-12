@@ -110,7 +110,44 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertEqual(1, output.count("Домен (например, dns.example.com):"), output)
         normalized_output = output.replace("\r\n", "\n")
         self.assertIn("[00%] проверка параметров\nДомен (например, dns.example.com):", normalized_output)
-        self.assertIn("Сервисы:", output)
+        self.assertIn("Категории:", output)
+        self.assertNotIn("78) [", output)
+
+    @unittest.skipUnless(os.environ.get("RUN_PTY_TESTS"), "PTY unavailable in restricted test runner")
+    def test_category_selector_opens_category_and_returns_to_categories(self):
+        code, output = run_pty(
+            "--dry-run", "--root", tempfile.gettempdir(),
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n1\n1 2\nb\ny\ny\n",
+        )
+        self.assertEqual(0, code, output)
+        self.assertIn("ИИ:", output)
+        self.assertIn("ChatGPT", output)
+        self.assertIn("Claude", output)
+        self.assertIn("Выбрано сервисов: 2", output)
+        self.assertIn("Активных уникальных доменов:", output)
+
+    @unittest.skipUnless(os.environ.get("RUN_PTY_TESTS"), "PTY unavailable in restricted test runner")
+    def test_selector_search_matches_name_and_id(self):
+        code, output = run_pty(
+            "--dry-run", "--root", tempfile.gettempdir(),
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n/copilot\n1 2\nb\ny\ny\n",
+        )
+        self.assertEqual(0, code, output)
+        self.assertIn("Результаты поиска", output)
+        self.assertIn("Microsoft Copilot", output)
+        self.assertIn("GitHub Copilot", output)
+        self.assertIn("Выбрано сервисов: 2", output)
+
+    @unittest.skipUnless(os.environ.get("RUN_PTY_TESTS"), "PTY unavailable in restricted test runner")
+    def test_category_all_none_and_experimental_are_explicit(self):
+        code, output = run_pty(
+            "--dry-run", "--root", tempfile.gettempdir(),
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\nx\n1\nb\n1\na\nn\nb\nc\n",
+        )
+        self.assertEqual(2, code, output)
+        self.assertIn("Экспериментальные:", output)
+        self.assertIn("A — все, N — снять все", output)
+        self.assertIn("выбор отменён", output)
 
     def test_interactive_input_trims_terminal_carriage_return_and_spaces(self):
         target_domain = "dns2." + "pre" + "ssroll" + ".ru"
@@ -136,6 +173,12 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertIn("[[ -r /dev/tty ]] || return 1", ui_source)
         self.assertIn("[[ -w /dev/tty ]] && return 0", ui_source)
         self.assertNotIn("( -t 0 || -t 1 )", ui_source)
+
+    def test_selector_no_long_global_service_list_or_legacy_shortcuts(self):
+        ui_source = UI.read_text(encoding="utf-8")
+        self.assertIn("Категории:", ui_source)
+        self.assertIn("Результаты поиска", ui_source)
+        self.assertNotIn("A/S — все стандартные", ui_source)
 
     def test_log_path_and_secrets_are_not_emitted_during_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:

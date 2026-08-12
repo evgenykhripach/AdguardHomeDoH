@@ -81,14 +81,6 @@ adguardhome_doh_load_service_catalog() {
     ((${#ADGUARDHOME_DOH_SERVICE_IDS[@]} > 0)) || { adguardhome_doh_ui_error "catalog has no services"; return 1; }
 }
 
-adguardhome_doh_service_number_for_id() {
-    local wanted="$1" index
-    for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
-        [[ "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" == "$wanted" ]] && { printf '%s\n' "$((index + 1))"; return 0; }
-    done
-    return 1
-}
-
 adguardhome_doh_selector_contains() {
     local selected="$1" wanted="$2" item
     IFS=',' read -r -a selected_items <<< "$selected"
@@ -114,20 +106,6 @@ adguardhome_doh_selector_remove() {
     ADGUARDHOME_DOH_SELECTOR_SELECTED="$result"
 }
 
-adguardhome_doh_selector_print() {
-    local selected="$1" index category last_category= marker section=standard
-    if ( : > /dev/tty ) 2>/dev/null; then exec 3>/dev/tty; else exec 3>&2; fi
-    printf '\nВыберите сервисы (номер, диапазон; A/S — все стандартные; D — настройки по умолчанию; X — экспериментальные; C — отмена):\n' >&3
-    for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
-        if [[ "${ADGUARDHOME_DOH_SERVICE_RISKS[index]}" == experimental && "$section" != experimental ]]; then section=experimental; printf '  Экспериментальные сервисы (отключены по умолчанию):\n' >&3; fi
-        category="${ADGUARDHOME_DOH_SERVICE_CATEGORIES[index]}"
-        if [[ "$category" != "$last_category" ]]; then printf '  %s:\n' "$category" >&3; last_category="$category"; fi
-        marker=' '; adguardhome_doh_selector_contains "$selected" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && marker='*'
-        printf '  %2d) [%s] %s (%s)\n' "$((index + 1))" "$marker" "${ADGUARDHOME_DOH_SERVICE_NAMES[index]}" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" >&3
-    done
-    exec 3>&-
-}
-
 adguardhome_doh_selector_ids() {
     local selected="$1" id result=
     for id in "${ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
@@ -137,17 +115,131 @@ adguardhome_doh_selector_ids() {
     printf '%s\n' "$result"
 }
 
-adguardhome_doh_selector_apply_token() {
-    local token="$1" selected="$2" start end number id index
-    token="${token//[[:space:]]/}"; [[ -n "$token" ]] || return 0
-    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"; (( start <= end )) || return 1
-        for ((number = start; number <= end; number++)); do adguardhome_doh_selector_apply_token "$number" "$selected" || return 1; selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done
-        ADGUARDHOME_DOH_SELECTOR_SELECTED="$selected"; return 0
-    fi
-    [[ "$token" =~ ^[0-9]+$ ]] || return 1; (( token >= 1 && token <= ${#ADGUARDHOME_DOH_SERVICE_IDS[@]} )) || return 1
-    index=$((token - 1)); id="${ADGUARDHOME_DOH_SERVICE_IDS[index]}"
-    if adguardhome_doh_selector_contains "$selected" "$id"; then adguardhome_doh_selector_remove "$selected" "$id"; else adguardhome_doh_selector_add "$selected" "$id"; fi
+adguardhome_doh_selector_emit() {
+    if [[ -w /dev/tty ]]; then printf '%s\n' "$1" > /dev/tty; else printf '%s\n' "$1" >&2; fi
+}
+
+adguardhome_doh_selector_count_selected() {
+    local count=0 id
+    for id in "${ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+        adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "$id" && ((count += 1))
+    done
+    printf '%s\n' "$count"
+}
+
+adguardhome_doh_selector_category_init() {
+    local index category found
+    ADGUARDHOME_DOH_SELECTOR_CATEGORIES=()
+    for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+        category="${ADGUARDHOME_DOH_SERVICE_CATEGORIES[index]}"; found=0
+        for item in "${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[@]-}"; do [[ "$item" == "$category" ]] && found=1; done
+        (( found )) || ADGUARDHOME_DOH_SELECTOR_CATEGORIES+=("$category")
+    done
+}
+
+adguardhome_doh_selector_category_indices() {
+    local category="$1" index
+    ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES=()
+    for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+        [[ "${ADGUARDHOME_DOH_SERVICE_CATEGORIES[index]}" == "$category" ]] && ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES+=("$index")
+    done
+}
+
+adguardhome_doh_selector_search_indices() {
+    local query="$1" index haystack
+    ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES=()
+    for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+        haystack="${ADGUARDHOME_DOH_SERVICE_NAMES[index]} ${ADGUARDHOME_DOH_SERVICE_IDS[index]}"
+        printf '%s\n' "$haystack" | grep -Fqi -- "$query" && ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES+=("$index")
+    done
+}
+
+adguardhome_doh_selector_domain_count() {
+    python3 - "$1" "$ADGUARDHOME_DOH_SELECTOR_SELECTED" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from tools.render_config import Catalog
+catalog = Catalog.load(Path(sys.argv[1]) / "config")
+selected = {item for item in sys.argv[2].split(",") if item}
+print(sum(1 for services in catalog.associations.values() if selected.intersection(services)))
+PY
+}
+
+adguardhome_doh_selector_summary() {
+    local config_dir="$1" count domains names id
+    count="$(adguardhome_doh_selector_count_selected)"
+    domains="$(adguardhome_doh_selector_domain_count "$(cd -- "$config_dir/.." && pwd -P)")"
+    adguardhome_doh_selector_emit "Выбрано сервисов: $count"
+    adguardhome_doh_selector_emit "Активных уникальных доменов: $domains"
+    names=
+    for id in "${ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+        adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "$id" || continue
+        [[ -n "$names" ]] && names="$names, "
+        for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+            [[ "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" == "$id" ]] && names="$names${ADGUARDHOME_DOH_SERVICE_NAMES[index]}"
+        done
+    done
+    [[ -n "$names" ]] && adguardhome_doh_selector_emit "Сервисы: $names"
+}
+
+adguardhome_doh_selector_print_categories() {
+    local number category total selected
+    adguardhome_doh_selector_emit ""
+    adguardhome_doh_selector_emit "Категории:"
+    for number in "${!ADGUARDHOME_DOH_SELECTOR_CATEGORIES[@]}"; do
+        category="${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[number]}"; total=0; selected=0
+        for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+            [[ "${ADGUARDHOME_DOH_SERVICE_CATEGORIES[index]}" == "$category" ]] || continue
+            ((total += 1)); adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && ((selected += 1))
+        done
+        adguardhome_doh_selector_emit " $((number + 1))) $category ($selected/$total)"
+    done
+    adguardhome_doh_selector_emit ""
+    adguardhome_doh_selector_emit "Команды: номер — открыть категорию, /текст — поиск, D — стандартные, X — экспериментальные, Y — итог, C — отмена"
+}
+
+adguardhome_doh_selector_print_view() {
+    local title="$1" number index marker
+    adguardhome_doh_selector_emit ""
+    [[ "$title" == *: ]] || title="$title:"
+    adguardhome_doh_selector_emit "$title"
+    for number in "${!ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[@]}"; do
+        index="${ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[number]}"; marker=' '
+        adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && marker='*'
+        adguardhome_doh_selector_emit " $((number + 1))) [$marker] ${ADGUARDHOME_DOH_SERVICE_NAMES[index]} (${ADGUARDHOME_DOH_SERVICE_IDS[index]})"
+    done
+    adguardhome_doh_selector_emit ""
+    adguardhome_doh_selector_emit "Команды: номера через пробел — включить/выключить, A — все, N — снять все, B — назад, C — отмена"
+}
+
+adguardhome_doh_selector_apply_view_tokens() {
+    local answer="$1" token number index id
+    IFS=', ' read -r -a tokens <<< "$answer"
+    for token in "${tokens[@]}"; do
+        [[ "$token" =~ ^[0-9]+$ ]] || return 1
+        number=$((token - 1)); (( number >= 0 && number < ${#ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[@]} )) || return 1
+        index="${ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[number]}"; id="${ADGUARDHOME_DOH_SERVICE_IDS[index]}"
+        if adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "$id"; then adguardhome_doh_selector_remove "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "$id"; else adguardhome_doh_selector_add "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "$id"; fi
+        ADGUARDHOME_DOH_SELECTOR_SELECTED="$ADGUARDHOME_DOH_SELECTOR_SELECTED"
+    done
+}
+
+adguardhome_doh_selector_view() {
+    local title="$1" answer normalized
+    while :; do
+        adguardhome_doh_selector_print_view "$title"
+        adguardhome_doh_read_tty answer $'\nВыбор: ' || return $?
+        normalized="$ADGUARDHOME_DOH_READ_VALUE"; normalized="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
+        case "$normalized" in
+            b|back|назад) return 0 ;;
+            c|q|cancel|отмена) return 2 ;;
+            a|all)
+                for index in "${ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[@]}"; do adguardhome_doh_selector_add "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}"; ADGUARDHOME_DOH_SELECTOR_SELECTED="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done ;;
+            n|none|снять) for index in "${ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[@]}"; do adguardhome_doh_selector_remove "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}"; ADGUARDHOME_DOH_SELECTOR_SELECTED="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done ;;
+            *) adguardhome_doh_selector_apply_view_tokens "$normalized" || adguardhome_doh_ui_error "введите номера сервисов или команду" ;;
+        esac
+    done
 }
 
 adguardhome_doh_selector_confirm() {
@@ -160,37 +252,36 @@ adguardhome_doh_selector_confirm() {
 }
 
 adguardhome_doh_select_services() {
-    local config_dir="$1" initial="${2:-}" answer token id index selected=
+    local config_dir="$1" initial="${2:-}" answer normalized category_number category title
     adguardhome_doh_load_service_catalog "$config_dir"
-    if [[ -n "$initial" ]]; then
-        IFS=',' read -r -a initial_ids <<< "$initial"
-        for id in "${initial_ids[@]}"; do
-            index="$(adguardhome_doh_service_number_for_id "$id")" || { adguardhome_doh_ui_error "unknown service: $id"; return 1; }
-            adguardhome_doh_selector_add "$selected" "${ADGUARDHOME_DOH_SERVICE_IDS[index-1]}"; selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED"
-        done
-    fi
+    ADGUARDHOME_DOH_SELECTOR_SELECTED="$initial"
+    adguardhome_doh_selector_category_init
     while :; do
-        adguardhome_doh_selector_print "$selected"
-        adguardhome_doh_read_tty answer $'\nСервисы: ' || return $?
-        answer="$ADGUARDHOME_DOH_READ_VALUE"; answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
-        case "$answer" in
+        adguardhome_doh_selector_print_categories
+        adguardhome_doh_selector_summary "$config_dir"
+        adguardhome_doh_read_tty answer $'\nКатегория: ' || return $?
+        normalized="$ADGUARDHOME_DOH_READ_VALUE"; normalized="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
+        case "$normalized" in
             c|q|cancel|отмена) adguardhome_doh_ui_error "выбор отменён"; return 2 ;;
             d|default|defaults|по-умолчанию)
-                selected=
-                for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do [[ "${ADGUARDHOME_DOH_SERVICE_DEFAULTS[index]}" == true ]] || continue; adguardhome_doh_selector_add "$selected" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}"; selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done ;;
-            a|all|s|standard|standard-all|all-standard|стандартные)
-                selected=
-                for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do [[ "${ADGUARDHOME_DOH_SERVICE_RISKS[index]}" == standard ]] || continue; adguardhome_doh_selector_add "$selected" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}"; selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done ;;
-            x|experimental|all-experimental|экспериментальные)
-                selected=
-                for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do [[ "${ADGUARDHOME_DOH_SERVICE_RISKS[index]}" == experimental ]] || continue; adguardhome_doh_selector_add "$selected" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}"; selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done ;;
+                ADGUARDHOME_DOH_SELECTOR_SELECTED=
+                for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do [[ "${ADGUARDHOME_DOH_SERVICE_DEFAULTS[index]}" == true ]] || continue; adguardhome_doh_selector_add "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}"; ADGUARDHOME_DOH_SELECTOR_SELECTED="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done
+                adguardhome_doh_selector_summary "$config_dir"
+                adguardhome_doh_selector_confirm && adguardhome_doh_selector_ids "$ADGUARDHOME_DOH_SELECTOR_SELECTED" && return 0
+                ;;
+            x|experimental|экспериментальные)
+                category='Экспериментальные'; adguardhome_doh_selector_category_indices "$category"; adguardhome_doh_selector_view "$category" || return $? ;;
+            y|yes|итог|применить)
+                [[ "$(adguardhome_doh_selector_count_selected)" != 0 ]] || { adguardhome_doh_ui_error "выберите хотя бы один сервис"; continue; }
+                adguardhome_doh_selector_summary "$config_dir"; adguardhome_doh_selector_confirm && adguardhome_doh_selector_ids "$ADGUARDHOME_DOH_SELECTOR_SELECTED" && return 0
+                ;;
+            /*)
+                adguardhome_doh_selector_search_indices "${normalized#/}"; ((${#ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[@]})) || { adguardhome_doh_ui_error "ничего не найдено"; continue; }
+                adguardhome_doh_selector_view "Результаты поиска: ${normalized#/}" || return $? ;;
             *)
-                selected=
-                IFS=', ' read -r -a tokens <<< "$answer"
-                for token in "${tokens[@]}"; do adguardhome_doh_selector_apply_token "$token" "$selected" || { adguardhome_doh_ui_error "неверный номер или диапазон: $token"; selected=; continue 2; }; selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED"; done ;;
+                [[ "$normalized" =~ ^[0-9]+$ ]] || { adguardhome_doh_ui_error "введите номер категории, /поиск, D, X, Y или C"; continue; }
+                category_number=$((normalized - 1)); (( category_number >= 0 && category_number < ${#ADGUARDHOME_DOH_SELECTOR_CATEGORIES[@]} )) || { adguardhome_doh_ui_error "нет такой категории"; continue; }
+                category="${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[category_number]}"; adguardhome_doh_selector_category_indices "$category"; adguardhome_doh_selector_view "$category" || return $? ;;
         esac
-        [[ "$(adguardhome_doh_selector_ids "$selected" 2>/dev/null || true)" ]] || { adguardhome_doh_ui_error "выберите хотя бы один сервис"; continue; }
-        if adguardhome_doh_selector_confirm; then adguardhome_doh_selector_ids "$selected"; return 0; fi
-        case "$?" in 2) adguardhome_doh_ui_error "выбор отменён"; return 2 ;; *) continue ;; esac
     done
 }

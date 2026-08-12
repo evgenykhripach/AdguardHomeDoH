@@ -30,6 +30,16 @@ The same values are stored in
 `sudo chmod 600` if an operator accidentally changes its permissions. Updates
 preserve this password.
 
+## Interactive service selection
+
+The installer opens a compact category selector instead of printing every
+service at once. Enter a category number, then toggle local service numbers with
+spaces. `A` selects all services in the category, `N` clears it, `B` goes back,
+and `/text` searches names and service IDs. `D` selects the standard set; `X`
+opens the experimental category explicitly. Use `Y` to review the selected
+service/domain counts and confirm with `y`. The non-interactive `--services`
+flag remains available for CI.
+
 ## Health-gated policy
 
 The timer runs every minute. A policy row becomes active after three successful
