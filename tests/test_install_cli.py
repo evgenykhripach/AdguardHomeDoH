@@ -245,7 +245,47 @@ class InstallerCliTests(unittest.TestCase):
         init = source.index("adguardhome_doh_init_log /")
         preflight = source.index("adguardhome_doh_preflight /")
         self.assertLess(init, preflight)
-        self.assertIn("adguardhome_doh_run_logged adguardhome_doh_preflight /", source)
+        self.assertIn("adguardhome_doh_run_logged adguardhome_doh_preflight / \"$DOMAIN\" \"$PUBLIC_IP\" \"$UPDATE\"", source)
+
+    def test_update_preflight_allows_only_existing_managed_nginx(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            site = root / "etc/nginx/sites-enabled"
+            stream = root / "etc/nginx/stream.d"
+            site.mkdir(parents=True)
+            stream.mkdir(parents=True)
+            (site / "adguardhome-doh").write_text(
+                "server { listen 80; server_name dns.example.com; }\n", encoding="utf-8"
+            )
+            (stream / "adguardhome-doh.conf").write_text(
+                "server { listen 443; }\n", encoding="utf-8"
+            )
+            listeners = (
+                'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* '
+                'users:(("nginx",pid=10,fd=7))\n'
+                'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* '
+                'users:(("nginx",pid=10,fd=8))\n'
+            )
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; adguardhome_doh_managed_nginx_update_allowed "$2" "$3" "$4"',
+                    "bash", str(common), str(root), "dns.example.com", listeners,
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            foreign = listeners.replace('(("nginx"', '(("xray"')
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; adguardhome_doh_managed_nginx_update_allowed "$2" "$3" "$4"',
+                    "bash", str(common), str(root), "dns.example.com", foreign,
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(0, result.returncode)
 
     def test_logged_command_output_is_redacted_and_written_to_private_log(self):
         common = ROOT / "deploy" / "lib" / "common.sh"

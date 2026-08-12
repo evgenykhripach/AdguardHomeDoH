@@ -220,7 +220,7 @@ command -v systemctl >/dev/null 2>&1 || adguardhome_doh_die "systemd is required
 adguardhome_doh_require_ubuntu
 adguardhome_doh_init_log /
 LOG_PATH="$ADGUARDHOME_DOH_LOG_PATH"
-adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP"
+adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE"
 adguardhome_doh_progress 20 'предварительная проверка завершена'
 
 adguardhome_doh_run_logged apt-get update

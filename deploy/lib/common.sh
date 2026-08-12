@@ -216,8 +216,29 @@ adguardhome_doh_run_logged() {
     fi
 }
 
+adguardhome_doh_managed_nginx_update_allowed() {
+    local root="$1" domain="$2" listeners="$3"
+    local site stream line endpoint port found=0
+    site="$(adguardhome_doh_under_root "$root" /etc/nginx/sites-enabled/adguardhome-doh)"
+    stream="$(adguardhome_doh_under_root "$root" /etc/nginx/stream.d/adguardhome-doh.conf)"
+    [[ -f "$site" && -f "$stream" ]] || return 1
+    grep -Fq "server_name $domain;" "$site" || return 1
+    grep -Eq '(^|[[:space:]])listen[[:space:]]+443([;[:space:]]|$)' "$stream" || return 1
+    while IFS= read -r line; do
+        endpoint="$(awk '{print $4}' <<< "$line")"
+        port="${endpoint##*:}"
+        case "$port" in
+            80|443)
+                found=1
+                [[ "$line" == *'users:(("nginx"'* ]] || return 1
+                ;;
+        esac
+    done <<< "$listeners"
+    (( found ))
+}
+
 adguardhome_doh_preflight() {
-    local root="$1" domain="$2" public_ip="$3" os_release
+    local root="$1" domain="$2" public_ip="$3" allow_managed_update="${4:-0}" os_release
     adguardhome_doh_require_valid_input "$domain" "$public_ip" "preflight@example.com"
     os_release="$(adguardhome_doh_under_root "$root" /etc/os-release)"
     adguardhome_doh_require_ubuntu "$os_release"
@@ -234,7 +255,13 @@ adguardhome_doh_preflight() {
             }
             END { exit !found }
         ' <<< "$listeners"; then
-            adguardhome_doh_die "required listener ports 80/443 are already in use"
+            local listeners_with_process
+            listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
+            if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
+                :
+            else
+                adguardhome_doh_die "required listener ports 80/443 are already in use"
+            fi
         fi
         local resolved
         resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
