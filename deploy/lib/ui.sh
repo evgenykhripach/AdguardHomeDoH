@@ -21,6 +21,8 @@ adguardhome_doh_progress() {
 
 adguardhome_doh_trim_input() {
     local value="$1"
+    value="${value//$'\e[200~'/}"
+    value="${value//$'\e[201~'/}"
     value="${value//$'\r'/}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"

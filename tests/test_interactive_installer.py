@@ -122,7 +122,7 @@ class InteractiveInstallerTests(unittest.TestCase):
         )
         result = subprocess.run(
             ["bash", "-c", script],
-            input=f" {target_domain}\r\n",
+            input=f"\x1b[200~ {target_domain}\x1b[201~\r\n",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
