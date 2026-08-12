@@ -24,6 +24,20 @@ pressroll_require_ubuntu() {
         pressroll_die "Ubuntu 24.04 or newer is required"
 }
 
+pressroll_required_packages() {
+    printf '%s\n' \
+        ca-certificates \
+        curl \
+        nginx \
+        libnginx-mod-stream \
+        certbot \
+        openssl \
+        apache2-utils \
+        tar \
+        gzip \
+        python3
+}
+
 pressroll_find_checksum() {
     local checksums_file="$1" archive="$2"
     awk -v name="$archive" \

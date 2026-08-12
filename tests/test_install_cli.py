@@ -124,6 +124,16 @@ class InstallerCliTests(unittest.TestCase):
                 (destination / "etc/systemd/system/pressroll-smart-dns-health.timer").is_file()
             )
 
+    def test_required_packages_include_nginx_stream_module(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; pressroll_required_packages',
+             "bash", str(common)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("libnginx-mod-stream", result.stdout.splitlines())
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)

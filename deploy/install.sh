@@ -85,8 +85,9 @@ if ((ROLLBACK)); then
 fi
 
 apt-get update
+mapfile -t required_packages < <(pressroll_required_packages)
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl nginx certbot openssl apache2-utils tar gzip python3
+    "${required_packages[@]}"
 
 mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" /var/www/html /etc/nginx/stream.d
 chmod 700 "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"
