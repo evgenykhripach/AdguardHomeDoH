@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +96,40 @@ class HealthcheckTests(unittest.TestCase):
                 ("*.shared.example", "203.0.113.10"),
             },
             set(rules),
+        )
+
+    def test_reconcile_removes_legacy_loopback_rules(self):
+        health = load_healthcheck()
+        policy = {
+            "services": {"chatgpt": ["chatgpt.com"]},
+            "domains": [
+                {"domain": "chatgpt.com", "kind": "suffix", "services": ["chatgpt"]}
+            ],
+        }
+        calls = []
+
+        def fake_api(method, path, cookie, body=None):
+            calls.append((method, path, body))
+            if method == "GET":
+                return [
+                    {"domain": "chatgpt.com", "answer": "127.0.0.1", "enabled": False},
+                    {"domain": "*.chatgpt.com", "answer": "127.0.0.1", "enabled": False},
+                    {"domain": "chatgpt.com", "answer": "203.0.113.10", "enabled": True},
+                ]
+            return None
+
+        with mock.patch.object(health, "login", return_value="sid=x"), mock.patch.object(
+            health, "api", side_effect=fake_api
+        ):
+            changes, active = health.reconcile(policy, {"chatgpt": {"healthy": True}}, "203.0.113.10")
+
+        self.assertEqual(2, active)
+        self.assertEqual(3, changes)
+        deleted = {(body["domain"], body["answer"]) for method, path, body in calls
+                   if method == "POST" and path == "/control/rewrite/delete"}
+        self.assertEqual(
+            {("chatgpt.com", "127.0.0.1"), ("*.chatgpt.com", "127.0.0.1")},
+            deleted,
         )
 
 

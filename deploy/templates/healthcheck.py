@@ -302,6 +302,8 @@ def reconcile(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP)
         managed.add((domain, public_ip))
         if str(row.get("kind", "")) == "suffix":
             managed.add(("*." + domain, public_ip))
+    legacy = {(domain, answer) for domain, _answer in managed
+              for answer in ("127.0.0.1", "127.0.0.1:53")}
     changes = 0
     for key in sorted(desired):
         item = by_key.get(key)
@@ -314,6 +316,11 @@ def reconcile(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP)
                 {"target": {"domain": key[0], "answer": key[1]}, "update": {"enabled": True}})
             changes += 1
     for key, item in by_key.items():
+        if key in legacy:
+            api("POST", "/control/rewrite/delete", cookie,
+                {"domain": key[0], "answer": key[1]})
+            changes += 1
+            continue
         if key in managed and key not in desired and item.get("enabled", True):
             api("PUT", "/control/rewrite/update", cookie,
                 {"target": {"domain": key[0], "answer": key[1]}, "update": {"enabled": False}})

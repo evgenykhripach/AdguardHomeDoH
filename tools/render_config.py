@@ -465,14 +465,8 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "  blocking_mode: default",
         "  blocking_ipv4: \"\"",
         "  blocking_ipv6: \"\"",
-        "  rewrites:",
+        "  rewrites: []",
     ])
-    for item in render_rewrites(rows, "127.0.0.1"):
-        lines.extend([
-            "    - domain: '%s'" % item["domain"],
-            "      answer: %s" % item["answer"],
-            "      enabled: false",
-        ])
     lines.extend([
         "  rewrites_enabled: true",
         "  filtering_enabled: true",
