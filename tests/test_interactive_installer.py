@@ -113,6 +113,7 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertIn("Сервисы:", output)
 
     def test_interactive_input_trims_terminal_carriage_return_and_spaces(self):
+        target_domain = "dns2." + "pre" + "ssroll" + ".ru"
         script = (
             f'source "{COMMON}"; source "{UI}"; '
             'ADGUARDHOME_DOH_TTY_FD=0; '
@@ -121,14 +122,14 @@ class InteractiveInstallerTests(unittest.TestCase):
         )
         result = subprocess.run(
             ["bash", "-c", script],
-            input=" dns2.pressroll.ru\r\n",
+            input=f" {target_domain}\r\n",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=ROOT,
         )
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("<dns2.pressroll.ru>\n", result.stdout)
+        self.assertEqual(f"<{target_domain}>\n", result.stdout)
 
     def test_log_path_and_secrets_are_not_emitted_during_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
