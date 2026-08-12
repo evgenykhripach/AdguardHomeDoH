@@ -38,6 +38,25 @@ pressroll_required_packages() {
         python3
 }
 
+pressroll_ensure_nginx_stream_include() {
+    local nginx_conf="${1:-/etc/nginx/nginx.conf}"
+    local include='include /etc/nginx/stream.d/*.conf;'
+    local rendered
+    [[ -f "$nginx_conf" ]] || pressroll_die "nginx.conf is missing: $nginx_conf"
+    rendered="$(mktemp)"
+    if ! awk -v include="$include" '
+        /^[[:space:]]*include[[:space:]]+\/etc\/nginx\/stream[.]d\/[*][.]conf;[[:space:]]*$/ { next }
+        !inserted && /^[[:space:]]*http[[:space:]]*\{/ { print include; inserted = 1 }
+        { print }
+        END { if (!inserted) exit 42 }
+    ' "$nginx_conf" > "$rendered"; then
+        rm -f -- "$rendered"
+        pressroll_die "nginx.conf has no top-level http block"
+    fi
+    cat "$rendered" > "$nginx_conf"
+    rm -f -- "$rendered"
+}
+
 pressroll_find_checksum() {
     local checksums_file="$1" archive="$2"
     awk -v name="$archive" \

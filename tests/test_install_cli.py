@@ -134,6 +134,32 @@ class InstallerCliTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("libnginx-mod-stream", result.stdout.splitlines())
 
+    def test_nginx_stream_include_is_deduplicated_idempotently(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        include = "include /etc/nginx/stream.d/*.conf;"
+        with tempfile.TemporaryDirectory() as directory:
+            nginx_conf = Path(directory) / "nginx.conf"
+            nginx_conf.write_text(
+                f"user www-data;\n{include}\n{include}\nhttp {{\n}}\n",
+                encoding="utf-8",
+            )
+            command = [
+                "bash", "-c",
+                'source "$1"; pressroll_ensure_nginx_stream_include "$2"',
+                "bash", str(common), str(nginx_conf),
+            ]
+            first = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, first.returncode, first.stderr)
+            first_content = nginx_conf.read_text(encoding="utf-8")
+            self.assertEqual(1, first_content.splitlines().count(include))
+            second = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, second.returncode, second.stderr)
+            self.assertEqual(first_content, nginx_conf.read_text(encoding="utf-8"))
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)

@@ -158,9 +158,7 @@ cat > "$WEBROOT/$DOH_TOKEN.mobileconfig" <<EOF
 <key>PayloadDisplayName</key><string>Pressroll Smart DNS</string><key>PayloadIdentifier</key><string>com.pressroll.smartdns.$PROFILE_ID</string><key>PayloadOrganization</key><string>Pressroll</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>$PROFILE_ID</string><key>PayloadVersion</key><integer>1</integer>
 </dict></plist>
 EOF
-if ! grep -q 'stream.d/\\*.conf' /etc/nginx/nginx.conf; then
-    sed -i '/^http[[:space:]]*{/i include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf
-fi
+pressroll_ensure_nginx_stream_include
 cat > /etc/nginx/sites-enabled/pressroll-smart-dns <<EOF
 server {
     listen 80;
