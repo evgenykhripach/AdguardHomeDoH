@@ -115,6 +115,13 @@ class InstallerCliTests(unittest.TestCase):
             'mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"', source
         )
 
+    def test_health_templates_receive_release_root_before_target_root(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertIn(
+            'adguardhome_doh_run_logged adguardhome_doh_install_health_templates "$PROJECT_ROOT" /',
+            source,
+        )
+
     def test_health_templates_install_outside_repository_working_directory(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
         with tempfile.TemporaryDirectory() as directory:
