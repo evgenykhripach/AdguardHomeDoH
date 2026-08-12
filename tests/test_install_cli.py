@@ -44,6 +44,16 @@ class InstallerCliTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("--public-ip is required", result.stderr)
 
+    def test_invalid_email_fails_before_installation(self):
+        result = self.run_install(
+            "--domain", "dns.example.com",
+            "--public-ip", "203.0.113.10",
+            "--email", "not-an-email",
+            "--dry-run",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("invalid email", result.stderr)
+
     def test_ubuntu_24_04_or_newer_is_supported(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
         with tempfile.TemporaryDirectory() as directory:
@@ -159,6 +169,55 @@ class InstallerCliTests(unittest.TestCase):
             )
             self.assertEqual(0, second.returncode, second.stderr)
             self.assertEqual(first_content, nginx_conf.read_text(encoding="utf-8"))
+
+    def test_doh_token_is_created_once_and_reused(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "doh-token"
+            command = [
+                "bash", "-c",
+                'source "$1"; pressroll_load_or_create_doh_token "$2"',
+                "bash", str(common), str(token_file),
+            ]
+            first = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            second = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, first.returncode, first.stderr)
+            self.assertEqual(0, second.returncode, second.stderr)
+            self.assertRegex(first.stdout.strip(), r"^[a-f0-9]{48}$")
+            self.assertEqual(first.stdout, second.stdout)
+            self.assertEqual(0o600, token_file.stat().st_mode & 0o777)
+
+    def test_certbot_contact_args_use_no_email_for_reserved_example_domain(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        command = [
+            "bash", "-c",
+            'source "$1"; pressroll_certbot_contact_args "$2"',
+            "bash", str(common), "admin@example.com",
+        ]
+        result = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("--register-unsafely-without-email\n", result.stdout)
+        self.assertIn("example.com", result.stderr)
+
+    def test_certbot_contact_args_keep_real_email(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        command = [
+            "bash", "-c",
+            'source "$1"; pressroll_certbot_contact_args "$2"',
+            "bash", str(common), "admin@pressroll.ru",
+        ]
+        result = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("--email\nadmin@pressroll.ru\n", result.stdout)
+        self.assertEqual("", result.stderr)
 
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")

@@ -271,7 +271,7 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "    ssl_session_timeout 1d;",
         "    add_header Strict-Transport-Security \"max-age=31536000\" always;",
         "    client_max_body_size 2m;",
-        "    location ~ \"^/[a-f0-9]{32}[.]mobileconfig\" {",
+        "    location = /%s.mobileconfig {" % doh_token,
         "        root %s;" % webroot,
         "        default_type application/x-apple-aspen-config;",
         "        add_header Content-Disposition \"attachment; filename=dns.pressroll.mobileconfig\" always;",

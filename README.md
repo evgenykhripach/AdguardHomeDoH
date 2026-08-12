@@ -50,6 +50,11 @@ curl --fail --silent --show-error --location \
 - `203.0.113.10` на публичный IPv4 сервера;
 - `admin@example.com` на email для Let's Encrypt.
 
+Используйте реальный email: Certbot отправляет на него уведомления о проблемах
+с сертификатом. Если оставить адрес в зарезервированных доменах `example.com`,
+`example.net` или `example.org`, установщик продолжит работу без email-контакта
+и выведет предупреждение.
+
 ## Данные после первоначальной установки
 
 При первой установке установщик выводит логин, пароль и оба клиентских адреса:
@@ -174,5 +179,17 @@ PYTHONPYCACHEPREFIX=/tmp/pressroll-smart-dns-pycache \
 python3 tools/check_release.py
 bash -n bootstrap.sh deploy/install.sh deploy/lib/common.sh
 ```
+
+Полный smoke-тест запускает установку два раза в официальном контейнере Ubuntu
+26.04, проверяет реальные конфигурации nginx и AdGuard Home и скачивает
+сгенерированный `.mobileconfig` через HTTPS:
+
+```bash
+docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
+  /repo/tests/ubuntu_26_04_smoke.sh /repo
+```
+
+Этот же тест автоматически запускается в GitHub Actions при каждом изменении
+установщика.
 
 Репозиторий: <https://github.com/evgenykhripach/AdguardHomeDoH>

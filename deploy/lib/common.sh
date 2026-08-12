@@ -40,13 +40,13 @@ pressroll_required_packages() {
 
 pressroll_ensure_nginx_stream_include() {
     local nginx_conf="${1:-/etc/nginx/nginx.conf}"
-    local include='include /etc/nginx/stream.d/*.conf;'
+    local include_line='include /etc/nginx/stream.d/*.conf;'
     local rendered
     [[ -f "$nginx_conf" ]] || pressroll_die "nginx.conf is missing: $nginx_conf"
     rendered="$(mktemp)"
-    if ! awk -v include="$include" '
+    if ! awk -v include_line="$include_line" '
         /^[[:space:]]*include[[:space:]]+\/etc\/nginx\/stream[.]d\/[*][.]conf;[[:space:]]*$/ { next }
-        !inserted && /^[[:space:]]*http[[:space:]]*\{/ { print include; inserted = 1 }
+        !inserted && /^[[:space:]]*http[[:space:]]*\{/ { print include_line; inserted = 1 }
         { print }
         END { if (!inserted) exit 42 }
     ' "$nginx_conf" > "$rendered"; then
@@ -55,6 +55,48 @@ pressroll_ensure_nginx_stream_include() {
     fi
     cat "$rendered" > "$nginx_conf"
     rm -f -- "$rendered"
+}
+
+pressroll_load_or_create_doh_token() {
+    local token_file="$1" token old_umask temporary
+    if [[ -f "$token_file" ]]; then
+        token="$(tr -d '\r\n' < "$token_file")"
+        [[ "$token" =~ ^[a-f0-9]{48}$ ]] || \
+            pressroll_die "invalid saved DoH token: $token_file"
+    else
+        mkdir -p "$(dirname "$token_file")"
+        token="$(openssl rand -hex 24)"
+        temporary="${token_file}.tmp.$$"
+        old_umask="$(umask)"
+        umask 077
+        printf '%s\n' "$token" > "$temporary"
+        umask "$old_umask"
+        chmod 600 "$temporary"
+        mv -f -- "$temporary" "$token_file"
+    fi
+    printf '%s\n' "$token"
+}
+
+pressroll_certbot_contact_args() {
+    local email="$1" domain
+    pressroll_validate_email "$email"
+    domain="${email##*@}"
+    domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')"
+    case "$domain" in
+        example.com|example.net|example.org)
+            printf 'warning: %s is a reserved example address; Certbot will register without an email contact\n' \
+                "$email" >&2
+            printf '%s\n' --register-unsafely-without-email
+            ;;
+        *)
+            printf '%s\n' --email "$email"
+            ;;
+    esac
+}
+
+pressroll_validate_email() {
+    [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+[.][^@[:space:]]+$ ]] || \
+        pressroll_die "invalid email: $1"
 }
 
 pressroll_find_checksum() {
@@ -91,15 +133,15 @@ pressroll_validate_hostname() {
 }
 
 pressroll_validate_ipv4() {
-    python3 - "$1" <<'PY'
-import ipaddress
-import sys
-try:
-    if ipaddress.ip_address(sys.argv[1]).version != 4:
-        raise ValueError
-except ValueError:
-    raise SystemExit("invalid IPv4")
-PY
+    local address="$1" octet
+    local -a octets
+    IFS=. read -r -a octets <<< "$address"
+    [[ "${#octets[@]}" -eq 4 ]] || pressroll_die "invalid IPv4: $address"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || \
+            pressroll_die "invalid IPv4: $address"
+        ((10#$octet <= 255)) || pressroll_die "invalid IPv4: $address"
+    done
 }
 
 pressroll_abs_root() {

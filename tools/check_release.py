@@ -24,10 +24,14 @@ def main():
         ROOT / "config/policy.csv",
         ROOT / "tools/render_config.py",
         ROOT / "deploy/templates/healthcheck.py",
+        ROOT / "tests/ubuntu_26_04_smoke.sh",
     ]
     missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
     if missing:
         raise SystemExit("missing release files: " + ", ".join(missing))
+    smoke_test = ROOT / "tests/ubuntu_26_04_smoke.sh"
+    if not smoke_test.stat().st_mode & 0o111:
+        raise SystemExit("Ubuntu 26.04 smoke test is not executable")
     forbidden = [
         "deploy/bin/",
         "deploy/templates/sniproxy",
@@ -52,7 +56,12 @@ def main():
     for phrase in ("AdguardHomeDoH/main/bootstrap.sh", "admin-credentials", "Password:"):
         if phrase not in readme:
             raise SystemExit("README missing: " + phrase)
-    for shell_file in (ROOT / "bootstrap.sh", ROOT / "deploy/install.sh", ROOT / "deploy/lib/common.sh"):
+    for shell_file in (
+        ROOT / "bootstrap.sh",
+        ROOT / "deploy/install.sh",
+        ROOT / "deploy/lib/common.sh",
+        ROOT / "tests/ubuntu_26_04_smoke.sh",
+    ):
         subprocess.run(["bash", "-n", str(shell_file)], check=True)
     print("release contract: ok")
     return 0

@@ -47,12 +47,14 @@ done
 [[ -n "$EMAIL" ]] || { usage >&2; pressroll_die "--email is required"; }
 pressroll_validate_hostname "$DOMAIN"
 pressroll_validate_ipv4 "$PUBLIC_IP"
+pressroll_validate_email "$EMAIL"
 [[ -f "$POLICY" ]] || pressroll_die "policy not found: $POLICY"
 
 ROOT="$(pressroll_abs_root "$ROOT")"
 STATE_DIR="$(pressroll_under_root "$ROOT" /var/lib/pressroll-smart-dns)"
 CONFIG_DIR="$(pressroll_under_root "$ROOT" /etc/pressroll-smart-dns)"
 CREDENTIALS_FILE="$STATE_DIR/admin-credentials"
+DOH_TOKEN_FILE="$STATE_DIR/doh-token"
 BACKUP_ROOT="$(pressroll_under_root "$ROOT" /var/backups/pressroll-smart-dns)"
 
 if ((DRY_RUN)); then
@@ -127,7 +129,7 @@ else
     FIRST_INSTALL=1
 fi
 ADMIN_HASH="$(htpasswd -bnBC 10 admin "$ADMIN_PASSWORD" | tr -d '\r' | cut -d: -f2-)"
-DOH_TOKEN="$(openssl rand -hex 24)"
+DOH_TOKEN="$(pressroll_load_or_create_doh_token "$DOH_TOKEN_FILE")"
 CERT_ROOT="/etc/letsencrypt/live/$DOMAIN"
 WEBROOT=/var/www/html
 PROFILE_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1)-a$(openssl rand -hex 1)-$(openssl rand -hex 6)"
@@ -215,7 +217,9 @@ nginx -t
 systemctl enable --now AdGuardHome nginx
 systemctl reload nginx
 if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
-    certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" --email "$EMAIL" \
+    mapfile -t certbot_contact_args < <(pressroll_certbot_contact_args "$EMAIL")
+    certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" \
+        "${certbot_contact_args[@]}" \
         --agree-tos --non-interactive --keep-until-expiring
 fi
 install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/pressroll-smart-dns

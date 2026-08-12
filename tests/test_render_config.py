@@ -92,6 +92,7 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn("password: $2a$10$hash", adguard)
         self.assertIn("domain: 'example.com'", adguard)
         self.assertIn("location = /doh/" + "a" * 48, http)
+        self.assertIn("location = /" + "a" * 48 + ".mobileconfig {", http)
         self.assertNotIn("listen 443 ssl", http)
 
 

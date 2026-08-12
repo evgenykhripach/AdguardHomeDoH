@@ -1,0 +1,23 @@
+name: Test installer
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit and release tests
+        run: |
+          python3 -m unittest discover -s tests -v
+          python3 tools/check_release.py
+      - name: Ubuntu 26.04 installation smoke test
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
+            /repo/tests/ubuntu_26_04_smoke.sh /repo
