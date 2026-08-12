@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -26,6 +27,16 @@ MENU_ENTRIES = (
     "Откатить последнее обновление",
     "Выход",
 )
+YES_ANSWERS = {"y", "yes", "д", "да"}
+INVISIBLE_INPUT = "\ufeff\u200b\u200c\u200d\u2060\u2066\u2067\u2068\u2069"
+
+
+def _is_yes_answer(value: str) -> bool:
+    """Accept y/да regardless of terminal CR, case, or pasted invisibles."""
+
+    normalized = str(value).strip().replace("\r", "")
+    normalized = "".join(char for char in normalized if char not in INVISIBLE_INPUT)
+    return normalized.casefold() in YES_ANSWERS
 MANAGED_FILES = (
     "/opt/AdGuardHome/AdGuardHome.yaml",
     "/etc/nginx/sites-enabled/adguardhome-doh",
@@ -450,6 +461,156 @@ def print_service_catalog(catalog: Any, selected: Iterable[str], output: TextIO 
         print("[%s] %2d. %-24s %s" % (mark, index, service.id, service.name_ru), file=output)
 
 
+def _selector_categories(catalog: Any) -> list[str]:
+    categories = []
+    for service in catalog.services:
+        if service.category not in categories:
+            categories.append(service.category)
+    return categories
+
+
+def _selector_services(catalog: Any, category: Optional[str] = None, query: Optional[str] = None) -> list[Any]:
+    services = list(catalog.services)
+    if category is not None:
+        services = [service for service in services if service.category == category]
+    if query is not None:
+        query = query.casefold()
+        services = [service for service in services
+                    if query in service.name_ru.casefold() or query in service.id.casefold()]
+    return services
+
+
+def _print_selector_summary(catalog: Any, selected: set[str], output: TextIO) -> None:
+    domains = _domain_set(catalog, selected)
+    names = [service.name_ru for service in catalog.services if service.id in selected]
+    print("Выбрано сервисов: %d" % len(selected), file=output)
+    print("Активных уникальных доменов: %d" % len(domains), file=output)
+    if names:
+        print("Сервисы: %s" % ", ".join(names), file=output)
+
+
+def _print_selector_categories(catalog: Any, selected: set[str], output: TextIO) -> list[str]:
+    categories = _selector_categories(catalog)
+    print("\nКатегории:", file=output)
+    for number, category in enumerate(categories, 1):
+        services = _selector_services(catalog, category=category)
+        count = sum(service.id in selected for service in services)
+        print("%2d) %-24s %d/%d" % (number, category, count, len(services)), file=output)
+    print("\nКоманды: номер — открыть категорию, /текст — поиск, D — стандартные, "
+          "X — экспериментальные, Y — итог, C — отмена", file=output)
+    return categories
+
+
+def _print_selector_view(title: str, services: list[Any], selected: set[str], output: TextIO) -> None:
+    print("\n%s:" % title, file=output)
+    for number, service in enumerate(services, 1):
+        marker = "x" if service.id in selected else " "
+        print("%2d) [%s] %-28s (%s)" % (number, marker, service.name_ru, service.id), file=output)
+    print("\nКоманды: номера через пробел — включить/выключить, A — все, "
+          "N — снять все, B — назад, C — отмена", file=output)
+
+
+def select_services_interactive(
+    catalog: Any,
+    current: Iterable[str],
+    input_stream: TextIO = sys.stdin,
+    output: TextIO = sys.stdout,
+) -> Optional[list[str]]:
+    """Use the same category/search selector as the installer for service changes."""
+
+    selected = {str(item) for item in current}
+    categories = _selector_categories(catalog)
+    while True:
+        _print_selector_categories(catalog, selected, output)
+        _print_selector_summary(catalog, selected, output)
+        print("\nКатегория: ", end="", file=output, flush=True)
+        raw = input_stream.readline()
+        if not raw:
+            return None
+        answer = raw.strip().casefold()
+        if answer in {"c", "q", "cancel", "отмена"}:
+            print("Выбор отменён.", file=output)
+            return None
+        if answer in {"d", "default", "defaults", "по-умолчанию"}:
+            selected = set(catalog.default_service_ids)
+            continue
+        if answer in {"x", "experimental", "экспериментальные"}:
+            services = [service for service in catalog.services if service.risk_level == "experimental"]
+            title = "Экспериментальные сервисы"
+            result = _select_services_view(services, selected, title, input_stream, output)
+            if result is None:
+                return None
+            selected = result
+            continue
+        if answer in {"y", "yes", "итог", "применить"}:
+            if not selected:
+                print("ошибка: выберите хотя бы один сервис", file=output)
+                continue
+            _print_selector_summary(catalog, selected, output)
+            print("Применить выбор? [y/N]: ", end="", file=output, flush=True)
+            if _is_yes_answer(input_stream.readline()):
+                return [service.id for service in catalog.services if service.id in selected]
+            print("Выбор не применён.", file=output)
+            continue
+        if answer.startswith("/"):
+            services = _selector_services(catalog, query=answer[1:])
+            if not services:
+                print("ошибка: ничего не найдено", file=output)
+                continue
+            result = _select_services_view(services, selected, "Результаты поиска", input_stream, output)
+            if result is None:
+                return None
+            selected = result
+            continue
+        if answer.isdigit() and 1 <= int(answer) <= len(categories):
+            category = categories[int(answer) - 1]
+            services = _selector_services(catalog, category=category)
+            result = _select_services_view(services, selected, category, input_stream, output)
+            if result is None:
+                return None
+            selected = result
+            continue
+        print("ошибка: введите номер категории, /поиск, D, X, Y или C", file=output)
+
+
+def _select_services_view(
+    services: list[Any], selected: set[str], title: str,
+    input_stream: TextIO, output: TextIO,
+) -> Optional[set[str]]:
+    while True:
+        _print_selector_view(title, services, selected, output)
+        print("\nВыбор: ", end="", file=output, flush=True)
+        raw = input_stream.readline()
+        if not raw:
+            return None
+        answer = raw.strip().casefold()
+        if answer in {"b", "back", "назад"}:
+            return selected
+        if answer in {"c", "q", "cancel", "отмена"}:
+            print("Выбор отменён.", file=output)
+            return None
+        if answer in {"a", "all", "все"}:
+            selected.update(service.id for service in services)
+            continue
+        if answer in {"n", "none", "снять"}:
+            selected.difference_update(service.id for service in services)
+            continue
+        tokens = answer.replace(",", " ").split()
+        if not tokens or any(not token.isdigit() for token in tokens):
+            print("ошибка: введите номера сервисов или команду", file=output)
+            continue
+        numbers = [int(token) for token in tokens]
+        if any(number < 1 or number > len(services) for number in numbers):
+            print("ошибка: неверный номер сервиса", file=output)
+            continue
+        for number in numbers:
+            service_id = services[number - 1].id
+            if service_id in selected:
+                selected.remove(service_id)
+            else:
+                selected.add(service_id)
+
+
 def _current_install_state(root: Path) -> Mapping[str, Any]:
     state = _read_json(_runtime_paths(Path(root))["install"], {})
     if not isinstance(state, Mapping) or not state.get("domain"):
@@ -609,18 +770,16 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
             print_access_data(root, output)
         elif choice == "2":
             current = _load_enabled(paths, catalog)
-            print_service_catalog(catalog, current, output)
-            print("Текущие сервисы: %s" % ", ".join(current), file=output)
-            print("Новый выбор (ID, номера, диапазон, default, standard, experimental): ", end="", file=output, flush=True)
-            raw = input_stream.readline()
             try:
-                selected = list(parse_service_selection(raw, catalog))
+                selected = select_services_interactive(catalog, current, input_stream, output)
+                if selected is None:
+                    continue
                 preview = preview_service_change(catalog, current, selected)
                 print("Домены: %d -> %d; добавлено %d; удалено %d" % (
                     preview["old_domains"], preview["new_domains"],
                     preview["added_domains"], preview["removed_domains"]), file=output)
                 print("Применить изменения? [y/N]: ", end="", file=output, flush=True)
-                if input_stream.readline().strip().lower() not in ("y", "yes", "д", "да"):
+                if not _is_yes_answer(input_stream.readline()):
                     print("Изменения отменены.", file=output)
                     continue
                 apply_service_change(selected, root=root, catalog=catalog)
@@ -637,15 +796,19 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                 else:
                     print("Доступна версия %s (текущая %s)." % (status["latest"], status["current"]), file=output)
                     print("Установить? [y/N]: ", end="", file=output, flush=True)
-                    if input_stream.readline().strip().lower() in ("y", "yes", "д", "да"):
-                        install_update(root=root)
-                        print("Обновление установлено.", file=output)
+                    if _is_yes_answer(input_stream.readline()):
+                        if install_update(root=root):
+                            print("Обновление установлено.", file=output)
+                        else:
+                            print("Обновление не требуется или не выполнено.", file=output)
+                    else:
+                        print("Обновление отменено.", file=output)
             except Exception as exc:
                 print("Обновление не применено: %s" % type(exc).__name__, file=output)
         elif choice == "5":
             try:
                 print("Откатить последнюю резервную копию? [y/N]: ", end="", file=output, flush=True)
-                if input_stream.readline().strip().lower() in ("y", "yes", "д", "да"):
+                if _is_yes_answer(input_stream.readline()):
                     print("Откат выполнен." if rollback_last(root) else "Резервная копия не найдена.", file=output)
             except Exception as exc:
                 print("Откат не применён: %s" % type(exc).__name__, file=output)

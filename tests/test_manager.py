@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,29 @@ def load_manager():
 
 
 class ManagerTests(unittest.TestCase):
+    def test_yes_answer_accepts_lowercase_and_terminal_invisibles(self):
+        manager = load_manager()
+        self.assertTrue(manager._is_yes_answer("y\r\n"))
+        self.assertTrue(manager._is_yes_answer("\ufeffY"))
+        self.assertTrue(manager._is_yes_answer("да"))
+        self.assertFalse(manager._is_yes_answer("n"))
+
+    def test_service_selector_matches_installer_categories_and_search(self):
+        manager = load_manager()
+        catalog = Catalog.load(ROOT / "config")
+        output = io.StringIO()
+        selected = manager.select_services_interactive(
+            catalog,
+            catalog.default_service_ids,
+            io.StringIO("/chatgpt\n1\nB\nY\ny\n"),
+            output,
+        )
+        self.assertIsNotNone(selected)
+        self.assertNotIn("chatgpt", selected)
+        self.assertIn("Категории:", output.getvalue())
+        self.assertIn("Результаты поиска:", output.getvalue())
+        self.assertNotIn("Новый выбор (ID", output.getvalue())
+
     def test_menu_is_root_tty_only_and_has_required_entries(self):
         manager = load_manager()
         self.assertEqual(
