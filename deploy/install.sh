@@ -218,8 +218,10 @@ systemctl enable --now AdGuardHome nginx
 systemctl reload nginx
 if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
     mapfile -t certbot_contact_args < <(pressroll_certbot_contact_args "$EMAIL")
-    certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" \
+    certbot certonly --standalone -d "$DOMAIN" \
         "${certbot_contact_args[@]}" \
+        --pre-hook "systemctl stop nginx" \
+        --post-hook "systemctl start nginx" \
         --agree-tos --non-interactive --keep-until-expiring
 fi
 install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/pressroll-smart-dns

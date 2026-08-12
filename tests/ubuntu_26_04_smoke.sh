@@ -25,19 +25,30 @@ cat > "$MOCK_BIN/certbot" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 domain=
+standalone=0
+pre_hook=
+post_hook=
 while (($#)); do
     case "$1" in
         -d) domain="$2"; shift 2 ;;
+        --standalone) standalone=1; shift ;;
+        --pre-hook) pre_hook="$2"; shift 2 ;;
+        --post-hook) post_hook="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
 [[ -n "$domain" ]]
+[[ "$standalone" -eq 1 ]]
+[[ "$pre_hook" == "systemctl stop nginx" ]]
+[[ "$post_hook" == "systemctl start nginx" ]]
+bash -c "$pre_hook"
 certificate_root="/etc/letsencrypt/live/$domain"
 mkdir -p "$certificate_root"
 /usr/bin/openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
     -subj "/CN=$domain" \
     -keyout "$certificate_root/privkey.pem" \
     -out "$certificate_root/fullchain.pem" >/dev/null 2>&1
+bash -c "$post_hook"
 EOF
 chmod 755 "$MOCK_BIN/certbot"
 
