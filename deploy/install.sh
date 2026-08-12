@@ -110,7 +110,9 @@ if [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
     tar -xzf "$work/$archive" -C "$work"
     adguard_binary="$(pressroll_find_adguard_binary "$work")"
     [[ -n "$adguard_binary" ]] || pressroll_die "AdGuard binary missing after extraction"
-    install -D -m 755 "$adguard_binary" /opt/AdGuardHome/AdGuardHome
+    mkdir -p /opt/AdGuardHome
+    chmod 755 /opt/AdGuardHome
+    install -m 755 "$adguard_binary" /opt/AdGuardHome/AdGuardHome
 fi
 
 if [[ -f "$CREDENTIALS_FILE" ]]; then
