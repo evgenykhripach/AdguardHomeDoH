@@ -3,11 +3,21 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from deploy.lib.releases import parse_release, parse_semver, verify_archive
+from deploy.lib.releases import download, parse_release, parse_semver, verify_archive
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_download_sends_asset_headers(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b"asset"
+        with mock.patch("deploy.lib.releases.urlopen", return_value=response) as opener:
+            self.assertEqual(b"asset", download("https://example.invalid/asset"))
+        request = opener.call_args.args[0]
+        self.assertEqual("application/octet-stream", request.get_header("Accept"))
+        self.assertEqual("adguardhome-doh-updater", request.get_header("User-agent"))
     def test_semver_and_stable_release_validation(self):
         version = parse_semver("v1.2.3")
         self.assertEqual((1, 2, 3), (version.major, version.minor, version.patch))

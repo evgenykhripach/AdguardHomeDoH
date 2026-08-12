@@ -685,7 +685,7 @@ def install_update(
         work = Path(directory)
         archive = work / releases.ARCHIVE_NAME
         checksum = work / releases.CHECKSUM_NAME
-        fetch = downloader or (lambda url, path: path.write_bytes(releases.urlopen(url, timeout=30).read()))
+        fetch = downloader or (lambda url, path: path.write_bytes(releases.download(url, timeout=30)))
         fetch(release.archive_url, archive)
         fetch(release.checksum_url, checksum)
         releases.verify_archive(archive, checksum, version=release.version.text())

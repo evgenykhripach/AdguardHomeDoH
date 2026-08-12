@@ -35,6 +35,25 @@ REQUIRED_FILES = (
 )
 
 
+def download(url: str, *, timeout: int = 30) -> bytes:
+    """Download a release asset with GitHub-compatible headers."""
+
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "adguardhome-doh-updater",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except HTTPError as exc:
+        raise RuntimeError("release asset unavailable (HTTP %d)" % exc.code) from exc
+    except (URLError, OSError) as exc:
+        raise RuntimeError("release asset download failed") from exc
+
+
 @dataclass(frozen=True, order=True)
 class Version:
     major: int
