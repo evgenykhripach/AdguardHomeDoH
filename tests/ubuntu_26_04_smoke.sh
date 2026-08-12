@@ -16,7 +16,16 @@ EOF
 chmod 755 /usr/sbin/policy-rc.d
 
 cat > "$MOCK_BIN/systemctl" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> /tmp/adguardhome-doh-systemctl.log
+if [[ "$*" == "start adguardhome-doh-health.service" ]]; then
+    if [[ -e /tmp/adguardhome-doh-force-health-failure ]]; then
+        exit 1
+    fi
+    grep -Fq 'restart adguardhome-doh' /tmp/adguardhome-doh-systemctl.log || exit 1
+    touch /tmp/adguardhome-doh-health-started
+fi
 exit 0
 EOF
 chmod 755 "$MOCK_BIN/systemctl"
@@ -75,6 +84,7 @@ active_token() {
 }
 
 install_once | tee /tmp/adguardhome-doh-first-install.out
+test -e /tmp/adguardhome-doh-health-started
 nginx -t
 /opt/AdGuardHome/AdGuardHome --check-config \
     -c /opt/AdGuardHome/AdGuardHome.yaml \
@@ -106,4 +116,9 @@ curl --fail --silent --show-error --insecure \
     "https://$DOMAIN/$second_token.mobileconfig" \
     -o /tmp/adguardhome-doh.mobileconfig
 grep -Fq "https://$DOMAIN/doh/$second_token" /tmp/adguardhome-doh.mobileconfig
+touch /tmp/adguardhome-doh-force-health-failure
+if install_once >/tmp/adguardhome-doh-failed-health.out 2>&1; then
+    printf 'installer ignored a failed health-check\n' >&2
+    exit 1
+fi
 printf 'ubuntu 26.04 install smoke: ok\n'
