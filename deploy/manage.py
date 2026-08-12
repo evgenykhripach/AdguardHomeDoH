@@ -397,7 +397,7 @@ def parse_service_selection(value: str, catalog: Any) -> Sequence[str]:
     if value in ("d", "default", "defaults", "по-умолчанию"):
         return list(catalog.default_service_ids)
     services = list(catalog.services)
-    if value in ("a", "all", "standard", "стандартные"):
+    if value in ("a", "all", "standard", "стандартные", "все", "выбрать все"):
         return [service.id for service in services if service.risk_level == "standard"]
     if value in ("x", "experimental", "экспериментальные"):
         return [service.id for service in services if service.risk_level == "experimental"]
@@ -426,6 +426,21 @@ def parse_service_selection(value: str, catalog: Any) -> Sequence[str]:
     if not unique:
         raise ValueError("выберите хотя бы один сервис")
     return unique
+
+
+def print_service_catalog(catalog: Any, selected: Iterable[str], output: TextIO = sys.stdout) -> None:
+    selected_ids = set(selected)
+    current_category = None
+    for index, service in enumerate(catalog.services, 1):
+        category = "%s (%s)" % (
+            service.category,
+            "экспериментальные и рискованные" if service.risk_level == "experimental" else "стандартные",
+        )
+        if category != current_category:
+            print("\n%s" % category, file=output)
+            current_category = category
+        mark = "x" if service.id in selected_ids else " "
+        print("[%s] %2d. %-24s %s" % (mark, index, service.id, service.name_ru), file=output)
 
 
 def _current_install_state(root: Path) -> Mapping[str, Any]:
@@ -500,7 +515,7 @@ def install_update(
         selected = [str(item) for item in old_services if str(item) in known]
         if not selected:
             selected = list(catalog.default_service_ids)
-        command = [sys.executable, str(source / "deploy" / "install.sh"),
+        command = ["bash", str(source / "deploy" / "install.sh"),
                    "--domain", str(state["domain"]), "--public-ip", str(state["public_ip"]),
                    "--email", str(state.get("email", "admin@example.com")),
                    "--services", ",".join(selected), "--yes", "--update"]
@@ -572,6 +587,7 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
             print_access_data(root, output)
         elif choice == "2":
             current = _load_enabled(paths, catalog)
+            print_service_catalog(catalog, current, output)
             print("Текущие сервисы: %s" % ", ".join(current), file=output)
             print("Новый выбор (ID, номера, диапазон, default, standard, experimental): ", end="", file=output, flush=True)
             raw = input_stream.readline()
