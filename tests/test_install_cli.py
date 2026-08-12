@@ -224,6 +224,40 @@ class InstallerCliTests(unittest.TestCase):
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)
         self.assertIn("printf 'mobileconfig URL: https://%s/%s.mobileconfig\\n'", source)
 
+    def test_real_install_initializes_log_before_logged_preflight(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        init = source.index("adguardhome_doh_init_log /")
+        preflight = source.index("adguardhome_doh_preflight /")
+        self.assertLess(init, preflight)
+        self.assertIn("adguardhome_doh_run_logged adguardhome_doh_preflight /", source)
+
+    def test_logged_command_output_is_redacted_and_written_to_private_log(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            command = [
+                "bash", "-c",
+                'source "$1"; '
+                'ADGUARDHOME_DOH_ADMIN_PASSWORD=secret-password; '
+                'ADGUARDHOME_DOH_DOH_TOKEN=secret-token; '
+                'ADGUARDHOME_DOH_ADMIN_HASH=secret-hash; '
+                'adguardhome_doh_init_log "$2"; '
+                "adguardhome_doh_run_logged sh -c 'printf \"normal output\\\\n\"; "
+                "printf \"secret-password secret-token secret-hash\\\\n\" >&2'; "
+                'printf "%s\\n" "$ADGUARDHOME_DOH_LOG_PATH"',
+                "bash", str(common), directory,
+            ]
+            result = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            log_path = Path(result.stdout.strip())
+            self.assertEqual(0o600, log_path.stat().st_mode & 0o777)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("normal output", log)
+            self.assertNotIn("secret-password", log)
+            self.assertNotIn("secret-token", log)
+            self.assertNotIn("secret-hash", log)
+
     def test_credentials_are_mode_600_and_preserve_password(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "admin-credentials"

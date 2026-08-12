@@ -207,14 +207,18 @@ if ((DRY_RUN)); then
     exit 0
 fi
 
+if ((YES == 0)) && ! adguardhome_doh_ui_tty; then
+    adguardhome_doh_die "non-interactive installation requires --yes"
+fi
+
 ((UPDATE || ROLLBACK)) && adguardhome_doh_die "update and rollback are available through sudo adguardhome-doh"
 adguardhome_doh_require_root
 [[ "$ROOT" == / ]] || adguardhome_doh_die "non-root installation only supports --dry-run"
 command -v systemctl >/dev/null 2>&1 || adguardhome_doh_die "systemd is required"
 adguardhome_doh_require_ubuntu
-adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP"
 adguardhome_doh_init_log /
 LOG_PATH="$ADGUARDHOME_DOH_LOG_PATH"
+adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP"
 adguardhome_doh_progress 20 'предварительная проверка завершена'
 
 adguardhome_doh_run_logged apt-get update
@@ -239,7 +243,7 @@ if [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
     checksum="$(adguardhome_doh_find_checksum "$work/checksums.txt" "$archive")"
     [[ "$checksum" =~ ^[0-9a-fA-F]{64}$ ]] || adguardhome_doh_die "AdGuard checksum missing for $archive"
     adguardhome_doh_run_logged sh -c "printf '%s  %s\\n' '$checksum' '$work/$archive' | sha256sum -c -"
-    tar -xzf "$work/$archive" -C "$work"
+    adguardhome_doh_run_logged tar -xzf "$work/$archive" -C "$work"
     adguard_binary="$(adguardhome_doh_find_binary "$work")"
     [[ -n "$adguard_binary" ]] || adguardhome_doh_die "AdGuard binary missing after extraction"
     mkdir -p /opt/AdGuardHome

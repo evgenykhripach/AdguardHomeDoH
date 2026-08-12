@@ -65,6 +65,20 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertRegex(result.stderr, r"(TTY|tty|--domain)")
 
+    def test_non_tty_real_install_requires_yes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    str(INSTALL), "--domain", "dns.example.com",
+                    "--public-ip", "203.0.113.10", "--email", "admin@example.com",
+                    "--services", "chatgpt,claude", "--root", directory,
+                ],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=3,
+            )
+        self.assertNotEqual(0, result.returncode)
+        self.assertRegex(result.stderr, r"(?i)(non-interactive|non-tty|--yes)")
+
     def test_dry_run_emits_neutral_progress_milestones_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
