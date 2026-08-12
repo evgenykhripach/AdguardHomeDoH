@@ -43,6 +43,20 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("Результаты поиска:", output.getvalue())
         self.assertNotIn("Новый выбор (ID", output.getvalue())
 
+    def test_menu_exits_after_successful_update_to_reload_new_code(self):
+        manager = load_manager()
+        output = io.StringIO()
+        with mock.patch.object(manager, "_load_catalog", return_value=Catalog.load(ROOT / "config")), \
+             mock.patch.object(manager, "update_status", return_value={
+                 "available": True, "current": "1.0.12", "latest": "1.0.13",
+             }), \
+             mock.patch.object(manager, "install_update", return_value=True):
+            result = manager.run_menu(
+                root=Path("/"), input_stream=io.StringIO("4\ny\n"), output=output
+            )
+        self.assertEqual(0, result)
+        self.assertIn("Запустите менеджер заново", output.getvalue())
+
     def test_menu_is_root_tty_only_and_has_required_entries(self):
         manager = load_manager()
         self.assertEqual(

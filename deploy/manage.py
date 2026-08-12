@@ -798,7 +798,8 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                     print("Установить? [y/N]: ", end="", file=output, flush=True)
                     if _is_yes_answer(input_stream.readline()):
                         if install_update(root=root):
-                            print("Обновление установлено.", file=output)
+                            print("Обновление установлено. Запустите менеджер заново для применения нового интерфейса.", file=output)
+                            return 0
                         else:
                             print("Обновление не требуется или не выполнено.", file=output)
                     else:
