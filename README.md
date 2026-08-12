@@ -1,4 +1,4 @@
-# Pressroll AdGuard Home DoH Smart DNS
+# AdGuard Home DoH Smart DNS
 
 Персональный Smart DNS на базе AdGuard Home и nginx. Установка выполняется
 одной командой на чистом Ubuntu 24.04.
