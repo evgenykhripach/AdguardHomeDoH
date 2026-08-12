@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck source=lib/ui.sh
 source "$SCRIPT_DIR/lib/ui.sh"
 
-ADGUARD_VERSION="${ADGUARDHOME_DOH_VERSION:-$(<"$PROJECT_ROOT/VERSION")}"
+ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.78}"
 REPOSITORY="${ADGUARDHOME_DOH_REPOSITORY:-evgenykhripach/AdguardHomeDoH}"
 ROOT=/
 DOMAIN=

@@ -26,6 +26,14 @@ class InstallerCliTests(unittest.TestCase):
         self.assertIn("--domain HOST", result.stdout)
         self.assertIn("--rollback", result.stdout)
 
+    def test_adguard_release_version_is_independent_from_project_version(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertIn(
+            'ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.78}"',
+            source,
+        )
+        self.assertNotIn('$(<"$PROJECT_ROOT/VERSION")', source)
+
     def test_dry_run_validates_without_writing_root(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_install(
