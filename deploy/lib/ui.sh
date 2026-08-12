@@ -16,7 +16,15 @@ adguardhome_doh_progress() {
     (( allowed )) || { adguardhome_doh_ui_error "invalid progress milestone: $percent"; return 1; }
     (( percent >= ADGUARDHOME_DOH_LAST_PROGRESS )) || { adguardhome_doh_ui_error "progress moved backwards: $percent"; return 1; }
     ADGUARDHOME_DOH_LAST_PROGRESS="$percent"
-    if [[ "${ADGUARDHOME_DOH_TEXT_PROGRESS:-0}" == 1 ]] || ! adguardhome_doh_ui_tty; then printf '[%02d%%] %s\n' "$percent" "$message"; else printf '\r\033[2K[%02d%%] %s' "$percent" "$message"; fi
+    if [[ "${ADGUARDHOME_DOH_TEXT_PROGRESS:-0}" == 1 ]] || ! adguardhome_doh_ui_tty || (( percent == 0 )); then printf '[%02d%%] %s\n' "$percent" "$message"; else printf '\r\033[2K[%02d%%] %s' "$percent" "$message"; fi
+}
+
+adguardhome_doh_trim_input() {
+    local value="$1"
+    value="${value//$'\r'/}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
 }
 
 adguardhome_doh_read_tty() {
@@ -37,7 +45,7 @@ adguardhome_doh_read_tty() {
         printf '%s' "$prompt" >&2
         IFS= read -r value || { adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2; }
     fi
-    ADGUARDHOME_DOH_READ_VALUE="$value"
+    ADGUARDHOME_DOH_READ_VALUE="$(adguardhome_doh_trim_input "$value")"
 }
 
 adguardhome_doh_prompt_value() {

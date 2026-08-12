@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "deploy" / "install.sh"
+COMMON = ROOT / "deploy" / "lib" / "common.sh"
+UI = ROOT / "deploy" / "lib" / "ui.sh"
 
 
 def run_pty(*args, input_text="", timeout=5):
@@ -106,7 +108,27 @@ class InteractiveInstallerTests(unittest.TestCase):
         self.assertIn("chatgpt", output.lower())
         self.assertIn("install", output.lower())
         self.assertEqual(1, output.count("Домен (например, dns.example.com):"), output)
+        normalized_output = output.replace("\r\n", "\n")
+        self.assertIn("[00%] проверка параметров\nДомен (например, dns.example.com):", normalized_output)
         self.assertIn("Сервисы:", output)
+
+    def test_interactive_input_trims_terminal_carriage_return_and_spaces(self):
+        script = (
+            f'source "{COMMON}"; source "{UI}"; '
+            'ADGUARDHOME_DOH_TTY_FD=0; '
+            'adguardhome_doh_read_tty value ""; '
+            'printf "<%s>\\n" "$ADGUARDHOME_DOH_READ_VALUE"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            input=" dns2.pressroll.ru\r\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=ROOT,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("<dns2.pressroll.ru>\n", result.stdout)
 
     def test_log_path_and_secrets_are_not_emitted_during_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
