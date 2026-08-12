@@ -55,6 +55,9 @@ adguardhome_doh_prompt_value() {
     while :; do
         adguardhome_doh_read_tty value "$prompt" || return $?
         value="$ADGUARDHOME_DOH_READ_VALUE"
+        if [[ "$validator" == adguardhome_doh_validate_hostname ]]; then
+            value="$(printf '%s' "$value" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cd 'a-z0-9.-')"
+        fi
         if "$validator" "$value" >/dev/null 2>&1; then printf -v "$variable" '%s' "$value"; return 0; fi
         adguardhome_doh_ui_error "значение не прошло проверку, повторите ввод"
     done

@@ -117,12 +117,12 @@ class InteractiveInstallerTests(unittest.TestCase):
         script = (
             f'source "{COMMON}"; source "{UI}"; '
             'ADGUARDHOME_DOH_TTY_FD=0; '
-            'adguardhome_doh_read_tty value ""; '
-            'printf "<%s>\\n" "$ADGUARDHOME_DOH_READ_VALUE"'
+            'adguardhome_doh_prompt_value normalized "" adguardhome_doh_validate_hostname; '
+            'printf "<%s>\\n" "$normalized"'
         )
         result = subprocess.run(
             ["bash", "-c", script],
-            input=f"\x1b[200~ {target_domain}\x1b[201~\r\n",
+            input=f"\x1b[200~\u200b {target_domain}\u200b\x1b[201~\r\n",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
