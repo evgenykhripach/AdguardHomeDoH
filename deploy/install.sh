@@ -55,7 +55,10 @@ STATE_DIR="$(pressroll_under_root "$ROOT" /var/lib/pressroll-smart-dns)"
 CONFIG_DIR="$(pressroll_under_root "$ROOT" /etc/pressroll-smart-dns)"
 CREDENTIALS_FILE="$STATE_DIR/admin-credentials"
 DOH_TOKEN_FILE="$STATE_DIR/doh-token"
+INSTALL_COMPLETE_FILE="$STATE_DIR/install-complete"
 BACKUP_ROOT="$(pressroll_under_root "$ROOT" /var/backups/pressroll-smart-dns)"
+PRINT_INSTALL_SUMMARY=0
+[[ -f "$INSTALL_COMPLETE_FILE" ]] || PRINT_INSTALL_SUMMARY=1
 
 if ((DRY_RUN)); then
     python3 "$PROJECT_ROOT/tools/render_config.py" \
@@ -230,8 +233,9 @@ systemctl reload nginx
 systemctl enable --now pressroll-smart-dns-health.timer
 systemctl start pressroll-smart-dns-health.service || true
 rm -rf -- "$stage"
+install -m 600 /dev/null "$INSTALL_COMPLETE_FILE"
 
-if ((FIRST_INSTALL)); then
+if ((PRINT_INSTALL_SUMMARY)); then
     printf '\nAdGuard Home admin credentials (save them now):\n'
     printf 'URL: https://%s/\nLogin: admin\nPassword: %s\n' "$DOMAIN" "$ADMIN_PASSWORD"
     printf 'Saved locally: %s (mode 0600)\n' "$CREDENTIALS_FILE"

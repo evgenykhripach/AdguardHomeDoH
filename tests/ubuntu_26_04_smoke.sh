@@ -68,21 +68,28 @@ active_token() {
         sed 's#location = /doh/##'
 }
 
-install_once
+install_once | tee /tmp/pressroll-first-install.out
 nginx -t
 /opt/AdGuardHome/AdGuardHome --check-config \
     -c /opt/AdGuardHome/AdGuardHome.yaml \
     -w /var/lib/AdGuardHome
 test "$(grep -Fxc 'include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf)" -eq 1
 test -s /var/lib/pressroll-smart-dns/admin-credentials
+test -f /var/lib/pressroll-smart-dns/install-complete
 first_token="$(active_token)"
 test -n "$first_token"
+grep -Fq 'AdGuard Home admin credentials' /tmp/pressroll-first-install.out
 
-install_once
+rm /var/lib/pressroll-smart-dns/install-complete
+install_once | tee /tmp/pressroll-recovered-install.out
 nginx -t
 second_token="$(active_token)"
 test "$second_token" = "$first_token"
 test "$(grep -Fxc 'include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf)" -eq 1
+test -f /var/lib/pressroll-smart-dns/install-complete
+grep -Fq 'AdGuard Home admin credentials' /tmp/pressroll-recovered-install.out
+grep -Fq "DoH URL: https://$DOMAIN/doh/$second_token" /tmp/pressroll-recovered-install.out
+grep -Fq "mobileconfig: https://$DOMAIN/$second_token.mobileconfig" /tmp/pressroll-recovered-install.out
 
 nginx
 trap 'nginx -s quit >/dev/null 2>&1 || true' EXIT
