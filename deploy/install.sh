@@ -104,7 +104,7 @@ if [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
     curl --fail --silent --show-error --location \
         "https://github.com/AdguardTeam/AdGuardHome/releases/download/v${ADGUARD_VERSION}/checksums.txt" \
         -o "$work/checksums.txt"
-    checksum="$(awk -v name="$archive" '$2 == name || $2 == "*" name {print $1}' "$work/checksums.txt" | head -1)"
+    checksum="$(pressroll_find_checksum "$work/checksums.txt" "$archive")"
     [[ "$checksum" =~ ^[0-9a-fA-F]{64}$ ]] || pressroll_die "AdGuard checksum missing for $archive"
     printf '%s  %s\n' "$checksum" "$work/$archive" | sha256sum -c -
     tar -xzf "$work/$archive" -C "$work"

@@ -24,6 +24,13 @@ pressroll_require_ubuntu() {
         pressroll_die "Ubuntu 24.04 or newer is required"
 }
 
+pressroll_find_checksum() {
+    local checksums_file="$1" archive="$2"
+    awk -v name="$archive" \
+        '$2 == name || $2 == "./" name || $2 == "*" name { print $1; exit }' \
+        "$checksums_file"
+}
+
 pressroll_validate_hostname() {
     [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || \
         pressroll_die "invalid hostname: $1"

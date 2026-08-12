@@ -59,6 +59,23 @@ class InstallerCliTests(unittest.TestCase):
                 )
                 self.assertEqual(expected, result.returncode, version)
 
+    def test_adguard_checksum_parser_accepts_release_path(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        checksum = "a" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            checksums = Path(directory) / "checksums.txt"
+            checksums.write_text(
+                f"{checksum}  ./AdGuardHome_linux_amd64.tar.gz\n", encoding="utf-8"
+            )
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; pressroll_find_checksum "$2" "$3"',
+                 "bash", str(common), str(checksums),
+                 "AdGuardHome_linux_amd64.tar.gz"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(checksum, result.stdout.strip())
+
     def test_first_install_prints_doh_and_mobileconfig_urls(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn("printf 'DoH URL: https://%s/doh/%s\\n'", source)
