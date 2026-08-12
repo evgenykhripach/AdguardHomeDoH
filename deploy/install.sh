@@ -327,7 +327,7 @@ ReadWritePaths=/opt/AdGuardHome /var/lib/AdGuardHome
 [Install]
 WantedBy=multi-user.target
 UNIT
-adguardhome_doh_install_health_templates "$PROJECT_ROOT"
+adguardhome_doh_run_logged adguardhome_doh_install_health_templates / "$PROJECT_ROOT"
 install -m 640 "$stage/health-policy.json" "$CONFIG_DIR/health-policy.json"
 cat > /etc/adguardhome-doh/runtime.env <<EOF
 ADGUARDHOME_DOH_AGH_URL=http://127.0.0.1:3001

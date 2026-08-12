@@ -120,13 +120,14 @@ adguardhome_doh_find_binary() {
 }
 
 adguardhome_doh_install_health_templates() {
-    local project_root="$1" root="${2:-/}" templates libexec systemd
+    local project_root="$1" root="${2:-/}" templates libexec systemd manager
     templates="$project_root/deploy/templates"
     libexec="$(adguardhome_doh_under_root "$root" /usr/local/libexec/adguardhome-doh)"
     systemd="$(adguardhome_doh_under_root "$root" /etc/systemd/system)"
     [[ -f "$templates/healthcheck.py" ]] || adguardhome_doh_die "healthcheck.py template is missing"
     [[ -f "$templates/healthcheck.service" ]] || adguardhome_doh_die "healthcheck.service template is missing"
     [[ -f "$templates/healthcheck.timer" ]] || adguardhome_doh_die "healthcheck.timer template is missing"
+    [[ -f "$project_root/deploy/manage.py" ]] || adguardhome_doh_die "manage.py is missing"
     mkdir -p "$libexec" "$systemd"
     chmod 700 "$libexec"
     cp "$templates/healthcheck.py" "$libexec/healthcheck.py"
@@ -134,6 +135,9 @@ adguardhome_doh_install_health_templates() {
     cp "$templates/healthcheck.service" "$systemd/adguardhome-doh-health.service"
     cp "$templates/healthcheck.timer" "$systemd/adguardhome-doh-health.timer"
     chmod 644 "$systemd/adguardhome-doh-health.service" "$systemd/adguardhome-doh-health.timer"
+    manager="$(adguardhome_doh_under_root "$root" /usr/local/sbin/adguardhome-doh)"
+    mkdir -p "$(dirname "$manager")"
+    install -m 755 "$project_root/deploy/manage.py" "$manager"
 }
 
 adguardhome_doh_abs_root() {

@@ -1,21 +1,21 @@
 [Unit]
-Description=Pressroll Smart DNS health gate
-After=network-online.target nginx.service AdGuardHome.service
+Description=AdGuard Home DoH health gate
+After=network-online.target nginx.service adguardhome-doh.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/pressroll-smart-dns/healthcheck.py
-EnvironmentFile=/etc/pressroll-smart-dns/runtime.env
+ExecStart=/usr/local/libexec/adguardhome-doh/healthcheck.py
+EnvironmentFile=/etc/adguardhome-doh/runtime.env
 User=root
 Group=root
-RuntimeDirectory=pressroll-smart-dns
+RuntimeDirectory=adguardhome-doh
 RuntimeDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/pressroll-smart-dns
+ReadWritePaths=/var/lib/adguardhome-doh
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
