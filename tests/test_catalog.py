@@ -73,6 +73,28 @@ class CatalogTests(unittest.TestCase):
         )
         self.assertEqual("files.oaiusercontent.com", row.probe)
 
+    def test_gemini_service_routes_consumer_app_backends(self):
+        catalog = Catalog.load(ROOT / "config")
+        backends = {
+            "alkalicore-pa.clients6.google.com",
+            "alkalimakersuite-pa.clients6.google.com",
+            "cloudaicompanion.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "geller-pa.googleapis.com",
+            "generativelanguage.googleapis.com",
+            "proactivebackend-pa.googleapis.com",
+            "robinfrontend-pa.googleapis.com",
+            "signaler-pa.clients6.google.com",
+            "waa-pa.clients6.google.com",
+            "webchannel-alkalimakersuite-pa.clients6.google.com",
+        }
+        routed = {row.domain for row in catalog.enabled_policy(["gemini"])}
+        self.assertTrue(backends <= routed)
+        for domain in backends:
+            self.assertIn("gemini", catalog.associations[domain])
+            self.assertIn("developer_infrastructure", catalog.associations[domain])
+
     def test_context7_service_covers_official_web_and_mcp_hosts(self):
         catalog = Catalog.load(ROOT / "config")
         service = next(service for service in catalog.services if service.id == "context7")

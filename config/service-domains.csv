@@ -8,7 +8,9 @@ developer_infrastructure,aisandbox-pa.googleapis.com
 gemini,aistudio.google.com
 developer_infrastructure,aitestkitchen.withgoogle.com
 developer_infrastructure,alkalicore-pa.clients6.google.com
+gemini,alkalicore-pa.clients6.google.com
 developer_infrastructure,alkalimakersuite-pa.clients6.google.com
+gemini,alkalimakersuite-pa.clients6.google.com
 amd,amd.com
 claude,anthropic.com
 trae,api-sg-central.trae.ai
@@ -53,7 +55,9 @@ claude,claudemcpcontent.com
 claude,claudeusercontent.com
 clickup,clickup.com
 developer_infrastructure,cloudaicompanion.googleapis.com
+gemini,cloudaicompanion.googleapis.com
 developer_infrastructure,cloudcode-pa.googleapis.com
+gemini,cloudcode-pa.googleapis.com
 codeium,codeium.com
 context7,context7.com
 developer_infrastructure,controlplane.tailscale.com
@@ -65,6 +69,7 @@ microsoft_copilot,copilot.microsoft.com
 misc_experimental,crixet.com
 microsoft_shared,d.docs.live.net
 developer_infrastructure,daily-cloudcode-pa.googleapis.com
+gemini,daily-cloudcode-pa.googleapis.com
 google_apps,datastudio.google.com
 deepl,deepl.app
 deepl,deepl.com
@@ -101,11 +106,13 @@ flowmusic,flowmusic.app
 fmhy,fmhy.net
 framer,framer.com
 developer_infrastructure,geller-pa.googleapis.com
+gemini,geller-pa.googleapis.com
 gemini,gemini.google
 gemini,gemini.google.com
 gemini,gemini.gstatic.com
 gemini,generativeai.google
 developer_infrastructure,generativelanguage.googleapis.com
+gemini,generativelanguage.googleapis.com
 developer_infrastructure,geolocation.onetrust.com
 github_copilot,githubcopilot.com
 misc_experimental,gpt3-openai.com
@@ -165,6 +172,7 @@ perplexity,perplexity.ai
 perplexity,perplexity.com
 perplexity,pplx.ai
 developer_infrastructure,proactivebackend-pa.googleapis.com
+gemini,proactivebackend-pa.googleapis.com
 pump_fun,pump.fun
 qualtrics,qualtrics.com
 qwant,qwant.com
@@ -173,9 +181,11 @@ reve,reve.art
 reve,reve.com
 microsoft_shared,rewards.bing.com
 developer_infrastructure,robinfrontend-pa.googleapis.com
+gemini,robinfrontend-pa.googleapis.com
 cdn_shared,scdn.co
 spotify,scdn.co
 developer_infrastructure,signaler-pa.clients6.google.com
+gemini,signaler-pa.clients6.google.com
 sketchup,sketchup.com
 chatgpt,sora.com
 spotify,spotify.com
@@ -199,11 +209,13 @@ unscreen,unscreen.com
 twitch,usher.ttvnw.net
 misc_experimental,w-x.co
 developer_infrastructure,waa-pa.clients6.google.com
+gemini,waa-pa.clients6.google.com
 wbgames,wbagora.com
 wbgames,wbgames.com
 weather,weather.com
 web_archive,web.archive.org
-developer_infrastructure,webchannel-alkalimakersuite-pa.googleapis.com
+developer_infrastructure,webchannel-alkalimakersuite-pa.clients6.google.com
+gemini,webchannel-alkalimakersuite-pa.clients6.google.com
 windsurf,windsurf.com
 lastfm,ws.audioscrobbler.com
 weather,wund.com
