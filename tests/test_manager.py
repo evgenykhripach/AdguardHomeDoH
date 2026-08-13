@@ -20,6 +20,18 @@ def load_manager():
 
 
 class ManagerTests(unittest.TestCase):
+    def test_runtime_services_are_reloaded_after_service_change(self):
+        manager = load_manager()
+        runner = mock.Mock()
+        manager.reload_runtime_services(Path("/"), runner=runner)
+        self.assertEqual(
+            [
+                mock.call(["systemctl", "restart", "adguardhome-doh"], check=True),
+                mock.call(["systemctl", "reload", "nginx"], check=True),
+            ],
+            runner.call_args_list,
+        )
+
     def test_yes_answer_accepts_lowercase_and_terminal_invisibles(self):
         manager = load_manager()
         self.assertTrue(manager._is_yes_answer("y\r\n"))

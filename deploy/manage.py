@@ -206,6 +206,17 @@ def activate_transaction(
     return backup_dir
 
 
+def reload_runtime_services(
+    root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run
+) -> None:
+    """Load newly activated AdGuard and nginx configuration on a live host."""
+
+    if Path(root) != Path("/"):
+        return
+    runner(["systemctl", "restart", "adguardhome-doh"], check=True)
+    runner(["systemctl", "reload", "nginx"], check=True)
+
+
 def _domain_set(catalog: Any, services: Iterable[str]) -> set:
     return {row.domain for row in catalog.enabled_policy(list(services))}
 
@@ -352,9 +363,16 @@ def apply_service_change(
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         try:
-            return activate_transaction(targets, backup_dir, validate=validate, root=root)
+            activated = activate_transaction(targets, backup_dir, validate=validate, root=root)
+            reload_runtime_services(root)
+            return activated
         except Exception:
             _restore_backup(full_backup, root)
+            if root == Path("/"):
+                try:
+                    reload_runtime_services(root)
+                except Exception:
+                    pass
             raise
     finally:
         shutil.rmtree(stage, ignore_errors=True)
