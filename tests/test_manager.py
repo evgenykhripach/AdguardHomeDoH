@@ -23,6 +23,7 @@ class ManagerTests(unittest.TestCase):
     def test_yes_answer_accepts_lowercase_and_terminal_invisibles(self):
         manager = load_manager()
         self.assertTrue(manager._is_yes_answer("y\r\n"))
+        self.assertTrue(manager._is_yes_answer("\x1b[200~y\x1b[201~\r\n"))
         self.assertTrue(manager._is_yes_answer("\ufeffY"))
         self.assertTrue(manager._is_yes_answer("да"))
         self.assertFalse(manager._is_yes_answer("n"))

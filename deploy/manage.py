@@ -35,6 +35,7 @@ def _is_yes_answer(value: str) -> bool:
     """Accept y/да regardless of terminal CR, case, or pasted invisibles."""
 
     normalized = str(value).strip().replace("\r", "")
+    normalized = normalized.replace("\x1b[200~", "").replace("\x1b[201~", "")
     normalized = "".join(char for char in normalized if char not in INVISIBLE_INPUT)
     return normalized.casefold() in YES_ANSWERS
 MANAGED_FILES = (
@@ -335,7 +336,8 @@ def apply_service_change(
                 validator()
                 return
             subprocess.run(["/opt/AdGuardHome/AdGuardHome", "--check-config",
-                            "-c", str(paths["agh"])], check=True,
+                            "-c", str(paths["agh"]),
+                            "-w", str(under_root(root, "/var/lib/AdGuardHome"))], check=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             subprocess.run(["nginx", "-t"], check=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -387,7 +389,8 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
         "units": units,
         "nginx": _command_ok(["nginx", "-t"], runner),
         "adguard_config": _command_ok(["/opt/AdGuardHome/AdGuardHome", "--check-config",
-                                        "-c", str(paths["agh"])], runner),
+                                        "-c", str(paths["agh"]),
+                                        "-w", str(under_root(root, "/var/lib/AdGuardHome"))], runner),
         "certificate": certificate.is_file() and (certificate.with_name("privkey.pem")).is_file(),
         "endpoints": {
             "admin": bool(domain),
