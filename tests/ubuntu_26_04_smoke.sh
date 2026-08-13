@@ -95,7 +95,7 @@ test -f /var/lib/adguardhome-doh/install-complete
 test "$(stat -c '%a' /var/www/adguardhome-doh)" = 755
 first_token="$(active_token)"
 test -n "$first_token"
-test -s "/var/www/adguardhome-doh/$first_token.mobileconfig"
+test -s "/var/www/adguardhome-doh/$DOMAIN.mobileconfig"
 grep -Fq 'Admin URL:' /tmp/adguardhome-doh-first-install.out
 
 rm /var/lib/adguardhome-doh/install-complete
@@ -113,9 +113,14 @@ nginx
 trap 'nginx -s quit >/dev/null 2>&1 || true' EXIT
 curl --fail --silent --show-error --insecure \
     --resolve "$DOMAIN:443:127.0.0.1" \
+    --dump-header /tmp/adguardhome-doh-mobileconfig.headers \
     "https://$DOMAIN/$second_token.mobileconfig" \
     -o /tmp/adguardhome-doh.mobileconfig
+grep -Fiq "Content-Disposition: attachment; filename=$DOMAIN.mobileconfig" \
+    /tmp/adguardhome-doh-mobileconfig.headers
 grep -Fq "https://$DOMAIN/doh/$second_token" /tmp/adguardhome-doh.mobileconfig
+test "$(grep -Foc "<key>PayloadDisplayName</key><string>$DOMAIN</string>" \
+    /tmp/adguardhome-doh.mobileconfig)" -eq 2
 touch /tmp/adguardhome-doh-force-health-failure
 if install_once >/tmp/adguardhome-doh-failed-health.out 2>&1; then
     printf 'installer ignored a failed health-check\n' >&2

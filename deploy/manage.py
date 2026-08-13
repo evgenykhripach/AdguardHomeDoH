@@ -412,6 +412,7 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
                 active += 1
     certificate_root = Path("/etc/letsencrypt/live") / domain if domain else Path("/")
     certificate = under_root(root, str(certificate_root)) / "fullchain.pem"
+    profile = paths["webroot"] / (domain + ".mobileconfig") if domain else None
     report = {
         "units": units,
         "nginx": _command_ok(["nginx", "-t"], runner),
@@ -422,7 +423,7 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
         "endpoints": {
             "admin": bool(domain),
             "doh": bool(domain and paths["token"].is_file()),
-            "mobileconfig": bool(domain and paths["token"].is_file()),
+            "mobileconfig": bool(profile and profile.is_file()),
         },
         "health_state": {
             "services": len(health_state) if isinstance(health_state, Mapping) else 0,

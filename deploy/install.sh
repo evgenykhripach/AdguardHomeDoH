@@ -269,8 +269,6 @@ ADGUARDHOME_DOH_ADMIN_HASH="$ADMIN_HASH"
 DOH_TOKEN="$(adguardhome_doh_load_or_create_doh_token "$DOH_TOKEN_FILE")"
 ADGUARDHOME_DOH_DOH_TOKEN="$DOH_TOKEN"
 CERT_ROOT="/etc/letsencrypt/live/$DOMAIN"
-PROFILE_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1)-a$(openssl rand -hex 1)-$(openssl rand -hex 6)"
-PAYLOAD_ID="$(openssl rand -hex 4)-$(openssl rand -hex 2)-4$(openssl rand -hex 1)-b$(openssl rand -hex 1)-$(openssl rand -hex 6)"
 stage="$(mktemp -d "$STATE_DIR/.stage.XXXXXX")"
 backup="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$backup"; chmod 700 "$backup"
@@ -287,17 +285,7 @@ adguardhome_doh_progress 65 'конфигурация подготовлена'
 
 install -m 640 "$stage/AdGuardHome.yaml" /opt/AdGuardHome/AdGuardHome.yaml
 install -m 644 "$stage/nginx-stream.conf" /etc/nginx/stream.d/adguardhome-doh.conf
-cat > "$WEBROOT/$DOH_TOKEN.mobileconfig" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>PayloadContent</key><array><dict>
-<key>DNSSettings</key><dict><key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://$DOMAIN/doh/$DOH_TOKEN</string></dict>
-<key>PayloadDisplayName</key><string>AdGuard Home DoH</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.$PAYLOAD_ID</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadType</key><string>com.apple.dnsSettings.managed</string><key>PayloadUUID</key><string>$PAYLOAD_ID</string><key>PayloadVersion</key><integer>1</integer>
-</dict></array>
-<key>PayloadDisplayName</key><string>AdGuard Home DoH</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.$PROFILE_ID</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>$PROFILE_ID</string><key>PayloadVersion</key><integer>1</integer>
-</dict></plist>
-EOF
+install -m 644 "$stage/$DOMAIN.mobileconfig" "$WEBROOT/$DOMAIN.mobileconfig"
 adguardhome_doh_ensure_nginx_stream_include
 cat > /etc/nginx/sites-enabled/adguardhome-doh <<EOF
 server {

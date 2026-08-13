@@ -6,6 +6,7 @@ import csv
 import ipaddress
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -498,6 +499,24 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
     return "\n".join(lines)
 
 
+def render_mobileconfig(doh_host: str, doh_token: str) -> str:
+    doh_host = _hostname(doh_host, "doh-host")
+    if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
+        raise ValueError("doh-token must be lowercase hexadecimal")
+    profile_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "adguardhome-doh-profile:" + doh_host))
+    payload_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "adguardhome-doh-payload:" + doh_host))
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>PayloadContent</key><array><dict>
+<key>DNSSettings</key><dict><key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://{host}/doh/{token}</string></dict>
+<key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{payload_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadType</key><string>com.apple.dnsSettings.managed</string><key>PayloadUUID</key><string>{payload_id}</string><key>PayloadVersion</key><integer>1</integer>
+</dict></array>
+<key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{profile_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>{profile_id}</string><key>PayloadVersion</key><integer>1</integer>
+</dict></plist>
+""".format(host=doh_host, token=doh_token, payload_id=payload_id, profile_id=profile_id)
+
+
 def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webroot: str) -> str:
     doh_host = _hostname(doh_host, "doh-host")
     if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
@@ -526,9 +545,9 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "    location = /%s.mobileconfig {" % doh_token,
         "        root %s;" % webroot,
         "        default_type application/x-apple-aspen-config;",
-        "        add_header Content-Disposition \"attachment; filename=adguardhome-doh.mobileconfig\" always;",
+        "        add_header Content-Disposition \"attachment; filename=%s.mobileconfig\" always;" % doh_host,
         "        add_header Cache-Control \"no-store\" always;",
-        "        try_files $uri =404;",
+        "        try_files /%s.mobileconfig =404;" % doh_host,
         "    }",
         "    location = /dns-query { return 404; }",
         "    location = /doh/%s {" % doh_token,

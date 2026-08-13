@@ -20,6 +20,24 @@ def load_manager():
 
 
 class ManagerTests(unittest.TestCase):
+    def test_system_check_requires_domain_named_mobileconfig(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh"
+            webroot = root / "var/www/adguardhome-doh"
+            state.mkdir(parents=True)
+            webroot.mkdir(parents=True)
+            (state / "install.json").write_text(
+                '{"domain":"dns.example.com"}\n', encoding="utf-8"
+            )
+            (webroot / "dns.example.com.mobileconfig").write_text(
+                "profile\n", encoding="utf-8"
+            )
+            runner = mock.Mock(return_value=mock.Mock(returncode=0))
+            report = manager.collect_system_check(root, runner=runner)
+        self.assertTrue(report["endpoints"]["mobileconfig"])
+
     def test_runtime_services_are_reloaded_after_service_change(self):
         manager = load_manager()
         runner = mock.Mock()

@@ -1,5 +1,6 @@
 import csv
 import json
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,37 @@ class RenderConfigTests(unittest.TestCase):
             )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("--config-dir", result.stdout)
+
+    def test_runtime_renderer_stages_domain_named_mobileconfig(self):
+        root = Path(__file__).resolve().parents[1]
+        token = "a" * 48
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            result = subprocess.run(
+                [
+                    "python3", str(root / "deploy/lib/render_runtime.py"),
+                    "--config-dir", str(root / "config"),
+                    "--services", "chatgpt",
+                    "--public-ip", "203.0.113.10",
+                    "--doh-host", "dns.example.com",
+                    "--doh-token", token,
+                    "--password-hash", "hash",
+                    "--certificate-root", "/etc/letsencrypt/live/dns.example.com",
+                    "--webroot", "/var/www/adguardhome-doh",
+                    "--output", str(output),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            profile = output / "dns.example.com.mobileconfig"
+            self.assertTrue(profile.is_file())
+            contents = profile.read_text(encoding="utf-8")
+            payload = plistlib.loads(profile.read_bytes())
+        self.assertIn("https://dns.example.com/doh/" + token, contents)
+        self.assertEqual("dns.example.com", payload["PayloadDisplayName"])
+        self.assertEqual(
+            "dns.example.com", payload["PayloadContent"][0]["PayloadDisplayName"]
+        )
 
     def write_policy(self, rows):
         handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False)
@@ -111,6 +143,11 @@ class RenderConfigTests(unittest.TestCase):
         self.assertNotIn("answer: 127.0.0.1", adguard)
         self.assertIn("location = /doh/" + "a" * 48, http)
         self.assertIn("location = /" + "a" * 48 + ".mobileconfig {", http)
+        self.assertIn("try_files /dns.example.com.mobileconfig =404;", http)
+        self.assertIn(
+            'Content-Disposition "attachment; filename=dns.example.com.mobileconfig"',
+            http,
+        )
         self.assertNotIn("listen 443 ssl", http)
 
     def test_catalog_rows_render_deterministically_for_selected_services(self):
