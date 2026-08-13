@@ -10,13 +10,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.render_config import (  # noqa: E402
-    Catalog,
-    load_policy,
-    render_adguard_yaml,
-    render_nginx_http,
-    render_nginx_stream,
-)
+try:
+    from tools.render_config import (  # noqa: E402
+        Catalog,
+        load_policy,
+        render_adguard_yaml,
+        render_nginx_http,
+        render_nginx_stream,
+    )
+except ModuleNotFoundError:
+    # The manager runs this file after it has been installed outside the
+    # source tree.  In that layout render_config.py is copied next to it.
+    import importlib.util
+
+    renderer_path = Path(__file__).with_name("render_config.py")
+    spec = importlib.util.spec_from_file_location("adguardhome_doh_render_config", renderer_path)
+    if spec is None or spec.loader is None:
+        raise
+    renderer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(renderer)
+    Catalog = renderer.Catalog
+    load_policy = renderer.load_policy
+    render_adguard_yaml = renderer.render_adguard_yaml
+    render_nginx_http = renderer.render_nginx_http
+    render_nginx_stream = renderer.render_nginx_stream
 
 
 def render_service_health_policy(catalog, selected, rows):

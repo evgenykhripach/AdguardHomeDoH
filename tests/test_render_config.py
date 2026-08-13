@@ -1,5 +1,7 @@
 import csv
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,19 @@ from tools.render_config import (
 
 
 class RenderConfigTests(unittest.TestCase):
+    def test_runtime_renderer_imports_when_installed_next_to_renderer(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            shutil.copy2(root / "deploy/lib/render_runtime.py", runtime_dir / "render_runtime.py")
+            shutil.copy2(root / "tools/render_config.py", runtime_dir / "render_config.py")
+            result = subprocess.run(
+                ["python3", str(runtime_dir / "render_runtime.py"), "--help"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("--config-dir", result.stdout)
+
     def write_policy(self, rows):
         handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False)
         with handle:

@@ -261,6 +261,15 @@ def _load_releases() -> Any:
     raise RuntimeError("release validator is unavailable")
 
 
+def _process_error_detail(exc: BaseException) -> str:
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return ""
+    detail = exc.stderr or exc.stdout or b""
+    if isinstance(detail, bytes):
+        detail = detail.decode("utf-8", "replace")
+    return str(detail).strip()
+
+
 def _runtime_paths(root: Path) -> Dict[str, Path]:
     return {
         "state": under_root(root, "/var/lib/adguardhome-doh"),
@@ -788,7 +797,9 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                 apply_service_change(selected, root=root, catalog=catalog)
                 print("Сервисы активированы.", file=output)
             except Exception as exc:
-                print("Изменения не применены: %s" % type(exc).__name__, file=output)
+                detail = _process_error_detail(exc)
+                suffix = ": " + detail.splitlines()[-1] if detail else ""
+                print("Изменения не применены: %s%s" % (type(exc).__name__, suffix), file=output)
         elif choice == "3":
             print_system_check(root, output)
         elif choice == "4":
