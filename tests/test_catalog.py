@@ -13,7 +13,7 @@ class CatalogTests(unittest.TestCase):
     def test_repository_catalog_has_expected_domain_union_and_defaults(self):
         catalog = Catalog.load(ROOT / "config")
 
-        self.assertEqual(205, len(catalog.domains))
+        self.assertEqual(206, len(catalog.domains))
         self.assertEqual(
             {
                 "chatgpt",
@@ -72,6 +72,25 @@ class CatalogTests(unittest.TestCase):
             if row.domain == "oaiusercontent.com"
         )
         self.assertEqual("files.oaiusercontent.com", row.probe)
+
+    def test_context7_service_covers_official_web_and_mcp_hosts(self):
+        catalog = Catalog.load(ROOT / "config")
+        service = next(service for service in catalog.services if service.id == "context7")
+        self.assertEqual("Context7", service.name_ru)
+        self.assertEqual("Разработка", service.category)
+        self.assertFalse(service.default_enabled)
+        self.assertEqual("standard", service.risk_level)
+
+        self.assertIn("context7.com", catalog.associations)
+        self.assertEqual(("context7",), catalog.associations["context7.com"])
+        self.assertEqual(
+            {"context7.com", "mcp.context7.com"},
+            set(catalog._probes["context7"]),
+        )
+        policy = catalog.enabled_policy(["context7"])
+        self.assertEqual(1, len(policy))
+        self.assertEqual("context7.com", policy[0].domain)
+        self.assertEqual("context7.com", policy[0].probe)
 
     def test_sensitive_and_infrastructure_domains_are_not_default_chatgpt(self):
         catalog = Catalog.load(ROOT / "config")
