@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,13 +42,55 @@ class ManagerTests(unittest.TestCase):
     def test_runtime_services_are_reloaded_after_service_change(self):
         manager = load_manager()
         runner = mock.Mock()
-        manager.reload_runtime_services(Path("/"), runner=runner)
+        manager.reload_runtime_services(
+            Path("/"), "dns.example.com", runner=runner, smoke_attempts=1, smoke_delay=0
+        )
         self.assertEqual(
             [
                 mock.call(["systemctl", "restart", "adguardhome-doh"], check=True),
                 mock.call(["systemctl", "reload", "nginx"], check=True),
+                mock.call(
+                    [
+                        "curl", "--fail", "--silent", "--show-error",
+                        "--resolve", "dns.example.com:443:127.0.0.1",
+                        "--connect-timeout", "3", "--max-time", "8",
+                        "--output", "/dev/null", "https://dns.example.com/",
+                    ],
+                    check=True, stdout=mock.ANY, stderr=mock.ANY,
+                ),
             ],
             runner.call_args_list,
+        )
+
+    def test_https_sni_smoke_retries_then_raises(self):
+        manager = load_manager()
+        runner = mock.Mock(side_effect=subprocess.CalledProcessError(28, ["curl"]))
+        with self.assertRaisesRegex(RuntimeError, "HTTPS/SNI smoke check failed"):
+            manager.smoke_https_sni(
+                "dns.example.com", runner=runner, attempts=3, delay=0
+            )
+        self.assertEqual(3, runner.call_count)
+
+    def test_backup_restore_reloads_and_checks_previous_runtime(self):
+        manager = load_manager()
+        runner = mock.Mock()
+        backup = Path("/var/backups/adguardhome-doh/test")
+        with mock.patch.object(manager, "_restore_backup") as restore, mock.patch.object(
+            manager, "reload_runtime_services"
+        ) as reload_services:
+            manager.restore_backup_runtime(
+                backup, Path("/"), "dns.example.com", runner=runner
+            )
+        restore.assert_called_once_with(backup, Path("/"))
+        self.assertEqual(
+            [
+                mock.call(["systemctl", "daemon-reload"], check=False),
+                mock.call(["nginx", "-t"], check=True),
+            ],
+            runner.call_args_list,
+        )
+        reload_services.assert_called_once_with(
+            Path("/"), "dns.example.com", runner=runner
         )
 
     def test_yes_answer_accepts_lowercase_and_terminal_invisibles(self):

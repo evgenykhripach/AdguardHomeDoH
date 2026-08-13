@@ -216,6 +216,24 @@ adguardhome_doh_run_logged() {
     fi
 }
 
+adguardhome_doh_smoke_https_sni() {
+    local host="$1" attempts="${2:-3}" delay="${3:-2}" attempt
+    adguardhome_doh_validate_hostname "$host" || return 1
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$delay" =~ ^[0-9]+$ ]] || return 1
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        if curl --fail --silent --show-error \
+            --resolve "$host:443:127.0.0.1" \
+            --connect-timeout 3 --max-time 8 \
+            --output /dev/null "https://$host/"; then
+            return 0
+        fi
+        (( attempt < attempts )) && sleep "$delay"
+    done
+    printf 'HTTPS/SNI smoke check failed for %s after %s attempts\n' "$host" "$attempts" >&2
+    return 1
+}
+
 adguardhome_doh_managed_nginx_update_allowed() {
     local root="$1" domain="$2" listeners="$3"
     local site stream line endpoint port found=0

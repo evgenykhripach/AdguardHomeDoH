@@ -120,6 +120,10 @@ class RenderConfigTests(unittest.TestCase):
         finally:
             path.unlink()
         nginx = render_nginx_stream(rows, "dns.example.com")
+        self.assertIn(
+            "resolver 9.9.9.10 149.112.112.10 valid=60s ipv4=on ipv6=off;",
+            nginx,
+        )
         self.assertIn(".oaiusercontent.com $ssl_preread_server_name:443;", nginx)
         self.assertIn("api.fitbit.com $ssl_preread_server_name:443;", nginx)
         self.assertNotIn("*.api.fitbit.com", nginx)

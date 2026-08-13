@@ -589,7 +589,7 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
         lines.append("        %s $ssl_preread_server_name:443;" % name)
     lines.extend([
         "    }",
-        "    resolver 9.9.9.10 149.112.112.10 valid=60s ipv4=on;",
+        "    resolver 9.9.9.10 149.112.112.10 valid=60s ipv4=on ipv6=off;",
         "    server {",
         "        listen 443;",
         "        proxy_connect_timeout 5s;",

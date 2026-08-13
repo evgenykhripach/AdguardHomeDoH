@@ -186,6 +186,57 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(0, second.returncode, second.stderr)
             self.assertEqual(first_content, nginx_conf.read_text(encoding="utf-8"))
 
+    def test_https_sni_smoke_retries_and_uses_local_stream_listener(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            calls = temp / "calls"
+            fake_curl = temp / "curl"
+            fake_curl.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$*\" >> \"$CALLS_FILE\"\n"
+                "count=$(wc -l < \"$CALLS_FILE\")\n"
+                "(( count >= 3 ))\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{temp}:{env['PATH']}"
+            env["CALLS_FILE"] = str(calls)
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; adguardhome_doh_smoke_https_sni "$2" 3 0',
+                    "bash", str(common), "dns.example.com",
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            call_lines = calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(3, len(call_lines))
+        self.assertTrue(
+            all("--resolve dns.example.com:443:127.0.0.1" in line for line in call_lines)
+        )
+        self.assertTrue(all("https://dns.example.com/" in line for line in call_lines))
+
+    def test_installer_reloads_nginx_once_after_final_config_and_smoke_checks(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        reload_command = "adguardhome_doh_run_logged systemctl reload nginx"
+        self.assertEqual(1, source.count(reload_command))
+        final_config = source.index(
+            'install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/adguardhome-doh'
+        )
+        reload_index = source.index(reload_command)
+        smoke_index = source.index(
+            'adguardhome_doh_run_logged adguardhome_doh_smoke_https_sni "$DOMAIN"'
+        )
+        completion_index = source.index(
+            'install -m 600 /dev/null "$INSTALL_COMPLETE_FILE"'
+        )
+        self.assertLess(final_config, reload_index)
+        self.assertLess(reload_index, smoke_index)
+        self.assertLess(smoke_index, completion_index)
+
     def test_doh_token_is_created_once_and_reused(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
         with tempfile.TemporaryDirectory() as directory:

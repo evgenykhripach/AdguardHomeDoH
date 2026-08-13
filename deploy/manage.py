@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -206,15 +207,64 @@ def activate_transaction(
     return backup_dir
 
 
+def smoke_https_sni(
+    domain: str, *, runner: Callable[..., Any] = subprocess.run,
+    attempts: int = 3, delay: int = 2,
+) -> None:
+    """Verify the local public TLS path using the installation domain as SNI."""
+
+    command = [
+        "curl", "--fail", "--silent", "--show-error",
+        "--resolve", "%s:443:127.0.0.1" % domain,
+        "--connect-timeout", "3", "--max-time", "8",
+        "--output", "/dev/null", "https://%s/" % domain,
+    ]
+    last_error: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            runner(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return
+        except (OSError, subprocess.SubprocessError) as error:
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+    raise RuntimeError(
+        "HTTPS/SNI smoke check failed for %s after %d attempts" % (domain, attempts)
+    ) from last_error
+
+
 def reload_runtime_services(
-    root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run
+    root: Path = Path("/"), domain: str = "",
+    runner: Callable[..., Any] = subprocess.run,
+    smoke_attempts: int = 3, smoke_delay: int = 2,
 ) -> None:
     """Load newly activated AdGuard and nginx configuration on a live host."""
 
     if Path(root) != Path("/"):
         return
+    if not domain:
+        raise RuntimeError("installation domain is unavailable")
     runner(["systemctl", "restart", "adguardhome-doh"], check=True)
     runner(["systemctl", "reload", "nginx"], check=True)
+    smoke_https_sni(
+        domain, runner=runner, attempts=smoke_attempts, delay=smoke_delay
+    )
+
+
+def restore_backup_runtime(
+    backup_dir: Path, root: Path, domain: str,
+    runner: Callable[..., Any] = subprocess.run,
+) -> None:
+    """Restore managed files and load the restored runtime configuration."""
+
+    root = Path(root)
+    backup_dir = Path(backup_dir)
+    _restore_backup(backup_dir, root)
+    if root != Path("/"):
+        return
+    runner(["systemctl", "daemon-reload"], check=False)
+    runner(["nginx", "-t"], check=True)
+    reload_runtime_services(root, domain, runner=runner)
 
 
 def _domain_set(catalog: Any, services: Iterable[str]) -> set:
@@ -364,15 +414,13 @@ def apply_service_change(
 
         try:
             activated = activate_transaction(targets, backup_dir, validate=validate, root=root)
-            reload_runtime_services(root)
+            reload_runtime_services(root, str(state["domain"]))
             return activated
         except Exception:
-            _restore_backup(full_backup, root)
-            if root == Path("/"):
-                try:
-                    reload_runtime_services(root)
-                except Exception:
-                    pass
+            try:
+                restore_backup_runtime(full_backup, root, str(state["domain"]))
+            except Exception:
+                pass
             raise
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -738,7 +786,9 @@ def install_update(
             if getattr(result, "returncode", 1) != 0:
                 raise RuntimeError("обновление не прошло активацию")
         except Exception:
-            _restore_backup(backup_dir, root)
+            restore_backup_runtime(
+                backup_dir, root, str(state["domain"]), runner=runner
+            )
             raise
     return True
 

@@ -357,7 +357,6 @@ adguardhome_doh_run_logged nginx -t
 adguardhome_doh_run_logged systemctl enable adguardhome-doh nginx
 adguardhome_doh_run_logged systemctl restart adguardhome-doh
 adguardhome_doh_run_logged systemctl start nginx
-adguardhome_doh_run_logged systemctl reload nginx
 adguardhome_doh_progress 85 'службы запущены'
 if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
     mapfile -t certbot_contact_args < <(adguardhome_doh_certbot_contact_args "$EMAIL")
@@ -366,6 +365,7 @@ fi
 install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/adguardhome-doh
 adguardhome_doh_run_logged nginx -t
 adguardhome_doh_run_logged systemctl reload nginx
+adguardhome_doh_run_logged adguardhome_doh_smoke_https_sni "$DOMAIN"
 adguardhome_doh_run_logged systemctl enable --now adguardhome-doh-health.timer
 adguardhome_doh_run_logged systemctl start adguardhome-doh-health.service
 rm -rf -- "$stage"
