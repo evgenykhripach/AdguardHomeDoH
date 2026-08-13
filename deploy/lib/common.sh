@@ -29,7 +29,7 @@ adguardhome_doh_require_ubuntu() {
 
 adguardhome_doh_required_packages() {
     printf '%s\n' \
-        ca-certificates curl nginx libnginx-mod-stream certbot openssl \
+        ca-certificates curl nginx libnginx-mod-stream certbot openssl iproute2 \
         apache2-utils tar gzip python3
 }
 
@@ -243,25 +243,29 @@ adguardhome_doh_preflight() {
     os_release="$(adguardhome_doh_under_root "$root" /etc/os-release)"
     adguardhome_doh_require_ubuntu "$os_release"
     if [[ "$root" == / ]]; then
-        command -v ss >/dev/null 2>&1 || adguardhome_doh_die "ss is required for listener preflight"
         local listeners
-        listeners="$(ss -H -ltn 2>/dev/null || true)"
-        # A clean host must expose no listener on ports required by activation.
-        if awk '
-            {
-                endpoint = $4
-                sub(/^.*:/, "", endpoint)
-                if (endpoint == "80" || endpoint == "443") found = 1
-            }
-            END { exit !found }
-        ' <<< "$listeners"; then
-            local listeners_with_process
-            listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
-            if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
-                :
-            else
-                adguardhome_doh_die "required listener ports 80/443 are already in use"
+        if command -v ss >/dev/null 2>&1; then
+            listeners="$(ss -H -ltn 2>/dev/null || true)"
+            # A clean host must expose no listener on ports required by activation.
+            if awk '
+                {
+                    endpoint = $4
+                    sub(/^.*:/, "", endpoint)
+                    if (endpoint == "80" || endpoint == "443") found = 1
+                }
+                END { exit !found }
+            ' <<< "$listeners"; then
+                local listeners_with_process
+                listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
+                if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
+                    :
+                else
+                    adguardhome_doh_die "required listener ports 80/443 are already in use"
+                fi
             fi
+        elif awk '$4 == "0A" && $2 ~ /:(0050|01BB)$/ { found = 1 } END { exit !found }' \
+            /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            adguardhome_doh_die "required listener ports 80/443 are already in use"
         fi
         local resolved
         resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
