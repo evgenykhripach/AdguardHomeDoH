@@ -85,6 +85,13 @@ PROJECT_VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
 [[ "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || adguardhome_doh_die "invalid project VERSION: $PROJECT_VERSION"
 
 adguardhome_doh_default_services() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        awk -F, 'NR > 1 && tolower($4) == "true" {
+            if (result != "") result = result ","
+            result = result $1
+        } END { if (result != "") print result }' "$PROJECT_ROOT/config/services.csv"
+        return
+    fi
     python3 - "$PROJECT_ROOT" <<'PY'
 import sys
 from pathlib import Path

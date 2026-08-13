@@ -155,6 +155,20 @@ adguardhome_doh_selector_search_indices() {
 }
 
 adguardhome_doh_selector_domain_count() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        awk -F, -v selected="$ADGUARDHOME_DOH_SELECTOR_SELECTED" '
+            BEGIN {
+                count = split(selected, items, ",")
+                for (i = 1; i <= count; i++) wanted[items[i]] = 1
+            }
+            NR > 1 && ($1 in wanted) { domains[$2] = 1 }
+            END {
+                total = 0
+                for (domain in domains) total += 1
+                print total
+            }' "$1/config/service-domains.csv"
+        return
+    fi
     python3 - "$1" "$ADGUARDHOME_DOH_SELECTOR_SELECTED" <<'PY'
 import sys
 from pathlib import Path

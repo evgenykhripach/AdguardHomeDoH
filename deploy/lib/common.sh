@@ -272,6 +272,37 @@ adguardhome_doh_preflight() {
 adguardhome_doh_validate_services() {
     local project_root="$1" value="${2:-}"
     [[ -n "$value" ]] || return 1
+    if ! command -v python3 >/dev/null 2>&1; then
+        awk -F, -v wanted="$value" '
+            BEGIN {
+                count = split(wanted, items, ",")
+                for (i = 1; i <= count; i++) {
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", items[i])
+                    if (items[i] !~ /^[a-z][a-z0-9_]*$/) {
+                        printf "invalid service id: %s\n", items[i] > "/dev/stderr"
+                        invalid = 1
+                    }
+                    requested[items[i]] = 1
+                }
+            }
+            NR > 1 && ($1 in requested) {
+                found[$1] = 1
+                if (result != "") result = result ","
+                result = result $1
+            }
+            END {
+                if (invalid) exit 2
+                for (i = 1; i <= count; i++) {
+                    if (!(items[i] in found)) {
+                        printf "unknown services: %s\n", items[i] > "/dev/stderr"
+                        invalid = 1
+                    }
+                }
+                if (invalid || result == "") exit 2
+                print result
+            }' "$project_root/config/services.csv"
+        return
+    fi
     python3 - "$project_root" "$value" <<'PY'
 import sys
 from pathlib import Path
