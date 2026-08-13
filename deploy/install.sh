@@ -191,8 +191,12 @@ adguardhome_doh_progress 5 'параметры приняты'
 
 if ((INTERACTIVE_INPUT)) && ((SERVICES_ARGUMENT)); then
     adguardhome_doh_confirm_install || exit $?
-elif ((INTERACTIVE_INPUT == 0 && YES == 0 && DRY_RUN == 0)) && adguardhome_doh_ui_tty; then
-    adguardhome_doh_confirm_install || exit $?
+elif ((INTERACTIVE_INPUT == 0 && YES == 0 && DRY_RUN == 0)); then
+    if [[ -t 0 || -t 1 ]]; then
+        adguardhome_doh_confirm_install || exit $?
+    else
+        adguardhome_doh_die "non-interactive installation requires --yes"
+    fi
 fi
 
 if ((DRY_RUN)); then
