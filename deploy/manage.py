@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,7 @@ def _is_yes_answer(value: str) -> bool:
 
     normalized = str(value).strip().replace("\r", "")
     normalized = normalized.replace("\x1b[200~", "").replace("\x1b[201~", "")
+    normalized = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", normalized)
     normalized = "".join(char for char in normalized if char not in INVISIBLE_INPUT)
     return normalized.casefold() in YES_ANSWERS
 MANAGED_FILES = (
