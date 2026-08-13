@@ -128,10 +128,10 @@ rtk python3 -m unittest discover -s tests -v
 rtk python3 tools/check_release.py
 rtk bash -n bootstrap.sh deploy/install.sh deploy/lib/common.sh deploy/lib/ui.sh tests/ubuntu_26_04_smoke.sh
 rtk git diff --check
-rtk git grep -n -i pressroll
 ```
 
-Expected: unit suite and release checks pass; shell syntax and diff checks exit zero; branding grep has no matches and exits one.
+Expected: unit suite and release checks pass; shell syntax and diff checks exit zero;
+the repository neutral-name contract in the unit suite passes.
 
 - [ ] **Step 3: Review the diff against the approved design**
 
