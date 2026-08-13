@@ -512,7 +512,7 @@ def render_mobileconfig(doh_host: str, doh_token: str) -> str:
 <key>DNSSettings</key><dict><key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://{host}/doh/{token}</string></dict>
 <key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{payload_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadType</key><string>com.apple.dnsSettings.managed</string><key>PayloadUUID</key><string>{payload_id}</string><key>PayloadVersion</key><integer>1</integer>
 </dict></array>
-<key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{profile_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>{profile_id}</string><key>PayloadVersion</key><integer>1</integer>
+<key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{profile_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadScope</key><string>System</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>{profile_id}</string><key>PayloadVersion</key><integer>1</integer>
 </dict></plist>
 """.format(host=doh_host, token=doh_token, payload_id=payload_id, profile_id=profile_id)
 

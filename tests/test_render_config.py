@@ -15,10 +15,26 @@ from tools.render_config import (
     render_nginx_http,
     render_nginx_stream,
     render_rewrites,
+    render_mobileconfig,
 )
 
 
 class RenderConfigTests(unittest.TestCase):
+    def test_mobileconfig_uses_system_scope_for_macos_dns_settings(self):
+        payload = plistlib.loads(
+            render_mobileconfig("dns.example.com", "a" * 48).encode("utf-8")
+        )
+
+        self.assertEqual("System", payload["PayloadScope"])
+        self.assertEqual(
+            "com.apple.dnsSettings.managed",
+            payload["PayloadContent"][0]["PayloadType"],
+        )
+        self.assertNotIn(
+            "com.apple.vpn.managed",
+            [item["PayloadType"] for item in payload["PayloadContent"]],
+        )
+
     def test_runtime_renderer_imports_when_installed_next_to_renderer(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
