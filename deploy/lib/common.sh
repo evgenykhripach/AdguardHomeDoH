@@ -29,7 +29,7 @@ adguardhome_doh_require_ubuntu() {
 
 adguardhome_doh_required_packages() {
     printf '%s\n' \
-        ca-certificates curl nginx libnginx-mod-stream certbot openssl iproute2 \
+        ca-certificates curl nginx libnginx-mod-stream certbot openssl \
         apache2-utils tar gzip python3
 }
 
@@ -243,29 +243,25 @@ adguardhome_doh_preflight() {
     os_release="$(adguardhome_doh_under_root "$root" /etc/os-release)"
     adguardhome_doh_require_ubuntu "$os_release"
     if [[ "$root" == / ]]; then
+        command -v ss >/dev/null 2>&1 || adguardhome_doh_die "ss is required for listener preflight"
         local listeners
-        if command -v ss >/dev/null 2>&1; then
-            listeners="$(ss -H -ltn 2>/dev/null || true)"
-            # A clean host must expose no listener on ports required by activation.
-            if awk '
-                {
-                    endpoint = $4
-                    sub(/^.*:/, "", endpoint)
-                    if (endpoint == "80" || endpoint == "443") found = 1
-                }
-                END { exit !found }
-            ' <<< "$listeners"; then
-                local listeners_with_process
-                listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
-                if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
-                    :
-                else
-                    adguardhome_doh_die "required listener ports 80/443 are already in use"
-                fi
+        listeners="$(ss -H -ltn 2>/dev/null || true)"
+        # A clean host must expose no listener on ports required by activation.
+        if awk '
+            {
+                endpoint = $4
+                sub(/^.*:/, "", endpoint)
+                if (endpoint == "80" || endpoint == "443") found = 1
+            }
+            END { exit !found }
+        ' <<< "$listeners"; then
+            local listeners_with_process
+            listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
+            if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
+                :
+            else
+                adguardhome_doh_die "required listener ports 80/443 are already in use"
             fi
-        elif awk '$4 == "0A" && $2 ~ /:(0050|01BB)$/ { found = 1 } END { exit !found }' \
-            /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
-            adguardhome_doh_die "required listener ports 80/443 are already in use"
         fi
         local resolved
         resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
@@ -276,37 +272,6 @@ adguardhome_doh_preflight() {
 adguardhome_doh_validate_services() {
     local project_root="$1" value="${2:-}"
     [[ -n "$value" ]] || return 1
-    if ! command -v python3 >/dev/null 2>&1; then
-        awk -F, -v wanted="$value" '
-            BEGIN {
-                count = split(wanted, items, ",")
-                for (i = 1; i <= count; i++) {
-                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", items[i])
-                    if (items[i] !~ /^[a-z][a-z0-9_]*$/) {
-                        printf "invalid service id: %s\n", items[i] > "/dev/stderr"
-                        invalid = 1
-                    }
-                    requested[items[i]] = 1
-                }
-            }
-            NR > 1 && ($1 in requested) {
-                found[$1] = 1
-                if (result != "") result = result ","
-                result = result $1
-            }
-            END {
-                if (invalid) exit 2
-                for (i = 1; i <= count; i++) {
-                    if (!(items[i] in found)) {
-                        printf "unknown services: %s\n", items[i] > "/dev/stderr"
-                        invalid = 1
-                    }
-                }
-                if (invalid || result == "") exit 2
-                print result
-            }' "$project_root/config/services.csv"
-        return
-    fi
     python3 - "$project_root" "$value" <<'PY'
 import sys
 from pathlib import Path

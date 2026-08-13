@@ -160,24 +160,6 @@ class InstallerCliTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("libnginx-mod-stream", result.stdout.splitlines())
 
-    def test_service_validation_has_awk_fallback_before_python_is_installed(self):
-        common = ROOT / "deploy" / "lib" / "common.sh"
-        with tempfile.TemporaryDirectory() as directory:
-            bin_dir = Path(directory) / "bin"
-            bin_dir.mkdir()
-            (bin_dir / "awk").symlink_to("/usr/bin/awk")
-            env = dict(os.environ, PATH=str(bin_dir))
-            result = subprocess.run(
-                [
-                    "/bin/bash", "-c",
-                    'source "$1"; adguardhome_doh_validate_services "$2" "$3"',
-                    "bash", str(common), str(ROOT), "chatgpt,context7",
-                ],
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-            )
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("chatgpt,context7\n", result.stdout)
-
     def test_nginx_stream_include_is_deduplicated_idempotently(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
         include = "include /etc/nginx/stream.d/*.conf;"

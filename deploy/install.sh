@@ -85,13 +85,6 @@ PROJECT_VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
 [[ "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || adguardhome_doh_die "invalid project VERSION: $PROJECT_VERSION"
 
 adguardhome_doh_default_services() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        awk -F, 'NR > 1 && tolower($4) == "true" {
-            if (result != "") result = result ","
-            result = result $1
-        } END { if (result != "") print result }' "$PROJECT_ROOT/config/services.csv"
-        return
-    fi
     python3 - "$PROJECT_ROOT" <<'PY'
 import sys
 from pathlib import Path
@@ -198,12 +191,8 @@ adguardhome_doh_progress 5 'параметры приняты'
 
 if ((INTERACTIVE_INPUT)) && ((SERVICES_ARGUMENT)); then
     adguardhome_doh_confirm_install || exit $?
-elif ((INTERACTIVE_INPUT == 0 && YES == 0 && DRY_RUN == 0)); then
-    if [[ -t 0 || -t 1 ]]; then
-        adguardhome_doh_confirm_install || exit $?
-    else
-        adguardhome_doh_die "non-interactive installation requires --yes"
-    fi
+elif ((INTERACTIVE_INPUT == 0 && YES == 0 && DRY_RUN == 0)) && adguardhome_doh_ui_tty; then
+    adguardhome_doh_confirm_install || exit $?
 fi
 
 if ((DRY_RUN)); then
