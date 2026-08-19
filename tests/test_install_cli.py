@@ -29,7 +29,7 @@ class InstallerCliTests(unittest.TestCase):
     def test_adguard_release_version_is_independent_from_project_version(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn(
-            'ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.78}"',
+            'ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.79}"',
             source,
         )
         self.assertIn('PROJECT_VERSION="$(tr -d \'\\r\\n\' < "$VERSION_FILE")"', source)
@@ -109,6 +109,59 @@ class InstallerCliTests(unittest.TestCase):
             )
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(str(binary), result.stdout.strip())
+
+    def test_managed_update_reinstalls_an_existing_adguard_binary(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "AdGuardHome"
+            target.write_bytes(b"old-binary")
+            target.chmod(0o755)
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; adguardhome_doh_should_install_binary "$2" 1',
+                    "bash", str(common), str(target),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_existing_binary_is_kept_during_non_update_install(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "AdGuardHome"
+            target.write_bytes(b"current-binary")
+            target.chmod(0o755)
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; adguardhome_doh_should_install_binary "$2" 0',
+                    "bash", str(common), str(target),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        self.assertEqual(1, result.returncode, result.stderr)
+
+    def test_adguard_binary_activation_replaces_target_with_executable(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "new-binary"
+            target = root / "AdGuardHome"
+            source.write_bytes(b"new-binary")
+            target.write_bytes(b"old-binary")
+            target.chmod(0o755)
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; adguardhome_doh_activate_binary "$2" "$3"',
+                    "bash", str(common), str(source), str(target),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(b"new-binary", target.read_bytes())
+            self.assertEqual(0o755, target.stat().st_mode & 0o777)
 
     def test_runtime_directories_use_mkdir_p(self):
         source = INSTALL.read_text(encoding="utf-8")

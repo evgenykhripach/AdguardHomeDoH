@@ -42,6 +42,7 @@ def _is_yes_answer(value: str) -> bool:
     normalized = "".join(char for char in normalized if char not in INVISIBLE_INPUT)
     return normalized.casefold() in YES_ANSWERS
 MANAGED_FILES = (
+    "/opt/AdGuardHome/AdGuardHome",
     "/opt/AdGuardHome/AdGuardHome.yaml",
     "/etc/nginx/sites-enabled/adguardhome-doh",
     "/etc/nginx/stream.d/adguardhome-doh.conf",

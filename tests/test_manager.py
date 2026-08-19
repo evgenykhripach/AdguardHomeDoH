@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -21,6 +22,28 @@ def load_manager():
 
 
 class ManagerTests(unittest.TestCase):
+    def test_full_backup_includes_adguard_binary_for_update_rollback(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "opt/AdGuardHome/AdGuardHome"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"old-binary")
+            binary.chmod(0o755)
+            backup = root / "backup"
+            manager.create_backup(root, backup)
+            manifest = json.loads(
+                (backup / "manifest.json").read_text(encoding="utf-8")
+            )
+            entry = next(
+                item for item in manifest
+                if item["path"] == "/opt/AdGuardHome/AdGuardHome"
+            )
+            self.assertTrue(entry["present"])
+            self.assertEqual(
+                b"old-binary", (backup / entry["backup"]).read_bytes()
+            )
+
     def test_system_check_requires_domain_named_mobileconfig(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:

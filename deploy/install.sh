@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck source=lib/ui.sh
 source "$SCRIPT_DIR/lib/ui.sh"
 
-ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.78}"
+ADGUARD_VERSION="${ADGUARDHOME_DOH_ADGUARD_VERSION:-0.107.79}"
 REPOSITORY="${ADGUARDHOME_DOH_REPOSITORY:-evgenykhripach/AdguardHomeDoH}"
 ROOT=/
 DOMAIN=
@@ -239,7 +239,7 @@ if ! id adguardhome >/dev/null 2>&1; then
     adguardhome_doh_run_logged useradd --system --home-dir /var/lib/AdGuardHome --create-home --shell /usr/sbin/nologin adguardhome
 fi
 
-if [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
+if adguardhome_doh_should_install_binary /opt/AdGuardHome/AdGuardHome "$UPDATE"; then
     work="$(mktemp -d)"
     trap 'rm -rf -- "$work"' EXIT
     arch="$(adguardhome_doh_arch)"
@@ -254,7 +254,8 @@ if [[ ! -x /opt/AdGuardHome/AdGuardHome ]]; then
     [[ -n "$adguard_binary" ]] || adguardhome_doh_die "AdGuard binary missing after extraction"
     mkdir -p /opt/AdGuardHome
     chmod 755 /opt/AdGuardHome
-    install -m 755 "$adguard_binary" /opt/AdGuardHome/AdGuardHome
+    adguardhome_doh_run_logged adguardhome_doh_activate_binary \
+        "$adguard_binary" /opt/AdGuardHome/AdGuardHome
 fi
 adguardhome_doh_progress 50 'AdGuard Home подготовлен'
 

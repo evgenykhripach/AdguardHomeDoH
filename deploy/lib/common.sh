@@ -119,6 +119,26 @@ adguardhome_doh_find_binary() {
     find "$root" -type f -path '*/AdGuardHome/AdGuardHome' -perm -u+x -print -quit
 }
 
+adguardhome_doh_should_install_binary() {
+    local target="$1" managed_update="${2:-0}"
+    [[ "$managed_update" == 1 || ! -x "$target" ]]
+}
+
+adguardhome_doh_activate_binary() {
+    local source="$1" target="$2" target_dir temporary
+    target_dir="$(dirname "$target")"
+    mkdir -p "$target_dir"
+    temporary="$(mktemp "$target_dir/.AdGuardHome.XXXXXX")"
+    if ! install -m 755 "$source" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if ! mv -f -- "$temporary" "$target"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
 adguardhome_doh_install_health_templates() {
     local project_root="$1" root="${2:-/}" templates libexec systemd manager
     templates="$project_root/deploy/templates"
