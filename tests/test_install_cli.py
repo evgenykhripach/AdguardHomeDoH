@@ -163,6 +163,34 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(b"new-binary", target.read_bytes())
             self.assertEqual(0o755, target.stat().st_mode & 0o777)
 
+    def test_failed_installer_exit_restores_previous_adguard_binary(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "AdGuardHome.backup"
+            target = root / "AdGuardHome"
+            work = root / "download"
+            backup.write_bytes(b"old-binary")
+            backup.chmod(0o755)
+            target.write_bytes(b"new-binary")
+            target.chmod(0o755)
+            work.mkdir()
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; '
+                    'ADGUARDHOME_DOH_WORK_DIR="$2"; '
+                    'ADGUARDHOME_DOH_BINARY_BACKUP="$3"; '
+                    'ADGUARDHOME_DOH_BINARY_TARGET="$4"; '
+                    'trap adguardhome_doh_install_exit EXIT; exit 23',
+                    "bash", str(common), str(work), str(backup), str(target),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(23, result.returncode, result.stderr)
+            self.assertEqual(b"old-binary", target.read_bytes())
+            self.assertFalse(work.exists())
+
     def test_runtime_directories_use_mkdir_p(self):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertIn(

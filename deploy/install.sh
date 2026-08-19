@@ -23,6 +23,10 @@ UPDATE=0
 ROLLBACK=0
 INTERACTIVE_INPUT=0
 SERVICES_ARGUMENT=0
+ADGUARDHOME_DOH_WORK_DIR=
+ADGUARDHOME_DOH_BINARY_BACKUP=
+ADGUARDHOME_DOH_BINARY_TARGET=/opt/AdGuardHome/AdGuardHome
+trap adguardhome_doh_install_exit EXIT
 
 usage() {
     cat <<'EOF'
@@ -241,7 +245,7 @@ fi
 
 if adguardhome_doh_should_install_binary /opt/AdGuardHome/AdGuardHome "$UPDATE"; then
     work="$(mktemp -d)"
-    trap 'rm -rf -- "$work"' EXIT
+    ADGUARDHOME_DOH_WORK_DIR="$work"
     arch="$(adguardhome_doh_arch)"
     archive="AdGuardHome_linux_${arch}.tar.gz"
     adguardhome_doh_run_logged curl --fail --silent --show-error --location         "https://github.com/AdguardTeam/AdGuardHome/releases/download/v${ADGUARD_VERSION}/${archive}"         -o "$work/$archive"
@@ -254,6 +258,11 @@ if adguardhome_doh_should_install_binary /opt/AdGuardHome/AdGuardHome "$UPDATE";
     [[ -n "$adguard_binary" ]] || adguardhome_doh_die "AdGuard binary missing after extraction"
     mkdir -p /opt/AdGuardHome
     chmod 755 /opt/AdGuardHome
+    binary_backup="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-AdGuardHome"
+    adguardhome_doh_backup /opt/AdGuardHome/AdGuardHome "$binary_backup"
+    if [[ -f "$binary_backup" ]]; then
+        ADGUARDHOME_DOH_BINARY_BACKUP="$binary_backup"
+    fi
     adguardhome_doh_run_logged adguardhome_doh_activate_binary \
         "$adguard_binary" /opt/AdGuardHome/AdGuardHome
 fi

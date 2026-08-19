@@ -139,6 +139,23 @@ adguardhome_doh_activate_binary() {
     fi
 }
 
+adguardhome_doh_install_exit() {
+    local status=$? restore_failed=0
+    trap - EXIT
+    if [[ -n "${ADGUARDHOME_DOH_WORK_DIR:-}" ]]; then
+        rm -rf -- "$ADGUARDHOME_DOH_WORK_DIR"
+    fi
+    if ((status != 0)) && [[ -f "${ADGUARDHOME_DOH_BINARY_BACKUP:-}" ]]; then
+        adguardhome_doh_activate_binary \
+            "$ADGUARDHOME_DOH_BINARY_BACKUP" \
+            "$ADGUARDHOME_DOH_BINARY_TARGET" || restore_failed=1
+        if ((restore_failed)); then
+            printf 'failed to restore previous AdGuard Home binary\n' >&2
+        fi
+    fi
+    exit "$status"
+}
+
 adguardhome_doh_install_health_templates() {
     local project_root="$1" root="${2:-/}" templates libexec systemd manager
     templates="$project_root/deploy/templates"
