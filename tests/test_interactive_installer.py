@@ -1,5 +1,6 @@
 import os
 import pty
+import re
 import select
 import subprocess
 import tempfile
@@ -14,11 +15,15 @@ COMMON = ROOT / "deploy" / "lib" / "common.sh"
 UI = ROOT / "deploy" / "lib" / "ui.sh"
 
 
-def run_pty(*args, input_text="", timeout=5):
+def run_pty(*args, input_text="", timeout=5, env_overrides=None, env_unset=()):
     master, slave = pty.openpty()
     env = dict(os.environ)
     env["PYTHONPYCACHEPREFIX"] = "/tmp/adguardhome-doh-pycache"
     env.pop("ADGUARDHOME_DOH_TTY_FD", None)
+    for key in env_unset:
+        env.pop(key, None)
+    if env_overrides:
+        env.update(env_overrides)
     process = subprocess.Popen(
         [str(INSTALL), *args], cwd=ROOT, env=env,
         stdin=slave, stdout=slave, stderr=slave,
@@ -146,8 +151,95 @@ class InteractiveInstallerTests(unittest.TestCase):
         )
         self.assertEqual(2, code, output)
         self.assertIn("Экспериментальные:", output)
-        self.assertIn("A — все, N — снять все", output)
+        self.assertIn("[A] Все  [N] Снять все  [B] Назад  [C] Отмена", output)
         self.assertIn("выбор отменён", output)
+
+    @unittest.skipUnless(os.environ.get("RUN_PTY_TESTS"), "PTY unavailable in restricted test runner")
+    def test_selector_uses_ansi_on_tty_and_no_color_override_is_plain(self):
+        input_text = "dns.example.com\n203.0.113.10\nadmin@example.com\nc\n"
+        code, output = run_pty(
+            "--dry-run", "--root", tempfile.gettempdir(), input_text=input_text,
+            env_overrides={"TERM": "xterm-256color", "COLUMNS": "80"},
+            env_unset=("NO_COLOR",),
+        )
+        self.assertEqual(2, code, output)
+        self.assertIn("\x1b[36mСЕРВИСЫ И ДОМЕНЫ\x1b[0m", output)
+        self.assertIn("\x1b[36m[D] Стандартные", output)
+        self.assertIn("\x1b[31m[C] Отмена\x1b[0m", output)
+
+        code, output = run_pty(
+            "--dry-run", "--root", tempfile.gettempdir(), input_text=input_text,
+            env_overrides={"TERM": "xterm-256color", "COLUMNS": "80", "NO_COLOR": ""},
+        )
+        self.assertEqual(2, code, output)
+        self.assertNotIn("\x1b[", output)
+        self.assertIn("СЕРВИСЫ И ДОМЕНЫ", output)
+
+    def test_selector_category_layout_follows_terminal_width(self):
+        script = (
+            f'source "{UI}"; '
+            f'adguardhome_doh_load_service_catalog "{ROOT / "config"}"; '
+            'ADGUARDHOME_DOH_SELECTOR_SELECTED=; '
+            'adguardhome_doh_selector_category_init; '
+            'adguardhome_doh_selector_print_categories'
+        )
+
+        def render(width):
+            env = dict(os.environ)
+            env.update({"ADGUARDHOME_DOH_TTY_FD": "0", "NO_COLOR": "", "COLUMNS": str(width)})
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=ROOT, env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
+            )
+            return re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+
+        wide = render(80)
+        category_lines = [line for line in wide.splitlines() if re.match(r"^\[[0-9]+\] ", line)]
+        self.assertTrue(any("[1] ИИ" in line and "[13] Работа" in line for line in category_lines), wide)
+        self.assertTrue(all(len(line) <= 80 for line in category_lines), wide)
+
+        narrow = render(40)
+        category_lines = [line for line in narrow.splitlines() if re.match(r"^\[[0-9]+\] ", line)]
+        self.assertTrue(all(len(line) <= 40 for line in narrow.splitlines()), narrow)
+        self.assertFalse(any("[1] ИИ" in line and "[2] Разработка" in line for line in category_lines), narrow)
+        self.assertIn("[D] Стандартные  [X] Экспериментальные", narrow)
+        self.assertIn("[Y] Итог  [C] Отмена", narrow)
+        self.assertNotIn("…", narrow)
+
+    def test_selector_wraps_long_text_without_losing_commands(self):
+        value = "Первый очень-длинный-сервис Второй"
+        script = (
+            f'source "{UI}"; '
+            f'adguardhome_doh_selector_emit_wrapped "Сервисы: " "{value}" 24'
+        )
+        env = dict(os.environ)
+        env.update({"ADGUARDHOME_DOH_TTY_FD": "0", "NO_COLOR": ""})
+        result = subprocess.run(
+            ["bash", "-c", script], cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
+        )
+        lines = result.stdout.splitlines()
+        self.assertTrue(all(len(line) <= 24 for line in lines), result.stdout)
+        self.assertNotIn("…", result.stdout)
+        self.assertEqual(
+            "Сервисы:" + value.replace(" ", ""),
+            "".join(line.strip().replace(" ", "") for line in lines),
+        )
+
+    @unittest.skipUnless(os.environ.get("RUN_PTY_TESTS"), "PTY unavailable in restricted test runner")
+    def test_selector_markers_and_command_labels_are_explicit(self):
+        code, output = run_pty(
+            "--dry-run", "--root", tempfile.gettempdir(),
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n1\n1\nb\ny\ny\n",
+            env_overrides={"TERM": "dumb", "COLUMNS": "60"},
+        )
+        self.assertEqual(0, code, output)
+        self.assertIn("[ ] ChatGPT", output)
+        self.assertIn("[✓] ChatGPT", output)
+        self.assertIn("Команды: номер — открыть, /текст — поиск", output)
+        self.assertIn("[D] Стандартные  [X] Экспериментальные  [Y] Итог  [C] Отмена", output)
+        self.assertIn("Команды: номера — переключить", output)
+        self.assertIn("[A] Все  [N] Снять все  [B] Назад  [C] Отмена", output)
 
     def test_interactive_input_trims_terminal_carriage_return_and_spaces(self):
         target_domain = "dns2." + "pre" + "ssroll" + ".ru"

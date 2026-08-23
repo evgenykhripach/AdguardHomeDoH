@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,15 +23,94 @@ from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optio
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _RELEASES_MODULE = None
 MENU_ENTRIES = (
-    "Доступ к данным",
-    "Изменить сервисы",
-    "Проверка системы",
-    "Проверить и установить обновление",
-    "Откатить последнее обновление",
-    "Выход",
+    "Данные доступа",
+    "Сервисы и домены",
+    "Диагностика системы",
+    "Проверить обновления",
+    "Откатить обновление",
 )
 YES_ANSWERS = {"y", "yes", "д", "да"}
 INVISIBLE_INPUT = "\ufeff\u200b\u200c\u200d\u2060\u2066\u2067\u2068\u2069"
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_RED = "\033[1;31m"
+ANSI_GREEN = "\033[1;32m"
+ANSI_YELLOW = "\033[1;33m"
+ANSI_CYAN = "\033[1;36m"
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+FULL_BANNER = (
+    r"    _    ____   ____ _   _   _    ____  ____  ",
+    r"   / \  |  _ \ / ___| | | | / \  |  _ \|  _ \ ",
+    r"  / _ \ | | | | |  _| | | |/ _ \ | |_) | | | |",
+    r" / ___ \| |_| | |_| | |_| / ___ \|  _ <| |_| |",
+    r"/_/   \_\____/ \____|\___/_/   \_\_| \_\____/ ",
+)
+
+
+def _stream_is_tty(stream: TextIO) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _terminal_supports_control(output: TextIO) -> bool:
+    return _stream_is_tty(output) and os.environ.get("TERM", "").casefold() != "dumb"
+
+
+def _color_enabled(output: TextIO) -> bool:
+    return _terminal_supports_control(output) and "NO_COLOR" not in os.environ
+
+
+def _style(value: Any, ansi: str, output: TextIO) -> str:
+    text = str(value)
+    return "%s%s%s" % (ansi, text, ANSI_RESET) if _color_enabled(output) else text
+
+
+def _strip_ansi(value: str) -> str:
+    return ANSI_RE.sub("", str(value))
+
+
+def _terminal_width(output: TextIO) -> int:
+    try:
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+    except OSError:
+        columns = 80
+    return max(40, min(int(columns or 80), 100))
+
+
+def _clip(value: Any, width: int) -> str:
+    text = str(value)
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[:width - 1] + "…"
+
+
+def _clear_screen(output: TextIO) -> None:
+    if _terminal_supports_control(output):
+        print("\033[2J\033[H", end="", file=output)
+
+
+def _section_title(title: str, output: TextIO, width: Optional[int] = None) -> None:
+    width = width or _terminal_width(output)
+    print(_style(_clip(title, width), ANSI_BOLD + ANSI_CYAN, output), file=output)
+    print(_style("─" * min(width, max(24, len(title))), ANSI_DIM, output), file=output)
+
+
+def _print_wrapped(prefix: str, value: str, output: TextIO, width: Optional[int] = None) -> None:
+    width = width or _terminal_width(output)
+    available = max(12, width - len(prefix))
+    lines = textwrap.wrap(str(value), width=available, break_long_words=True,
+                          break_on_hyphens=False) or [""]
+    print(prefix + lines[0], file=output)
+    continuation = " " * len(prefix)
+    for line in lines[1:]:
+        print(continuation + line, file=output)
 
 
 def _is_yes_answer(value: str) -> bool:
@@ -404,6 +484,239 @@ def _runtime_paths(root: Path) -> Dict[str, Path]:
     }
 
 
+def _active_domain_count(policy: Any, health_state: Mapping[str, Any]) -> int:
+    domains = policy.get("domains", []) if isinstance(policy, Mapping) else policy
+    active = 0
+    if not isinstance(domains, list):
+        return active
+    for row in domains:
+        if not isinstance(row, Mapping):
+            continue
+        service_ids = row.get("services", row.get("service_ids", []))
+        if isinstance(service_ids, str):
+            service_ids = [service_ids]
+        if service_ids and any(
+            isinstance(health_state.get(str(item)), Mapping)
+            and health_state.get(str(item), {}).get("healthy", False)
+            for item in service_ids
+        ):
+            active += 1
+    return active
+
+
+def _endpoint_files(root: Path, paths: Mapping[str, Path], domain: str) -> Dict[str, bool]:
+    certificate_root = Path("/etc/letsencrypt/live") / domain if domain else Path("/")
+    certificate = under_root(root, str(certificate_root)) / "fullchain.pem"
+    profile = paths["webroot"] / (domain + ".mobileconfig") if domain else None
+    return {
+        "certificate": bool(
+            domain and certificate.is_file()
+            and certificate.with_name("privkey.pem").is_file()
+        ),
+        "profile": bool(profile and profile.is_file()),
+    }
+
+
+def _installed_version_text(paths: Mapping[str, Path], install: Mapping[str, Any]) -> str:
+    try:
+        version = paths["manager_version"].read_text(encoding="utf-8").strip()
+    except OSError:
+        version = str(install.get("version", "0.0.0")).strip()
+    return version or "0.0.0"
+
+
+def _latest_valid_backup(root: Path = Path("/")) -> Optional[Path]:
+    backup_root = _runtime_paths(Path(root))["backup"]
+    if not backup_root.is_dir():
+        return None
+    try:
+        candidates = sorted(
+            (item for item in backup_root.iterdir() if item.is_dir()),
+            key=lambda item: item.name,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates:
+        manifest_dirs = []
+        if (candidate / "manifest.json").is_file():
+            manifest_dirs.append(candidate)
+        if (candidate / "full" / "manifest.json").is_file():
+            manifest_dirs.append(candidate / "full")
+        for manifest_dir in manifest_dirs:
+            try:
+                _validated_backup_manifest(manifest_dir)
+            except RuntimeError:
+                continue
+            return manifest_dir
+    return None
+
+
+def collect_menu_status(
+    root: Path = Path("/"), catalog: Any = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> Dict[str, Any]:
+    """Collect a fast local dashboard summary without reading secret values."""
+
+    root = Path(root)
+    paths = _runtime_paths(root)
+    install = _read_json(paths["install"], {})
+    if not isinstance(install, Mapping):
+        install = {}
+    domain = str(install.get("domain", ""))
+    enabled = _load_enabled(paths, catalog) if catalog is not None else []
+    if catalog is not None:
+        known = {service.id for service in catalog.services}
+        enabled = [item for item in enabled if item in known]
+    health_state = _read_json(paths["health_state"], {})
+    if not isinstance(health_state, Mapping):
+        health_state = {}
+    policy = _read_json(paths["health_policy"], {})
+    units = {}
+    for unit in (
+        "adguardhome-doh.service",
+        "nginx.service",
+        "adguardhome-doh-health.timer",
+    ):
+        units[unit] = _command_ok(
+            ["systemctl", "is-active", "--quiet", unit], runner
+        )
+    if all(units.values()):
+        overall = "running"
+    elif units["adguardhome-doh.service"] or units["nginx.service"]:
+        overall = "attention"
+    else:
+        overall = "stopped"
+    endpoints = _endpoint_files(root, paths, domain)
+    return {
+        "version": _installed_version_text(paths, install),
+        "domain": domain,
+        "units": units,
+        "overall": overall,
+        "enabled_services": len(enabled),
+        "healthy_services": sum(
+            1 for service_id in enabled
+            if isinstance(health_state.get(service_id), Mapping)
+            and health_state.get(service_id, {}).get("healthy", False)
+        ),
+        "active_domain_count": _active_domain_count(policy, health_state),
+        "certificate": endpoints["certificate"],
+        "profile": endpoints["profile"],
+        "rollback_available": _latest_valid_backup(root) is not None,
+    }
+
+
+def _status_value(
+    state: bool, yes: str = "активен", no: str = "неактивен",
+    success_symbol: str = "●",
+) -> Tuple[str, str]:
+    return (((success_symbol + " " + yes), ANSI_GREEN)
+            if state else ("✗ " + no, ANSI_RED))
+
+
+def _metric_cell(
+    label: str, value: str, tone: str, output: TextIO, width: int,
+) -> str:
+    label_width = min(15, max(12, width // 3 + 1))
+    label_text = _clip(label + ":", label_width)
+    label_text = "%-*s" % (label_width, label_text)
+    value_text = _clip(value, max(1, width - label_width))
+    plain_length = len(label_text) + len(value_text)
+    padding = " " * max(0, width - plain_length)
+    return (
+        _style(label_text, ANSI_BOLD, output)
+        + _style(value_text, tone, output)
+        + padding
+    )
+
+
+def _render_banner(version: str, output: TextIO, width: int) -> None:
+    if width >= 72:
+        for line in FULL_BANNER:
+            print(_style(line, ANSI_CYAN, output), file=output)
+        print("%s %s" % (
+            _style("ADGUARD HOME • DoH", ANSI_BOLD + ANSI_CYAN, output),
+            _style("v" + version, ANSI_DIM, output),
+        ), file=output)
+    else:
+        print(_style("ADGUARDHOME DOH", ANSI_BOLD + ANSI_CYAN, output), file=output)
+        print(_style("adguardhome-doh v" + version, ANSI_DIM, output), file=output)
+    print(file=output)
+
+
+def render_main_screen(
+    status: Mapping[str, Any], output: TextIO = sys.stdout,
+    *, width: Optional[int] = None, notice: str = "",
+) -> None:
+    width = width or _terminal_width(output)
+    _render_banner(str(status.get("version", "0.0.0")), output, width)
+    overall = str(status.get("overall", "stopped"))
+    overall_values = {
+        "running": ("● РАБОТАЕТ", ANSI_GREEN),
+        "attention": ("! ТРЕБУЕТ ВНИМАНИЯ", ANSI_YELLOW),
+        "stopped": ("✗ ОСТАНОВЛЕН", ANSI_RED),
+    }
+    overall_text, overall_tone = overall_values.get(
+        overall, overall_values["stopped"]
+    )
+    units = status.get("units", {})
+    if not isinstance(units, Mapping):
+        units = {}
+    adguard = _status_value(bool(units.get("adguardhome-doh.service")))
+    nginx = _status_value(bool(units.get("nginx.service")))
+    timer = _status_value(bool(units.get("adguardhome-doh-health.timer")))
+    enabled = int(status.get("enabled_services", 0) or 0)
+    healthy = int(status.get("healthy_services", 0) or 0)
+    if enabled > 0 and healthy == enabled:
+        service_tone = ANSI_GREEN
+    elif healthy > 0:
+        service_tone = ANSI_YELLOW
+    else:
+        service_tone = ANSI_RED
+    certificate = _status_value(
+        bool(status.get("certificate")), "готов", "не готов", "✓"
+    )
+    profile = _status_value(bool(status.get("profile")), "готов", "не готов", "✓")
+    rollback = _status_value(
+        bool(status.get("rollback_available")), "доступен", "нет копии", "✓"
+    )
+    active_domains = int(status.get("active_domain_count", 0) or 0)
+    metrics = [
+        ("Статус", overall_text, overall_tone),
+        ("Домен", str(status.get("domain") or "не настроен"),
+         ANSI_GREEN if status.get("domain") else ANSI_YELLOW),
+        ("AdGuard Home", adguard[0], adguard[1]),
+        ("nginx", nginx[0], nginx[1]),
+        ("Health timer", timer[0], timer[1]),
+        ("Сервисы", "%d / %d здоровы" % (enabled, healthy), service_tone),
+        ("Домены", "%d активны" % active_domains,
+         ANSI_GREEN if active_domains else ANSI_YELLOW),
+        ("Сертификат", certificate[0], certificate[1]),
+        ("Профиль", profile[0], profile[1]),
+        ("Откат", rollback[0], rollback[1]),
+    ]
+    if width >= 72:
+        cell_width = (width - 2) // 2
+        for index in range(0, len(metrics), 2):
+            left = _metric_cell(*metrics[index], output, cell_width)
+            right = _metric_cell(*metrics[index + 1], output, cell_width)
+            print(left + "  " + right, file=output)
+    else:
+        for metric in metrics:
+            print(_metric_cell(*metric, output, width), file=output)
+    print(file=output)
+    print(_style("─" * min(width, 56), ANSI_DIM, output), file=output)
+    print(file=output)
+    for key, entry in enumerate(MENU_ENTRIES, 1):
+        tone = ANSI_RED if key == 5 else ANSI_CYAN
+        print("%s %s" % (_style("[%d]" % key, tone, output), entry), file=output)
+    print(file=output)
+    print("%s Выход" % _style("[0]", ANSI_CYAN, output), file=output)
+    if notice:
+        print(file=output)
+        print(_style(_clip(notice, width), ANSI_YELLOW, output), file=output)
+
+
 def apply_service_change(
     selected: Sequence[str],
     *,
@@ -500,32 +813,21 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
     install = _read_json(paths["install"], {})
     domain = str(install.get("domain", "")) if isinstance(install, Mapping) else ""
     health_state = _read_json(paths["health_state"], {})
+    if not isinstance(health_state, Mapping):
+        health_state = {}
     policy = _read_json(paths["health_policy"], {})
-    domains = policy.get("domains", []) if isinstance(policy, Mapping) else policy
-    active = 0
-    if isinstance(domains, list):
-        for row in domains:
-            if not isinstance(row, Mapping):
-                continue
-            ids = row.get("services", row.get("service_ids", []))
-            if isinstance(ids, str):
-                ids = [ids]
-            if ids and any(health_state.get(str(item), {}).get("healthy", False) for item in ids):
-                active += 1
-    certificate_root = Path("/etc/letsencrypt/live") / domain if domain else Path("/")
-    certificate = under_root(root, str(certificate_root)) / "fullchain.pem"
-    profile = paths["webroot"] / (domain + ".mobileconfig") if domain else None
+    endpoints = _endpoint_files(root, paths, domain)
     report = {
         "units": units,
         "nginx": _command_ok(["nginx", "-t"], runner),
         "adguard_config": _command_ok(["/opt/AdGuardHome/AdGuardHome", "--check-config",
                                         "-c", str(paths["agh"]),
                                         "-w", str(under_root(root, "/var/lib/AdGuardHome"))], runner),
-        "certificate": certificate.is_file() and (certificate.with_name("privkey.pem")).is_file(),
+        "certificate": endpoints["certificate"],
         "endpoints": {
             "admin": bool(domain),
             "doh": bool(domain and paths["token"].is_file()),
-            "mobileconfig": bool(profile and profile.is_file()),
+            "mobileconfig": endpoints["profile"],
         },
         "health_state": {
             "services": len(health_state) if isinstance(health_state, Mapping) else 0,
@@ -533,14 +835,38 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
                             if isinstance(item, Mapping) and item.get("healthy", False))
             if isinstance(health_state, Mapping) else 0,
         },
-        "active_domain_count": active,
+        "active_domain_count": _active_domain_count(policy, health_state),
     }
     return report
 
 
+def _render_system_check(report: Mapping[str, Any], output: TextIO) -> None:
+    _section_title("ДИАГНОСТИКА СИСТЕМЫ", output)
+    checks = (
+        ("AdGuard Home", report["units"].get("adguardhome-doh.service", False)),
+        ("nginx", report["units"].get("nginx.service", False)),
+        ("Health service", report["units"].get("adguardhome-doh-health.service", False)),
+        ("Health timer", report["units"].get("adguardhome-doh-health.timer", False)),
+        ("Конфигурация AdGuard Home", report["adguard_config"]),
+        ("Конфигурация nginx", report["nginx"]),
+        ("Сертификат", report["certificate"]),
+        ("Панель администратора", report["endpoints"].get("admin", False)),
+        ("Private DoH", report["endpoints"].get("doh", False)),
+        ("Apple-профиль", report["endpoints"].get("mobileconfig", False)),
+    )
+    for label, ok in checks:
+        text, tone = _status_value(bool(ok), "готов", "ошибка")
+        print("%-30s %s" % (label + ":", _style(text, tone, output)), file=output)
+    print(file=output)
+    print("Здоровые сервисы: %d/%d" % (
+        report["health_state"].get("healthy", 0),
+        report["health_state"].get("services", 0),
+    ), file=output)
+    print("Активные домены: %d" % report.get("active_domain_count", 0), file=output)
+
+
 def print_system_check(root: Path = Path("/"), output: TextIO = sys.stdout) -> None:
-    report = collect_system_check(root)
-    print(json.dumps(report, ensure_ascii=False, sort_keys=True), file=output)
+    _render_system_check(collect_system_check(root), output)
 
 
 def parse_service_selection(value: str, catalog: Any) -> Sequence[str]:
@@ -613,34 +939,130 @@ def _selector_services(catalog: Any, category: Optional[str] = None, query: Opti
     return services
 
 
-def _print_selector_summary(catalog: Any, selected: set[str], output: TextIO) -> None:
+def _print_selector_summary(
+    catalog: Any, selected: set[str], output: TextIO,
+    *, width: Optional[int] = None,
+) -> None:
+    width = width or _terminal_width(output)
     domains = _domain_set(catalog, selected)
     names = [service.name_ru for service in catalog.services if service.id in selected]
-    print("Выбрано сервисов: %d" % len(selected), file=output)
-    print("Активных уникальных доменов: %d" % len(domains), file=output)
+    selected_tone = ANSI_GREEN if selected else ANSI_YELLOW
+    print(_style(
+        "Выбрано сервисов: %d/%d" % (len(selected), len(catalog.services)),
+        selected_tone, output,
+    ), file=output)
+    print(_style(
+        "Активных уникальных доменов: %d" % len(domains),
+        ANSI_CYAN, output,
+    ), file=output)
     if names:
-        print("Сервисы: %s" % ", ".join(names), file=output)
+        _print_wrapped("Сервисы: ", ", ".join(names), output, width)
 
 
-def _print_selector_categories(catalog: Any, selected: set[str], output: TextIO) -> list[str]:
+def _selector_category_cell(
+    number: int, category: str, selected: int, total: int,
+    output: TextIO, width: int,
+) -> str:
+    prefix = "[%d] " % number
+    suffix = " %d/%d" % (selected, total)
+    label = _clip(category, max(1, width - len(prefix) - len(suffix)))
+    plain = prefix + label + suffix
+    padding = " " * max(0, width - len(plain))
+    tone = (
+        ANSI_YELLOW if category == "Экспериментальные"
+        else ANSI_GREEN if selected else ANSI_CYAN
+    )
+    return _style(prefix + label + suffix + padding, tone, output)
+
+
+def _selector_service_line(
+    number: int, service: Any, selected: set[str],
+    output: TextIO, width: int,
+) -> str:
+    prefix = "[%d] " % number
+    checked = service.id in selected
+    marker = "[✓]" if checked else "[ ]"
+    suffix = " (%s)" % service.id
+    available = width - len(prefix) - len(marker) - 1 - len(suffix)
+    if available < 8:
+        suffix = ""
+        available = width - len(prefix) - len(marker) - 1
+    name = _clip(service.name_ru, max(1, available))
+    marker_tone = ANSI_GREEN if checked else ANSI_DIM
+    return (
+        _style(prefix, ANSI_CYAN, output)
+        + _style(marker, marker_tone, output)
+        + " " + name
+        + _style(suffix, ANSI_DIM, output)
+    )
+
+
+def _print_selector_categories(
+    catalog: Any, selected: set[str], output: TextIO,
+    *, width: Optional[int] = None,
+) -> list[str]:
+    width = width or _terminal_width(output)
     categories = _selector_categories(catalog)
-    print("\nКатегории:", file=output)
+    print(file=output)
+    print(_style("Категории:", ANSI_BOLD, output), file=output)
+    cells = []
     for number, category in enumerate(categories, 1):
         services = _selector_services(catalog, category=category)
         count = sum(service.id in selected for service in services)
-        print("%2d) %-24s %d/%d" % (number, category, count, len(services)), file=output)
-    print("\nКоманды: номер — открыть категорию, /текст — поиск, D — стандартные, "
-          "X — экспериментальные, Y — итог, C — отмена", file=output)
+        cells.append((number, category, count, len(services)))
+    if width >= 72:
+        column_width = (width - 2) // 2
+        rows = (len(cells) + 1) // 2
+        for row in range(rows):
+            left = _selector_category_cell(*cells[row], output, column_width)
+            right_index = row + rows
+            right = (
+                _selector_category_cell(*cells[right_index], output, column_width)
+                if right_index < len(cells) else ""
+            )
+            print(left + ("  " + right if right else ""), file=output)
+    else:
+        for cell in cells:
+            print(_selector_category_cell(*cell, output, width), file=output)
+    print(file=output)
+    if width >= 44:
+        print("Команды: номер — открыть, /текст — поиск", file=output)
+    else:
+        print("Команды: номер — открыть", file=output)
+        print("/текст — поиск", file=output)
+    defaults = "%s Стандартные" % _style("[D]", ANSI_CYAN, output)
+    experimental = "%s Экспериментальные" % _style("[X]", ANSI_YELLOW, output)
+    finish = "%s Итог" % _style("[Y]", ANSI_GREEN, output)
+    cancel = "%s Отмена" % _style("[C]", ANSI_RED, output)
+    if width >= 72:
+        print("  ".join((defaults, experimental, finish, cancel)), file=output)
+    else:
+        print(defaults + "  " + experimental, file=output)
+        print(finish + "  " + cancel, file=output)
     return categories
 
 
-def _print_selector_view(title: str, services: list[Any], selected: set[str], output: TextIO) -> None:
-    print("\n%s:" % title, file=output)
+def _print_selector_view(
+    title: str, services: list[Any], selected: set[str], output: TextIO,
+    *, width: Optional[int] = None,
+) -> None:
+    width = width or _terminal_width(output)
+    print(file=output)
+    print(_style("%s:" % title, ANSI_BOLD, output), file=output)
+    print("Выбрано сервисов: %d" % len(selected), file=output)
     for number, service in enumerate(services, 1):
-        marker = "x" if service.id in selected else " "
-        print("%2d) [%s] %-28s (%s)" % (number, marker, service.name_ru, service.id), file=output)
-    print("\nКоманды: номера через пробел — включить/выключить, A — все, "
-          "N — снять все, B — назад, C — отмена", file=output)
+        print(_selector_service_line(number, service, selected, output, width), file=output)
+    print(file=output)
+    print("Команды: номера — переключить", file=output)
+    select_all = "%s Все" % _style("[A]", ANSI_GREEN, output)
+    select_none = "%s Снять все" % _style("[N]", ANSI_YELLOW, output)
+    back = "%s Назад" % _style("[B]", ANSI_CYAN, output)
+    cancel = "%s Отмена" % _style("[C]", ANSI_RED, output)
+    if width >= 56:
+        print("  ".join((select_all, select_none, back, cancel)), file=output)
+    else:
+        print(select_all + "  " + select_none, file=output)
+        print(back + "  " + cancel, file=output)
 
 
 def select_services_interactive(
@@ -654,15 +1076,18 @@ def select_services_interactive(
     selected = {str(item) for item in current}
     categories = _selector_categories(catalog)
     while True:
-        _print_selector_categories(catalog, selected, output)
-        _print_selector_summary(catalog, selected, output)
+        _clear_screen(output)
+        width = _terminal_width(output)
+        _section_title("СЕРВИСЫ И ДОМЕНЫ", output, width)
+        _print_selector_summary(catalog, selected, output, width=width)
+        _print_selector_categories(catalog, selected, output, width=width)
         print("\nКатегория: ", end="", file=output, flush=True)
         raw = input_stream.readline()
         if not raw:
             return None
         answer = raw.strip().casefold()
         if answer in {"c", "q", "cancel", "отмена"}:
-            print("Выбор отменён.", file=output)
+            print(_style("Выбор отменён.", ANSI_YELLOW, output), file=output)
             return None
         if answer in {"d", "default", "defaults", "по-умолчанию"}:
             selected = set(catalog.default_service_ids)
@@ -677,9 +1102,9 @@ def select_services_interactive(
             continue
         if answer in {"y", "yes", "итог", "применить"}:
             if not selected:
-                print("ошибка: выберите хотя бы один сервис", file=output)
+                print(_style("ошибка: выберите хотя бы один сервис", ANSI_RED, output), file=output)
                 continue
-            _print_selector_summary(catalog, selected, output)
+            _print_selector_summary(catalog, selected, output, width=width)
             print("Применить выбор? [y/N]: ", end="", file=output, flush=True)
             if _is_yes_answer(input_stream.readline()):
                 return [service.id for service in catalog.services if service.id in selected]
@@ -688,7 +1113,7 @@ def select_services_interactive(
         if answer.startswith("/"):
             services = _selector_services(catalog, query=answer[1:])
             if not services:
-                print("ошибка: ничего не найдено", file=output)
+                print(_style("ошибка: ничего не найдено", ANSI_RED, output), file=output)
                 continue
             result = _select_services_view(services, selected, "Результаты поиска", input_stream, output)
             if result is None:
@@ -703,7 +1128,10 @@ def select_services_interactive(
                 return None
             selected = result
             continue
-        print("ошибка: введите номер категории, /поиск, D, X, Y или C", file=output)
+        print(_style(
+            "ошибка: введите номер категории, /поиск, D, X, Y или C",
+            ANSI_RED, output,
+        ), file=output)
 
 
 def _select_services_view(
@@ -711,7 +1139,10 @@ def _select_services_view(
     input_stream: TextIO, output: TextIO,
 ) -> Optional[set[str]]:
     while True:
-        _print_selector_view(title, services, selected, output)
+        _clear_screen(output)
+        width = _terminal_width(output)
+        _section_title("СЕРВИСЫ И ДОМЕНЫ", output, width)
+        _print_selector_view(title, services, selected, output, width=width)
         print("\nВыбор: ", end="", file=output, flush=True)
         raw = input_stream.readline()
         if not raw:
@@ -720,7 +1151,7 @@ def _select_services_view(
         if answer in {"b", "back", "назад"}:
             return selected
         if answer in {"c", "q", "cancel", "отмена"}:
-            print("Выбор отменён.", file=output)
+            print(_style("Выбор отменён.", ANSI_YELLOW, output), file=output)
             return None
         if answer in {"a", "all", "все"}:
             selected.update(service.id for service in services)
@@ -730,11 +1161,11 @@ def _select_services_view(
             continue
         tokens = answer.replace(",", " ").split()
         if not tokens or any(not token.isdigit() for token in tokens):
-            print("ошибка: введите номера сервисов или команду", file=output)
+            print(_style("ошибка: введите номера сервисов или команду", ANSI_RED, output), file=output)
             continue
         numbers = [int(token) for token in tokens]
         if any(number < 1 or number > len(services) for number in numbers):
-            print("ошибка: неверный номер сервиса", file=output)
+            print(_style("ошибка: неверный номер сервиса", ANSI_RED, output), file=output)
             continue
         for number in numbers:
             service_id = services[number - 1].id
@@ -849,30 +1280,7 @@ def install_update(
 
 def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run) -> bool:
     root = Path(root)
-    backup_root = _runtime_paths(root)["backup"]
-    if not backup_root.is_dir():
-        return False
-    candidates = sorted(
-        (item for item in backup_root.iterdir() if item.is_dir()),
-        key=lambda item: item.name,
-        reverse=True,
-    )
-    selected = None
-    for candidate in candidates:
-        manifest_dirs = []
-        if (candidate / "manifest.json").is_file():
-            manifest_dirs.append(candidate)
-        if (candidate / "full" / "manifest.json").is_file():
-            manifest_dirs.append(candidate / "full")
-        for manifest_dir in manifest_dirs:
-            try:
-                _validated_backup_manifest(manifest_dir)
-            except RuntimeError:
-                continue
-            selected = manifest_dir
-            break
-        if selected is not None:
-            break
+    selected = _latest_valid_backup(root)
     if selected is None:
         return False
 
@@ -892,6 +1300,12 @@ def _load_enabled(paths: Mapping[str, Path], catalog: Any) -> list:
 
 def print_access_data(root: Path = Path("/"), output: TextIO = sys.stdout) -> None:
     paths = _runtime_paths(Path(root))
+    _section_title("ДАННЫЕ ДОСТУПА", output)
+    print(_style(
+        "Конфиденциально: не публикуйте пароль и приватные URL.",
+        ANSI_YELLOW, output,
+    ), file=output)
+    print(file=output)
     credentials = _read_json(paths["credentials"], {})
     token = paths["token"].read_text(encoding="utf-8").strip() if paths["token"].is_file() else ""
     if isinstance(credentials, Mapping):
@@ -906,6 +1320,57 @@ def print_access_data(root: Path = Path("/"), output: TextIO = sys.stdout) -> No
     print("Данные хранятся в режиме 0600.", file=output)
 
 
+def _pause(input_stream: TextIO, output: TextIO) -> None:
+    if not (_stream_is_tty(input_stream) and _stream_is_tty(output)):
+        return
+    print(file=output)
+    print(_style("Enter — назад", ANSI_DIM, output), end="", file=output, flush=True)
+    input_stream.readline()
+
+
+def _fallback_menu_status(root: Path) -> Dict[str, Any]:
+    paths = _runtime_paths(Path(root))
+    install = _read_json(paths["install"], {})
+    if not isinstance(install, Mapping):
+        install = {}
+    return {
+        "version": _installed_version_text(paths, install),
+        "domain": str(install.get("domain", "")),
+        "units": {},
+        "overall": "stopped",
+        "enabled_services": 0,
+        "healthy_services": 0,
+        "active_domain_count": 0,
+        "certificate": False,
+        "profile": False,
+        "rollback_available": _latest_valid_backup(root) is not None,
+    }
+
+
+def _service_display_names(catalog: Any, service_ids: Iterable[str]) -> list[str]:
+    wanted = {str(item) for item in service_ids}
+    return [service.name_ru for service in catalog.services if service.id in wanted]
+
+
+def _print_service_change_preview(
+    catalog: Any, preview: Mapping[str, Any], output: TextIO,
+) -> None:
+    _section_title("ПРЕДПРОСМОТР ИЗМЕНЕНИЙ", output)
+    print("Домены: %d → %d" % (
+        preview["old_domains"], preview["new_domains"],
+    ), file=output)
+    print("Добавлено доменов: %d" % preview["added_domains"], file=output)
+    print("Удалено доменов: %d" % preview["removed_domains"], file=output)
+    added = _service_display_names(catalog, preview["added_services"])
+    removed = _service_display_names(catalog, preview["removed_services"])
+    if added:
+        _print_wrapped("+ Сервисы: ", ", ".join(added), output)
+    if removed:
+        _print_wrapped("− Сервисы: ", ", ".join(removed), output)
+    if not added and not removed:
+        print(_style("Состав сервисов не изменился.", ANSI_DIM, output), file=output)
+
+
 def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: TextIO = sys.stdout) -> int:
     paths = _runtime_paths(Path(root))
     try:
@@ -913,68 +1378,140 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
     except Exception as exc:
         print("Не удалось загрузить каталог: %s" % type(exc).__name__, file=output)
         return 1
-    while True:
-        print("\nМенеджер adguardhome-doh", file=output)
-        for index, entry in enumerate(MENU_ENTRIES, 1):
-            print("%d. %s" % (index, entry), file=output)
-        print("Выбор: ", end="", file=output, flush=True)
-        answer = input_stream.readline()
-        if not answer:
-            return 0
-        choice = answer.strip()
-        if choice == "1":
-            print_access_data(root, output)
-        elif choice == "2":
-            current = _load_enabled(paths, catalog)
+    notice = ""
+    try:
+        while True:
+            _clear_screen(output)
             try:
-                selected = select_services_interactive(catalog, current, input_stream, output)
-                if selected is None:
-                    continue
-                preview = preview_service_change(catalog, current, selected)
-                print("Домены: %d -> %d; добавлено %d; удалено %d" % (
-                    preview["old_domains"], preview["new_domains"],
-                    preview["added_domains"], preview["removed_domains"]), file=output)
-                print("Применить изменения? [y/N]: ", end="", file=output, flush=True)
-                if not _is_yes_answer(input_stream.readline()):
-                    print("Изменения отменены.", file=output)
-                    continue
-                apply_service_change(selected, root=root, catalog=catalog)
-                print("Сервисы активированы.", file=output)
-            except Exception as exc:
-                detail = _process_error_detail(exc)
-                suffix = ": " + detail.splitlines()[-1] if detail else ""
-                print("Изменения не применены: %s%s" % (type(exc).__name__, suffix), file=output)
-        elif choice == "3":
-            print_system_check(root, output)
-        elif choice == "4":
-            try:
-                status = update_status(root)
-                if not status.get("available"):
-                    print("Обновлений нет: %s" % status.get("reason", "версия актуальна"), file=output)
-                else:
-                    print("Доступна версия %s (текущая %s)." % (status["latest"], status["current"]), file=output)
-                    print("Установить? [y/N]: ", end="", file=output, flush=True)
-                    if _is_yes_answer(input_stream.readline()):
-                        if install_update(root=root):
-                            print("Обновление установлено. Запустите менеджер заново для применения нового интерфейса.", file=output)
-                            return 0
-                        else:
-                            print("Обновление не требуется или не выполнено.", file=output)
+                status = collect_menu_status(root, catalog)
+            except Exception:
+                status = _fallback_menu_status(Path(root))
+                if not notice:
+                    notice = "Не удалось полностью собрать состояние системы."
+            render_main_screen(status, output, notice=notice)
+            notice = ""
+            print(file=output)
+            print("Выбор: ", end="", file=output, flush=True)
+            answer = input_stream.readline()
+            if not answer:
+                return 0
+            choice = answer.strip()
+            if choice == "1":
+                _clear_screen(output)
+                print_access_data(root, output)
+                _pause(input_stream, output)
+            elif choice == "2":
+                current = _load_enabled(paths, catalog)
+                try:
+                    selected = select_services_interactive(
+                        catalog, current, input_stream, output
+                    )
+                    if selected is None:
+                        notice = "Изменения сервисов отменены."
+                        continue
+                    preview = preview_service_change(catalog, current, selected)
+                    _clear_screen(output)
+                    _print_service_change_preview(catalog, preview, output)
+                    print("Применить изменения? [y/N]: ", end="", file=output, flush=True)
+                    if not _is_yes_answer(input_stream.readline()):
+                        notice = "Изменения отменены."
+                        continue
+                    print(_style("Применяем конфигурацию…", ANSI_CYAN, output),
+                          file=output, flush=True)
+                    apply_service_change(selected, root=root, catalog=catalog)
+                    notice = "Сервисы активированы."
+                except Exception as exc:
+                    detail = _process_error_detail(exc)
+                    suffix = ": " + detail.splitlines()[-1] if detail else ""
+                    notice = "Изменения не применены: %s%s" % (
+                        type(exc).__name__, suffix,
+                    )
+            elif choice == "3":
+                _clear_screen(output)
+                _section_title("ДИАГНОСТИКА СИСТЕМЫ", output)
+                try:
+                    print(_style("Выполняется полная проверка…", ANSI_CYAN, output),
+                          file=output, flush=True)
+                    report = collect_system_check(root)
+                    _clear_screen(output)
+                    _render_system_check(report, output)
+                except Exception as exc:
+                    print(_style(
+                        "Диагностика не выполнена: %s" % type(exc).__name__,
+                        ANSI_RED, output,
+                    ), file=output)
+                _pause(input_stream, output)
+            elif choice == "4":
+                _clear_screen(output)
+                _section_title("ОБНОВЛЕНИЕ", output)
+                try:
+                    print(_style("Проверяем стабильный GitHub Release…", ANSI_CYAN, output),
+                          file=output, flush=True)
+                    update = update_status(root)
+                    if not update.get("available"):
+                        print("Обновлений нет: %s" % update.get(
+                            "reason", "версия актуальна"
+                        ), file=output)
                     else:
-                        print("Обновление отменено.", file=output)
-            except Exception as exc:
-                print("Обновление не применено: %s" % type(exc).__name__, file=output)
-        elif choice == "5":
-            try:
-                print("Откатить последнюю резервную копию? [y/N]: ", end="", file=output, flush=True)
-                if _is_yes_answer(input_stream.readline()):
-                    print("Откат выполнен." if rollback_last(root) else "Резервная копия не найдена.", file=output)
-            except Exception as exc:
-                print("Откат не применён: %s" % type(exc).__name__, file=output)
-        elif choice == "6":
-            return 0
-        else:
-            print("Введите номер пункта от 1 до 6.", file=output)
+                        print("Доступна версия %s (текущая %s)." % (
+                            update["latest"], update["current"],
+                        ), file=output)
+                        print("Установить? [y/N]: ", end="", file=output, flush=True)
+                        if _is_yes_answer(input_stream.readline()):
+                            print(_style("Скачиваем и проверяем обновление…", ANSI_CYAN, output),
+                                  file=output, flush=True)
+                            if install_update(root=root):
+                                print(
+                                    "Обновление установлено. Запустите менеджер заново "
+                                    "для применения нового интерфейса.",
+                                    file=output,
+                                )
+                                return 0
+                            print("Обновление не требуется или не выполнено.", file=output)
+                        else:
+                            print("Обновление отменено.", file=output)
+                except Exception as exc:
+                    print(_style(
+                        "Обновление не применено: %s" % type(exc).__name__,
+                        ANSI_RED, output,
+                    ), file=output)
+                _pause(input_stream, output)
+            elif choice == "5":
+                _clear_screen(output)
+                _section_title("ОТКАТ ОБНОВЛЕНИЯ", output)
+                print(_style(
+                    "Будет восстановлена последняя корректная резервная копия.",
+                    ANSI_RED, output,
+                ), file=output)
+                try:
+                    print("Продолжить откат? [y/N]: ", end="", file=output, flush=True)
+                    if _is_yes_answer(input_stream.readline()):
+                        print(_style("Восстанавливаем резервную копию…", ANSI_CYAN, output),
+                              file=output, flush=True)
+                        print(
+                            "Откат выполнен."
+                            if rollback_last(root)
+                            else "Резервная копия не найдена.",
+                            file=output,
+                        )
+                    else:
+                        print("Откат отменён.", file=output)
+                except Exception as exc:
+                    print(_style(
+                        "Откат не применён: %s" % type(exc).__name__,
+                        ANSI_RED, output,
+                    ), file=output)
+                _pause(input_stream, output)
+            elif choice in {"0", "6"}:
+                return 0
+            else:
+                notice = "Введите номер пункта от 0 до 5."
+    except KeyboardInterrupt:
+        print(file=output)
+        print(_style("Выход прерван.", ANSI_YELLOW, output), file=output)
+        if _color_enabled(output):
+            print(ANSI_RESET, end="", file=output)
+        return 130
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -990,7 +1527,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("ошибка: интерактивное меню требует TTY", file=sys.stderr)
         return 1
-    return run_menu(Path(os.environ.get("ADGUARDHOME_DOH_ROOT", "/")))
+    try:
+        return run_menu(Path(os.environ.get("ADGUARDHOME_DOH_ROOT", "/")))
+    except KeyboardInterrupt:
+        print(file=sys.stdout)
+        print(_style("Выход прерван.", ANSI_YELLOW, sys.stdout), file=sys.stdout)
+        if _color_enabled(sys.stdout):
+            print(ANSI_RESET, end="", file=sys.stdout)
+        return 130
 
 
 if __name__ == "__main__":

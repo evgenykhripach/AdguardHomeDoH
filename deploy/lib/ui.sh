@@ -115,8 +115,138 @@ adguardhome_doh_selector_ids() {
     printf '%s\n' "$result"
 }
 
+adguardhome_doh_selector_color_enabled() {
+    [[ "${NO_COLOR+x}" == x ]] && return 1
+    [[ "${TERM:-}" == dumb ]] && return 1
+    if [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]]; then
+        [[ -t 0 || -t 1 || -t 2 ]] || return 1
+    else
+        adguardhome_doh_ui_tty || return 1
+    fi
+}
+
+adguardhome_doh_selector_style() {
+    local color="$1" text="$2" code
+    case "$color" in
+        cyan) code='36' ;;
+        green) code='32' ;;
+        yellow) code='33' ;;
+        red) code='31' ;;
+        dim) code='2' ;;
+        *) printf '%s' "$text"; return 0 ;;
+    esac
+    if adguardhome_doh_selector_color_enabled; then
+        printf '\033[%sm%s\033[0m' "$code" "$text"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+adguardhome_doh_selector_clear() {
+    adguardhome_doh_selector_color_enabled || return 0
+    if [[ -w /dev/tty ]]; then
+        printf '\033[2J\033[H' > /dev/tty 2>/dev/null || printf '\033[2J\033[H' >&2
+    else
+        printf '\033[2J\033[H' >&2
+    fi
+    return 0
+}
+
+adguardhome_doh_selector_terminal_width() {
+    local width="${ADGUARDHOME_DOH_SELECTOR_WIDTH:-${ADGUARDHOME_DOH_TERMINAL_WIDTH:-${COLUMNS:-}}}" tty_size
+    if ([[ ! "$width" =~ ^[0-9]+$ ]] || ((width < 1))) && [[ -t 0 || -t 1 || -t 2 ]]; then
+        tty_size="$(stty size 2>/dev/null || true)"
+        read -r _ width <<< "$tty_size" || true
+    fi
+    [[ "$width" =~ ^[0-9]+$ ]] || width=80
+    ((width > 0)) || width=80
+    printf '%s\n' "$width"
+}
+
+adguardhome_doh_selector_print_header() {
+    local width line line_width
+    width="$(adguardhome_doh_selector_terminal_width)"
+    line_width=24
+    ((line_width > width)) && line_width="$width"
+    printf -v line '%*s' "$line_width" ''
+    line="${line// /─}"
+    adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style cyan 'СЕРВИСЫ И ДОМЕНЫ')"
+    adguardhome_doh_selector_emit "$line"
+    return 0
+}
+
+adguardhome_doh_selector_truncate() {
+    local value="$1" width="$2"
+    ((width > 0)) || return 0
+    if (( ${#value} <= width )); then
+        printf '%s' "$value"
+    elif ((width == 1)); then
+        printf '…'
+    else
+        printf '%s…' "${value:0:width-1}"
+    fi
+}
+
+adguardhome_doh_selector_pad() {
+    local value="$1" width="$2" padding
+    value="$(adguardhome_doh_selector_truncate "$value" "$width")"
+    padding=$((width - ${#value}))
+    printf '%s' "$value"
+    ((padding > 0)) && printf '%*s' "$padding" ''
+    return 0
+}
+
+adguardhome_doh_selector_emit_wrapped() {
+    local prefix="$1" value="$2" width="$3" color="${4:-plain}"
+    local continuation line word separator candidate available chunk
+    local -a words=()
+    ((width > 0)) || return 0
+    continuation="$(printf '%*s' "${#prefix}" '')"
+    line="$prefix"
+    read -r -a words <<< "$value"
+    for word in "${words[@]-}"; do
+        separator=' '
+        [[ "$line" == "$prefix" || "$line" == "$continuation" ]] && separator=''
+        candidate="$line$separator$word"
+        if ((${#candidate} <= width)); then
+            line="$candidate"
+            continue
+        fi
+        if [[ "$line" != "$prefix" && "$line" != "$continuation" ]]; then
+            adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$color" "$line")"
+            line="$continuation"
+        fi
+        available=$((width - ${#line}))
+        if ((available < 1)); then
+            adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$color" "$line")"
+            line=
+            available="$width"
+        fi
+        while ((${#word} > available)); do
+            chunk="${word:0:available}"
+            adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$color" "$line$chunk")"
+            word="${word:available}"
+            line="$continuation"
+            available=$((width - ${#line}))
+            if ((available < 1)); then
+                line=
+                available="$width"
+            fi
+        done
+        line="$line$word"
+    done
+    if [[ -n "$line" ]]; then
+        adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$color" "$line")"
+    fi
+    return 0
+}
+
 adguardhome_doh_selector_emit() {
-    if [[ -w /dev/tty ]]; then printf '%s\n' "$1" > /dev/tty; else printf '%s\n' "$1" >&2; fi
+    if [[ -w /dev/tty ]]; then
+        printf '%s\n' "$1" > /dev/tty 2>/dev/null || printf '%s\n' "$1" >&2
+    else
+        printf '%s\n' "$1" >&2
+    fi
 }
 
 adguardhome_doh_selector_count_selected() {
@@ -167,11 +297,19 @@ PY
 }
 
 adguardhome_doh_selector_summary() {
-    local config_dir="$1" count domains names id
+    local config_dir="$1" count domains names id status_color width summary
     count="$(adguardhome_doh_selector_count_selected)"
     domains="$(adguardhome_doh_selector_domain_count "$(cd -- "$config_dir/.." && pwd -P)")"
-    adguardhome_doh_selector_emit "Выбрано сервисов: $count"
-    adguardhome_doh_selector_emit "Активных уникальных доменов: $domains"
+    width="$(adguardhome_doh_selector_terminal_width)"
+    if ((count > 0)); then
+        status_color=green
+    else
+        status_color=yellow
+    fi
+    summary="$(adguardhome_doh_selector_truncate "Выбрано сервисов: $count/${#ADGUARDHOME_DOH_SERVICE_IDS[@]}" "$width")"
+    adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$status_color" "$summary")"
+    summary="$(adguardhome_doh_selector_truncate "Активных уникальных доменов: $domains" "$width")"
+    adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style cyan "$summary")"
     names=
     for id in "${ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
         adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "$id" || continue
@@ -180,37 +318,157 @@ adguardhome_doh_selector_summary() {
             [[ "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" == "$id" ]] && names="$names${ADGUARDHOME_DOH_SERVICE_NAMES[index]}"
         done
     done
-    [[ -n "$names" ]] && adguardhome_doh_selector_emit "Сервисы: $names"
+    [[ -n "$names" ]] && adguardhome_doh_selector_emit_wrapped "Сервисы: " "$names" "$width"
+    return 0
+}
+
+adguardhome_doh_selector_category_line() {
+    local number="$1" category="$2" total="$3" selected="$4" width="$5"
+    local line
+    line="[$number] $category $selected/$total"
+    line="$(adguardhome_doh_selector_truncate "$line" "$width")"
+    printf '%s' "$line"
+    return 0
+}
+
+adguardhome_doh_selector_category_color() {
+    local category="$1" selected="$2"
+    if [[ "$category" == 'Экспериментальные' ]]; then
+        printf 'yellow'
+    elif ((selected > 0)); then
+        printf 'green'
+    else
+        printf 'cyan'
+    fi
+    return 0
+}
+
+adguardhome_doh_selector_category_totals() {
+    local category="$1" index
+    ADGUARDHOME_DOH_SELECTOR_CATEGORY_TOTAL=0
+    ADGUARDHOME_DOH_SELECTOR_CATEGORY_SELECTED=0
+    for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
+        [[ "${ADGUARDHOME_DOH_SERVICE_CATEGORIES[index]}" == "$category" ]] || continue
+        ((ADGUARDHOME_DOH_SELECTOR_CATEGORY_TOTAL += 1))
+        adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && ((ADGUARDHOME_DOH_SELECTOR_CATEGORY_SELECTED += 1))
+    done
+    return 0
+}
+
+adguardhome_doh_selector_emit_commands() {
+    local width="$1" first="$2" first_color="$3" second="$4" second_color="$5"
+    local third="$6" third_color="$7" fourth="$8" fourth_color="$9"
+    local all_length pair_one_length pair_two_length
+    all_length=$((${#first} + ${#second} + ${#third} + ${#fourth} + 6))
+    pair_one_length=$((${#first} + ${#second} + 2))
+    pair_two_length=$((${#third} + ${#fourth} + 2))
+    if ((all_length <= width)); then
+        adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$first_color" "$first")  $(adguardhome_doh_selector_style "$second_color" "$second")  $(adguardhome_doh_selector_style "$third_color" "$third")  $(adguardhome_doh_selector_style "$fourth_color" "$fourth")"
+    elif ((pair_one_length <= width && pair_two_length <= width)); then
+        adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$first_color" "$first")  $(adguardhome_doh_selector_style "$second_color" "$second")"
+        adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$third_color" "$third")  $(adguardhome_doh_selector_style "$fourth_color" "$fourth")"
+    else
+        adguardhome_doh_selector_emit_wrapped "" "$first" "$width" "$first_color"
+        adguardhome_doh_selector_emit_wrapped "" "$second" "$width" "$second_color"
+        adguardhome_doh_selector_emit_wrapped "" "$third" "$width" "$third_color"
+        adguardhome_doh_selector_emit_wrapped "" "$fourth" "$width" "$fourth_color"
+    fi
+    return 0
 }
 
 adguardhome_doh_selector_print_categories() {
-    local number category total selected
+    local number category total selected width column_width first second first_color second_color
+    local categories_count rows left_index right_index
+    width="$(adguardhome_doh_selector_terminal_width)"
     adguardhome_doh_selector_emit ""
     adguardhome_doh_selector_emit "Категории:"
-    for number in "${!ADGUARDHOME_DOH_SELECTOR_CATEGORIES[@]}"; do
-        category="${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[number]}"; total=0; selected=0
-        for index in "${!ADGUARDHOME_DOH_SERVICE_IDS[@]}"; do
-            [[ "${ADGUARDHOME_DOH_SERVICE_CATEGORIES[index]}" == "$category" ]] || continue
-            ((total += 1)); adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && ((selected += 1))
+    categories_count="${#ADGUARDHOME_DOH_SELECTOR_CATEGORIES[@]}"
+    if ((width >= 72)); then
+        column_width=$(( (width - 2) / 2 ))
+        rows=$(( (categories_count + 1) / 2 ))
+        for ((number = 0; number < rows; number += 1)); do
+            left_index="$number"
+            right_index=$((number + rows))
+            category="${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[left_index]}"
+            adguardhome_doh_selector_category_totals "$category"
+            total="$ADGUARDHOME_DOH_SELECTOR_CATEGORY_TOTAL"
+            selected="$ADGUARDHOME_DOH_SELECTOR_CATEGORY_SELECTED"
+            first="$(adguardhome_doh_selector_category_line "$((left_index + 1))" "$category" "$total" "$selected" "$column_width")"
+            first_color="$(adguardhome_doh_selector_category_color "$category" "$selected")"
+            if ((right_index < categories_count)); then
+                category="${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[right_index]}"
+                adguardhome_doh_selector_category_totals "$category"
+                total="$ADGUARDHOME_DOH_SELECTOR_CATEGORY_TOTAL"
+                selected="$ADGUARDHOME_DOH_SELECTOR_CATEGORY_SELECTED"
+                second="$(adguardhome_doh_selector_category_line "$((right_index + 1))" "$category" "$total" "$selected" "$column_width")"
+                second_color="$(adguardhome_doh_selector_category_color "$category" "$selected")"
+                first="$(adguardhome_doh_selector_pad "$first" "$column_width")"
+                first="$(adguardhome_doh_selector_style "$first_color" "$first")"
+                second="$(adguardhome_doh_selector_style "$second_color" "$second")"
+                adguardhome_doh_selector_emit "$first  $second"
+            else
+                adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$first_color" "$first")"
+            fi
         done
-        adguardhome_doh_selector_emit " $((number + 1))) $category ($selected/$total)"
-    done
+    else
+        for ((number = 0; number < categories_count; number += 1)); do
+            category="${ADGUARDHOME_DOH_SELECTOR_CATEGORIES[number]}"
+            adguardhome_doh_selector_category_totals "$category"
+            total="$ADGUARDHOME_DOH_SELECTOR_CATEGORY_TOTAL"
+            selected="$ADGUARDHOME_DOH_SELECTOR_CATEGORY_SELECTED"
+            first="$(adguardhome_doh_selector_category_line "$((number + 1))" "$category" "$total" "$selected" "$width")"
+            first_color="$(adguardhome_doh_selector_category_color "$category" "$selected")"
+            adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style "$first_color" "$first")"
+        done
+    fi
     adguardhome_doh_selector_emit ""
-    adguardhome_doh_selector_emit "Команды: номер — открыть категорию, /текст — поиск, D — стандартные, X — экспериментальные, Y — итог, C — отмена"
+    first="$(adguardhome_doh_selector_truncate 'Команды: номер — открыть, /текст — поиск' "$width")"
+    adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style cyan "$first")"
+    adguardhome_doh_selector_emit_commands "$width" \
+        '[D] Стандартные' cyan '[X] Экспериментальные' yellow \
+        '[Y] Итог' green '[C] Отмена' red
+}
+
+adguardhome_doh_selector_view_line() {
+    local number="$1" marker_color="$2" name="$3" service_id="$4" width="$5"
+    local marker='[ ]' number_prefix suffix name_width line colored_marker colored_number
+    [[ "$marker_color" == green ]] && marker='[✓]'
+    number_prefix="[$number] "
+    suffix=" ($service_id)"
+    name_width=$((width - ${#number_prefix} - ${#marker} - 1 - ${#suffix}))
+    if ((name_width < 1)); then
+        suffix=""
+        name_width=$((width - ${#number_prefix} - ${#marker} - 1))
+    fi
+    if ((name_width < 1)); then
+        line="$(adguardhome_doh_selector_truncate "$number_prefix$marker" "$width")"
+        printf '%s' "$line"
+        return 0
+    fi
+    name="$(adguardhome_doh_selector_truncate "$name" "$name_width")"
+    colored_marker="$(adguardhome_doh_selector_style "$marker_color" "$marker")"
+    colored_number="$(adguardhome_doh_selector_style cyan "$number_prefix")"
+    printf '%s%s %s%s' "$colored_number" "$colored_marker" "$name" "$suffix"
 }
 
 adguardhome_doh_selector_print_view() {
-    local title="$1" number index marker
+    local title="$1" number index marker_color width
+    width="$(adguardhome_doh_selector_terminal_width)"
     adguardhome_doh_selector_emit ""
     [[ "$title" == *: ]] || title="$title:"
-    adguardhome_doh_selector_emit "$title"
+    title="$(adguardhome_doh_selector_truncate "$title" "$width")"
+    adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style cyan "$title")"
     for number in "${!ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[@]}"; do
-        index="${ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[number]}"; marker=' '
-        adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && marker='*'
-        adguardhome_doh_selector_emit " $((number + 1))) [$marker] ${ADGUARDHOME_DOH_SERVICE_NAMES[index]} (${ADGUARDHOME_DOH_SERVICE_IDS[index]})"
+        index="${ADGUARDHOME_DOH_SELECTOR_VIEW_INDICES[number]}"; marker_color=dim
+        adguardhome_doh_selector_contains "$ADGUARDHOME_DOH_SELECTOR_SELECTED" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" && marker_color=green
+        adguardhome_doh_selector_emit "$(adguardhome_doh_selector_view_line "$((number + 1))" "$marker_color" "${ADGUARDHOME_DOH_SERVICE_NAMES[index]}" "${ADGUARDHOME_DOH_SERVICE_IDS[index]}" "$width")"
     done
     adguardhome_doh_selector_emit ""
-    adguardhome_doh_selector_emit "Команды: номера через пробел — включить/выключить, A — все, N — снять все, B — назад, C — отмена"
+    title="$(adguardhome_doh_selector_truncate 'Команды: номера — переключить' "$width")"
+    adguardhome_doh_selector_emit "$(adguardhome_doh_selector_style cyan "$title")"
+    adguardhome_doh_selector_emit_commands "$width" \
+        '[A] Все' green '[N] Снять все' yellow \
+        '[B] Назад' cyan '[C] Отмена' red
 }
 
 adguardhome_doh_selector_apply_view_tokens() {
@@ -228,6 +486,8 @@ adguardhome_doh_selector_apply_view_tokens() {
 adguardhome_doh_selector_view() {
     local title="$1" answer normalized
     while :; do
+        adguardhome_doh_selector_clear
+        adguardhome_doh_selector_print_header
         adguardhome_doh_selector_print_view "$title"
         adguardhome_doh_read_tty answer $'\nВыбор: ' || return $?
         normalized="$ADGUARDHOME_DOH_READ_VALUE"; normalized="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
@@ -257,8 +517,10 @@ adguardhome_doh_select_services() {
     ADGUARDHOME_DOH_SELECTOR_SELECTED="$initial"
     adguardhome_doh_selector_category_init
     while :; do
-        adguardhome_doh_selector_print_categories
+        adguardhome_doh_selector_clear
+        adguardhome_doh_selector_print_header
         adguardhome_doh_selector_summary "$config_dir"
+        adguardhome_doh_selector_print_categories
         adguardhome_doh_read_tty answer $'\nКатегория: ' || return $?
         normalized="$ADGUARDHOME_DOH_READ_VALUE"; normalized="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
         case "$normalized" in
