@@ -801,6 +801,42 @@ def _command_ok(command: Sequence[str], runner: Callable[..., Any]) -> bool:
     return getattr(result, "returncode", 1) == 0
 
 
+def _oneshot_last_run_ok(unit: str, runner: Callable[..., Any]) -> bool:
+    """Return whether a oneshot unit is running or last exited successfully."""
+
+    command = [
+        "systemctl", "show",
+        "--property=ActiveState",
+        "--property=Result",
+        "--property=ExecMainStatus",
+        unit,
+    ]
+    try:
+        result = runner(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if getattr(result, "returncode", 1) != 0:
+        return False
+    output = getattr(result, "stdout", "")
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    if not isinstance(output, str):
+        return False
+    properties = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key.strip()] = value.strip()
+    if properties.get("ActiveState") in {"active", "activating"}:
+        return True
+    return (
+        properties.get("Result") == "success"
+        and properties.get("ExecMainStatus") == "0"
+    )
+
+
 def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
     """Collect operational checks without reading or returning secrets."""
 
@@ -808,8 +844,11 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
     paths = _runtime_paths(root)
     units = {}
     for unit in ("adguardhome-doh.service", "nginx.service",
-                 "adguardhome-doh-health.service", "adguardhome-doh-health.timer"):
+                 "adguardhome-doh-health.timer"):
         units[unit] = _command_ok(["systemctl", "is-active", "--quiet", unit], runner)
+    units["adguardhome-doh-health.service"] = _oneshot_last_run_ok(
+        "adguardhome-doh-health.service", runner
+    )
     install = _read_json(paths["install"], {})
     domain = str(install.get("domain", "")) if isinstance(install, Mapping) else ""
     health_state = _read_json(paths["health_state"], {})
@@ -840,33 +879,74 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
     return report
 
 
-def _render_system_check(report: Mapping[str, Any], output: TextIO) -> None:
-    _section_title("ДИАГНОСТИКА СИСТЕМЫ", output)
+def _unhealthy_service_names(root: Path = Path("/")) -> list[str]:
+    paths = _runtime_paths(Path(root))
+    health_state = _read_json(paths["health_state"], {})
+    if not isinstance(health_state, Mapping):
+        return []
+    unhealthy_ids = {
+        str(service_id)
+        for service_id, state in health_state.items()
+        if isinstance(state, Mapping) and not state.get("healthy", False)
+    }
+    if not unhealthy_ids:
+        return []
+    try:
+        catalog = _load_catalog(paths["catalog"])
+    except (OSError, RuntimeError, ValueError):
+        return sorted(unhealthy_ids)
+    names = [
+        service.name_ru for service in catalog.services
+        if service.id in unhealthy_ids
+    ]
+    known_ids = {service.id for service in catalog.services}
+    names.extend(sorted(unhealthy_ids - known_ids))
+    return names
+
+
+def _render_system_check(
+    report: Mapping[str, Any], output: TextIO,
+    unhealthy_services: Sequence[str] = (),
+) -> None:
+    width = _terminal_width(output)
+    _section_title("ДИАГНОСТИКА СИСТЕМЫ", output, width)
     checks = (
-        ("AdGuard Home", report["units"].get("adguardhome-doh.service", False)),
-        ("nginx", report["units"].get("nginx.service", False)),
-        ("Health service", report["units"].get("adguardhome-doh-health.service", False)),
-        ("Health timer", report["units"].get("adguardhome-doh-health.timer", False)),
-        ("Конфигурация AdGuard Home", report["adguard_config"]),
-        ("Конфигурация nginx", report["nginx"]),
-        ("Сертификат", report["certificate"]),
-        ("Панель администратора", report["endpoints"].get("admin", False)),
-        ("Private DoH", report["endpoints"].get("doh", False)),
-        ("Apple-профиль", report["endpoints"].get("mobileconfig", False)),
+        ("AdGuard Home", report["units"].get("adguardhome-doh.service", False), "готов", "ошибка"),
+        ("nginx", report["units"].get("nginx.service", False), "готов", "ошибка"),
+        ("Health service", report["units"].get("adguardhome-doh-health.service", False),
+         "последняя проверка успешна", "последняя проверка: ошибка"),
+        ("Health timer", report["units"].get("adguardhome-doh-health.timer", False), "готов", "ошибка"),
+        ("Конфигурация AdGuard Home", report["adguard_config"], "готов", "ошибка"),
+        ("Конфигурация nginx", report["nginx"], "готов", "ошибка"),
+        ("Сертификат", report["certificate"], "готов", "ошибка"),
+        ("Панель администратора", report["endpoints"].get("admin", False), "готов", "ошибка"),
+        ("Private DoH", report["endpoints"].get("doh", False), "готов", "ошибка"),
+        ("Apple-профиль", report["endpoints"].get("mobileconfig", False), "готов", "ошибка"),
     )
-    for label, ok in checks:
-        text, tone = _status_value(bool(ok), "готов", "ошибка")
-        print("%-30s %s" % (label + ":", _style(text, tone, output)), file=output)
+    for label, ok, success_text, error_text in checks:
+        text, tone = _status_value(bool(ok), success_text, error_text)
+        prefix = "%-30s " % (label + ":")
+        if len(prefix) + len(text) <= width:
+            print(prefix + _style(text, tone, output), file=output)
+        else:
+            print(label + ":", file=output)
+            print("  " + _style(text, tone, output), file=output)
     print(file=output)
     print("Здоровые сервисы: %d/%d" % (
         report["health_state"].get("healthy", 0),
         report["health_state"].get("services", 0),
     ), file=output)
+    if unhealthy_services:
+        _print_wrapped(
+            "Требуют внимания: ", ", ".join(unhealthy_services), output, width
+        )
     print("Активные домены: %d" % report.get("active_domain_count", 0), file=output)
 
 
 def print_system_check(root: Path = Path("/"), output: TextIO = sys.stdout) -> None:
-    _render_system_check(collect_system_check(root), output)
+    _render_system_check(
+        collect_system_check(root), output, _unhealthy_service_names(root)
+    )
 
 
 def parse_service_selection(value: str, catalog: Any) -> Sequence[str]:
@@ -1432,9 +1512,8 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                 try:
                     print(_style("Выполняется полная проверка…", ANSI_CYAN, output),
                           file=output, flush=True)
-                    report = collect_system_check(root)
                     _clear_screen(output)
-                    _render_system_check(report, output)
+                    print_system_check(root, output)
                 except Exception as exc:
                     print(_style(
                         "Диагностика не выполнена: %s" % type(exc).__name__,

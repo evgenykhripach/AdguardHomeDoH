@@ -38,7 +38,7 @@ def load_manager():
 class ManagerTests(unittest.TestCase):
     def _menu_status(self):
         return {
-            "version": "1.0.32",
+            "version": "1.0.33",
             "domain": "dns.example.com",
             "units": {
                 "adguardhome-doh.service": True,
@@ -94,6 +94,73 @@ class ManagerTests(unittest.TestCase):
             report = manager.collect_system_check(root, runner=runner)
         self.assertTrue(report["endpoints"]["mobileconfig"])
 
+    def test_system_check_uses_successful_last_oneshot_result(self):
+        manager = load_manager()
+        commands = []
+
+        def runner(command, **_kwargs):
+            commands.append(command)
+            stdout = b""
+            if command[:2] == ["systemctl", "show"]:
+                stdout = (
+                    b"ActiveState=inactive\n"
+                    b"Result=success\n"
+                    b"ExecMainStatus=0\n"
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = manager.collect_system_check(Path(directory), runner=runner)
+
+        self.assertTrue(report["units"]["adguardhome-doh-health.service"])
+        self.assertIn(
+            [
+                "systemctl", "show",
+                "--property=ActiveState",
+                "--property=Result",
+                "--property=ExecMainStatus",
+                "adguardhome-doh-health.service",
+            ],
+            commands,
+        )
+        self.assertNotIn(
+            [
+                "systemctl", "is-active", "--quiet",
+                "adguardhome-doh-health.service",
+            ],
+            commands,
+        )
+
+    def test_system_check_rejects_failed_last_oneshot_result(self):
+        manager = load_manager()
+        result = subprocess.CompletedProcess(
+            [], 0,
+            b"ActiveState=failed\nResult=exit-code\nExecMainStatus=1\n",
+            b"",
+        )
+        runner = mock.Mock(return_value=result)
+        self.assertFalse(manager._oneshot_last_run_ok(
+            "adguardhome-doh-health.service", runner
+        ))
+
+    def test_unhealthy_service_names_use_catalog_labels(self):
+        manager = load_manager()
+        catalog = Catalog.load(ROOT / "config")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh"
+            state.mkdir(parents=True)
+            (state / "health-state.json").write_text(
+                json.dumps({
+                    "chatgpt": {"healthy": True},
+                    "claude": {"healthy": False},
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.object(manager, "_load_catalog", return_value=catalog):
+                names = manager._unhealthy_service_names(root)
+        self.assertEqual(["Claude"], names)
+
     def test_menu_status_is_fast_local_and_never_contains_secrets(self):
         manager = load_manager()
         catalog = Catalog.load(ROOT / "config")
@@ -138,7 +205,7 @@ class ManagerTests(unittest.TestCase):
             )
             (certificate / "fullchain.pem").write_text("cert\n", encoding="utf-8")
             (certificate / "privkey.pem").write_text("key\n", encoding="utf-8")
-            version.write_text("1.0.32\n", encoding="utf-8")
+            version.write_text("1.0.33\n", encoding="utf-8")
             manager.create_backup(
                 root,
                 root / "var/backups/adguardhome-doh/20260823T000000000000Z",
@@ -154,7 +221,7 @@ class ManagerTests(unittest.TestCase):
 
             status = manager.collect_menu_status(root, catalog, runner=runner)
 
-        self.assertEqual("1.0.32", status["version"])
+        self.assertEqual("1.0.33", status["version"])
         self.assertEqual("dns.example.com", status["domain"])
         self.assertEqual(2, status["enabled_services"])
         self.assertEqual(1, status["healthy_services"])
@@ -220,14 +287,25 @@ class ManagerTests(unittest.TestCase):
             "active_domain_count": 42,
         }
         output = io.StringIO()
-        with mock.patch.object(manager, "collect_system_check", return_value=report):
+        with mock.patch.object(manager, "collect_system_check", return_value=report), \
+             mock.patch.object(manager, "_unhealthy_service_names", return_value=["Claude"]):
             manager.print_system_check(Path("/"), output)
         text = output.getvalue()
         self.assertIn("ДИАГНОСТИКА СИСТЕМЫ", text)
         self.assertIn("AdGuard Home", text)
         self.assertIn("nginx", text)
+        self.assertIn("последняя проверка успешна", text)
+        self.assertIn("Требуют внимания: Claude", text)
         self.assertIn("42", text)
         self.assertNotIn('{"', text)
+
+        narrow = io.StringIO()
+        with mock.patch.object(manager, "_terminal_width", return_value=40):
+            manager._render_system_check(
+                report, narrow, ["Claude", "Microsoft Copilot"]
+            )
+        for line in narrow.getvalue().splitlines():
+            self.assertLessEqual(len(manager._strip_ansi(line)), 40, line)
 
     def test_access_screen_is_explicitly_confidential(self):
         manager = load_manager()
