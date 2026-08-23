@@ -241,6 +241,73 @@ class InstallerCliTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("libnginx-mod-stream", result.stdout.splitlines())
 
+    def test_missing_packages_reports_only_packages_not_fully_installed(self):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            fake_bin = Path(directory) / "bin"
+            fake_bin.mkdir()
+            dpkg_query = fake_bin / "dpkg-query"
+            dpkg_query.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${@: -1}\" in\n"
+                "  installed) printf 'ii ' ;;\n"
+                "  configured-only) printf 'iF ' ;;\n"
+                "  reinstall-required) printf 'iiR' ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            dpkg_query.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; shift; adguardhome_doh_missing_packages "$@"',
+                    "bash", str(common), "installed", "missing", "configured-only",
+                    "reinstall-required",
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            ["missing", "configured-only", "reinstall-required"],
+            result.stdout.splitlines(),
+        )
+
+    def test_installer_skips_apt_when_all_dependencies_are_installed(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertIn(
+            'mapfile -t missing_packages < <(adguardhome_doh_missing_packages "${required_packages[@]}")',
+            source,
+        )
+        self.assertIn('if ((${#missing_packages[@]})); then', source)
+        self.assertIn(
+            'install -y --no-install-recommends "${missing_packages[@]}"',
+            source,
+        )
+        self.assertNotIn(
+            'apt-get install -y --no-install-recommends "${required_packages[@]}"',
+            source,
+        )
+
+    def test_managed_update_summary_does_not_print_credentials(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertIn(
+            'if ((UPDATE)); then\n    adguardhome_doh_update_summary "$LOG_PATH"',
+            source,
+        )
+        self.assertIn(
+            'else\n    adguardhome_doh_summary "$LOG_PATH" "$DOH_TOKEN" "$ADMIN_PASSWORD" "$CREDENTIALS_FILE"',
+            source,
+        )
+        start = source.index("adguardhome_doh_update_summary()")
+        end = source.index("adguardhome_doh_render_dry_run()", start)
+        update_summary = source[start:end]
+        self.assertNotIn("Password:", update_summary)
+        self.assertNotIn("DoH URL:", update_summary)
+        self.assertNotIn("mobileconfig URL:", update_summary)
+
     def test_nginx_stream_include_is_deduplicated_idempotently(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
         include = "include /etc/nginx/stream.d/*.conf;"

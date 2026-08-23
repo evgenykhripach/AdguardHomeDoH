@@ -33,6 +33,18 @@ adguardhome_doh_required_packages() {
         apache2-utils tar gzip python3
 }
 
+adguardhome_doh_missing_packages() {
+    local package status
+    for package in "$@"; do
+        status=
+        if ! status="$(LC_ALL=C dpkg-query --show \
+            --showformat='${db:Status-Abbrev}' "$package" 2>/dev/null)" || \
+            [[ "$status" != "ii " ]]; then
+            printf '%s\n' "$package"
+        fi
+    done
+}
+
 adguardhome_doh_ensure_nginx_stream_include() {
     local nginx_conf="${1:-/etc/nginx/nginx.conf}" include_line='include /etc/nginx/stream.d/*.conf;' rendered
     [[ -f "$nginx_conf" ]] || adguardhome_doh_die "nginx.conf is missing: $nginx_conf"

@@ -162,6 +162,14 @@ adguardhome_doh_summary() {
     printf 'Management: sudo adguardhome-doh\n'
 }
 
+adguardhome_doh_update_summary() {
+    local log_path="$1"
+    printf '\nОбновление adguardhome-doh завершено.\n'
+    printf 'Данные доступа: пункт 1 меню менеджера.\n'
+    printf 'Install log: %s\n' "$log_path"
+    printf 'Management: sudo adguardhome-doh\n'
+}
+
 adguardhome_doh_render_dry_run() {
     local output status
     output="$(mktemp -d)"
@@ -227,10 +235,23 @@ LOG_PATH="$ADGUARDHOME_DOH_LOG_PATH"
 adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE"
 adguardhome_doh_progress 20 'предварительная проверка завершена'
 
-adguardhome_doh_run_logged apt-get update
 mapfile -t required_packages < <(adguardhome_doh_required_packages)
-adguardhome_doh_run_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${required_packages[@]}"
-adguardhome_doh_progress 35 'зависимости установлены'
+mapfile -t missing_packages < <(adguardhome_doh_missing_packages "${required_packages[@]}")
+if ((${#missing_packages[@]})); then
+    adguardhome_doh_progress 25 'обновление индекса пакетов; это может занять несколько минут'
+    adguardhome_doh_run_logged apt-get \
+        -o Acquire::Retries=3 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+        update
+    adguardhome_doh_progress 30 'установка недостающих зависимостей'
+    adguardhome_doh_run_logged env DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Dpkg::Use-Pty=0 \
+        install -y --no-install-recommends "${missing_packages[@]}"
+    adguardhome_doh_progress 35 'зависимости установлены'
+else
+    adguardhome_doh_progress 35 'зависимости уже установлены; apt пропущен'
+fi
 
 mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT" "$WEBROOT" /etc/nginx/stream.d /etc/adguardhome-doh
 chmod 700 "$STATE_DIR" "$CONFIG_DIR" "$BACKUP_ROOT"
@@ -382,4 +403,8 @@ rm -rf -- "$stage"
 install -m 600 /dev/null "$INSTALL_COMPLETE_FILE"
 adguardhome_doh_progress 95 'сертификат и DoH активированы'
 adguardhome_doh_progress 100 'установка завершена'
-adguardhome_doh_summary "$LOG_PATH" "$DOH_TOKEN" "$ADMIN_PASSWORD" "$CREDENTIALS_FILE"
+if ((UPDATE)); then
+    adguardhome_doh_update_summary "$LOG_PATH"
+else
+    adguardhome_doh_summary "$LOG_PATH" "$DOH_TOKEN" "$ADMIN_PASSWORD" "$CREDENTIALS_FILE"
+fi
