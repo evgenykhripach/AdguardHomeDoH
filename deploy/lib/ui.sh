@@ -144,8 +144,10 @@ adguardhome_doh_selector_style() {
 
 adguardhome_doh_selector_clear() {
     adguardhome_doh_selector_color_enabled || return 0
-    if [[ -w /dev/tty ]]; then
-        printf '\033[2J\033[H' > /dev/tty 2>/dev/null || printf '\033[2J\033[H' >&2
+    if [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]]; then
+        printf '\033[2J\033[H' >&2
+    elif [[ -w /dev/tty ]]; then
+        { printf '\033[2J\033[H' > /dev/tty; } 2>/dev/null || printf '\033[2J\033[H' >&2
     else
         printf '\033[2J\033[H' >&2
     fi
@@ -242,8 +244,10 @@ adguardhome_doh_selector_emit_wrapped() {
 }
 
 adguardhome_doh_selector_emit() {
-    if [[ -w /dev/tty ]]; then
-        printf '%s\n' "$1" > /dev/tty 2>/dev/null || printf '%s\n' "$1" >&2
+    if [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]]; then
+        printf '%s\n' "$1" >&2
+    elif [[ -w /dev/tty ]]; then
+        { printf '%s\n' "$1" > /dev/tty; } 2>/dev/null || printf '%s\n' "$1" >&2
     else
         printf '%s\n' "$1" >&2
     fi
