@@ -4,11 +4,14 @@ set -euo pipefail
 ADGUARDHOME_DOH_LAST_PROGRESS=-1
 ADGUARDHOME_DOH_PROGRESS_MILESTONES=(0 5 20 25 30 35 50 65 75 85 95 100)
 
+adguardhome_doh_ui_dev_tty() {
+    [[ -r /dev/tty && -w /dev/tty ]] || return 1
+    { : </dev/tty >/dev/tty; } 2>/dev/null
+}
+
 adguardhome_doh_ui_tty() {
-    [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]] && return 0
-    [[ -r /dev/tty ]] || return 1
-    [[ -w /dev/tty ]] && return 0
-    [[ -t 0 || -t 1 ]]
+    [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 || -t 0 ]] && return 0
+    adguardhome_doh_ui_dev_tty
 }
 
 adguardhome_doh_ui_error() { printf 'ошибка: %s\n' "$*" >&2; }
@@ -36,14 +39,14 @@ adguardhome_doh_read_tty() {
     local variable="$1" prompt="$2" value
     adguardhome_doh_ui_tty || { adguardhome_doh_ui_error "interactive input requires a TTY (/dev/tty)"; return 2; }
     ADGUARDHOME_DOH_READ_VALUE=
-    if [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 ]]; then
+    if [[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 || -t 0 ]]; then
         printf '%s' "$prompt" >&2
         IFS= read -r value || { adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2; }
-    elif [[ -r /dev/tty && -w /dev/tty ]]; then
-        printf '%s' "$prompt" > /dev/tty 2>/dev/null || {
+    elif adguardhome_doh_ui_dev_tty; then
+        { printf '%s' "$prompt" > /dev/tty; } 2>/dev/null || {
             adguardhome_doh_ui_error "input terminal is unavailable"; return 2;
         }
-        IFS= read -r value < /dev/tty || {
+        { IFS= read -r value < /dev/tty; } 2>/dev/null || {
             adguardhome_doh_ui_error "input cancelled or unavailable on /dev/tty"; return 2;
         }
     else

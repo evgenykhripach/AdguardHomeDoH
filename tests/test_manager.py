@@ -38,7 +38,7 @@ def load_manager():
 class ManagerTests(unittest.TestCase):
     def _menu_status(self):
         return {
-            "version": "1.0.31",
+            "version": "1.0.32",
             "domain": "dns.example.com",
             "units": {
                 "adguardhome-doh.service": True,
@@ -138,7 +138,7 @@ class ManagerTests(unittest.TestCase):
             )
             (certificate / "fullchain.pem").write_text("cert\n", encoding="utf-8")
             (certificate / "privkey.pem").write_text("key\n", encoding="utf-8")
-            version.write_text("1.0.31\n", encoding="utf-8")
+            version.write_text("1.0.32\n", encoding="utf-8")
             manager.create_backup(
                 root,
                 root / "var/backups/adguardhome-doh/20260823T000000000000Z",
@@ -154,7 +154,7 @@ class ManagerTests(unittest.TestCase):
 
             status = manager.collect_menu_status(root, catalog, runner=runner)
 
-        self.assertEqual("1.0.31", status["version"])
+        self.assertEqual("1.0.32", status["version"])
         self.assertEqual("dns.example.com", status["domain"])
         self.assertEqual(2, status["enabled_services"])
         self.assertEqual(1, status["healthy_services"])

@@ -262,8 +262,10 @@ class InteractiveInstallerTests(unittest.TestCase):
 
     def test_selector_tty_detection_survives_command_substitution(self):
         ui_source = UI.read_text(encoding="utf-8")
-        self.assertIn("[[ -r /dev/tty ]] || return 1", ui_source)
-        self.assertIn("[[ -w /dev/tty ]] && return 0", ui_source)
+        self.assertIn("[[ -r /dev/tty && -w /dev/tty ]] || return 1", ui_source)
+        self.assertIn("{ : </dev/tty >/dev/tty; } 2>/dev/null", ui_source)
+        self.assertIn('[[ "${ADGUARDHOME_DOH_TTY_FD:-}" == 0 || -t 0 ]]', ui_source)
+        self.assertNotIn("[[ -w /dev/tty ]] && return 0", ui_source)
         self.assertNotIn("( -t 0 || -t 1 )", ui_source)
 
     def test_selector_no_long_global_service_list_or_legacy_shortcuts(self):
