@@ -131,7 +131,7 @@ def main(argv=None):
                           args.certificate_root, args.webroot), encoding="utf-8"
     )
     (args.output / (args.doh_host + ".mobileconfig")).write_text(
-        render_mobileconfig(args.doh_host, args.doh_token), encoding="utf-8"
+        render_mobileconfig(args.doh_host, args.doh_token, args.public_ip), encoding="utf-8"
     )
     (args.output / "nginx-stream.conf").write_text(
         render_nginx_stream(rows, args.doh_host), encoding="utf-8"

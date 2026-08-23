@@ -66,6 +66,8 @@ newest complete backup after validating nginx configuration.
 ## Client setup
 
 Use the generated DoH URL in the operating system or browser's custom DoH
-settings. If the client has cached the previous DNS answer, flush its DNS cache
-and restart the browser. Do not copy the server credential or DoH token into a
-public issue or chat.
+settings. The generated Apple profile pins the server's public IPv4 address;
+regenerate and reinstall the profile whenever that address changes. If the
+client has cached the previous DNS answer, flush its DNS cache and restart the
+browser. Do not copy the server credential or DoH token into a public issue or
+chat.

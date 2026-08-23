@@ -21,11 +21,19 @@ from tools.render_config import (
 
 class RenderConfigTests(unittest.TestCase):
     def test_mobileconfig_uses_system_scope_for_macos_dns_settings(self):
+        token = "a" * 48
         payload = plistlib.loads(
-            render_mobileconfig("dns.example.com", "a" * 48).encode("utf-8")
+            render_mobileconfig("dns.example.com", token, "203.0.113.10").encode("utf-8")
         )
 
         self.assertEqual("System", payload["PayloadScope"])
+        dns_settings = payload["PayloadContent"][0]["DNSSettings"]
+        self.assertEqual("HTTPS", dns_settings["DNSProtocol"])
+        self.assertEqual(
+            "https://dns.example.com/doh/" + token,
+            dns_settings["ServerURL"],
+        )
+        self.assertEqual(["203.0.113.10"], dns_settings["ServerAddresses"])
         self.assertEqual(
             "com.apple.dnsSettings.managed",
             payload["PayloadContent"][0]["PayloadType"],
@@ -34,6 +42,11 @@ class RenderConfigTests(unittest.TestCase):
             "com.apple.vpn.managed",
             [item["PayloadType"] for item in payload["PayloadContent"]],
         )
+
+    def test_mobileconfig_rejects_invalid_or_ipv6_public_ip(self):
+        for public_ip in ("not-an-ip", "2001:db8::10"):
+            with self.assertRaises(ValueError):
+                render_mobileconfig("dns.example.com", "a" * 48, public_ip)
 
     def test_runtime_renderer_imports_when_installed_next_to_renderer(self):
         root = Path(__file__).resolve().parents[1]
@@ -77,6 +90,10 @@ class RenderConfigTests(unittest.TestCase):
         self.assertEqual("dns.example.com", payload["PayloadDisplayName"])
         self.assertEqual(
             "dns.example.com", payload["PayloadContent"][0]["PayloadDisplayName"]
+        )
+        self.assertEqual(
+            ["203.0.113.10"],
+            payload["PayloadContent"][0]["DNSSettings"]["ServerAddresses"],
         )
 
     def write_policy(self, rows):
@@ -159,6 +176,8 @@ class RenderConfigTests(unittest.TestCase):
             "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com", "/var/www/html"
         )
         self.assertIn("password: $2a$10$hash", adguard)
+        self.assertIn("  ratelimit: 0", adguard)
+        self.assertNotIn("  ratelimit: 20", adguard)
         self.assertIn("  rewrites: []", adguard)
         self.assertNotIn("answer: 127.0.0.1", adguard)
         self.assertIn("location = /doh/" + "a" * 48, http)
@@ -167,6 +186,18 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn(
             'Content-Disposition "attachment; filename=dns.example.com.mobileconfig"',
             http,
+        )
+        mobileconfig_block = http.split(
+            "    location = /" + "a" * 48 + ".mobileconfig {", 1
+        )[1].split("    }", 1)[0]
+        doh_block = http.split("    location = /doh/" + "a" * 48 + " {", 1)[1].split(
+            "    }", 1
+        )[0]
+        self.assertIn("        access_log off;", mobileconfig_block)
+        self.assertIn("        access_log off;", doh_block)
+        self.assertNotIn(
+            "access_log off;",
+            http.rsplit("    location / {", 1)[1].split("    }", 1)[0],
         )
         self.assertNotIn("listen 443 ssl", http)
 

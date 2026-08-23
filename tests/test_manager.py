@@ -108,13 +108,142 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(
             [
                 mock.call(["systemctl", "daemon-reload"], check=False),
+                mock.call(
+                    [
+                        "/opt/AdGuardHome/AdGuardHome", "--check-config",
+                        "-c", "/opt/AdGuardHome/AdGuardHome.yaml",
+                        "-w", "/var/lib/AdGuardHome",
+                    ],
+                    check=True, stdout=mock.ANY, stderr=mock.ANY,
+                ),
                 mock.call(["nginx", "-t"], check=True),
+                mock.call(
+                    ["systemctl", "restart", "adguardhome-doh-health.timer"],
+                    check=True,
+                ),
             ],
             runner.call_args_list,
         )
         reload_services.assert_called_once_with(
             Path("/"), "dns.example.com", runner=runner
         )
+
+    def test_restore_rejects_invalid_manifest_without_mutating_target(self):
+        manager = load_manager()
+        invalid_manifests = [
+            ("empty", []),
+            ("non_mapping", ["invalid"]),
+            (
+                "unknown_path",
+                [{"path": "/tmp/not-managed", "backup": "backup", "present": False}],
+            ),
+            (
+                "present_not_bool",
+                [{"path": "/opt/AdGuardHome/AdGuardHome.yaml", "backup": "backup", "present": 1}],
+            ),
+            (
+                "unsafe_backup_name",
+                [{"path": "/opt/AdGuardHome/AdGuardHome.yaml", "backup": "../backup", "present": True}],
+            ),
+            (
+                "missing_present_backup",
+                [{"path": "/opt/AdGuardHome/AdGuardHome.yaml", "backup": "missing", "present": True}],
+            ),
+        ]
+        for name, manifest in invalid_manifests:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+                target.parent.mkdir(parents=True)
+                target.write_text("before\n", encoding="utf-8")
+                backup = root / "backup"
+                manager.create_backup(root, backup)
+                (backup / "manifest.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+                with self.assertRaises(RuntimeError):
+                    manager._restore_backup(backup, root)
+                self.assertEqual("before\n", target.read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text("before\n", encoding="utf-8")
+            backup = root / "backup"
+            manager.create_backup(root, backup)
+            (backup / "manifest.json").unlink()
+            with self.assertRaises(RuntimeError):
+                manager._restore_backup(backup, root)
+            self.assertEqual("before\n", target.read_text(encoding="utf-8"))
+
+    def test_restore_rejects_partial_or_duplicate_manifest_without_mutation(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text("before\n", encoding="utf-8")
+            backup = root / "backup"
+            manager.create_backup(root, backup)
+            manifest = json.loads(
+                (backup / "manifest.json").read_text(encoding="utf-8")
+            )
+
+            for name, invalid in (
+                ("partial", manifest[:1]),
+                ("duplicate", manifest + [manifest[0]]),
+            ):
+                with self.subTest(name=name):
+                    (backup / "manifest.json").write_text(
+                        json.dumps(invalid), encoding="utf-8"
+                    )
+                    with self.assertRaises(RuntimeError):
+                        manager._restore_backup(backup, root)
+                    self.assertEqual(
+                        "before\n", target.read_text(encoding="utf-8")
+                    )
+
+    def test_rollback_ignores_newer_incomplete_backup(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text("before\n", encoding="utf-8")
+            backup_root = root / "var/backups/adguardhome-doh"
+            manager.create_backup(root, backup_root / "20240101T00000000000000Z")
+            target.write_text("after\n", encoding="utf-8")
+            newer = backup_root / "20240201T00000000000000Z"
+            newer.mkdir(parents=True)
+            (newer / "transaction.json").write_text("{}\n", encoding="utf-8")
+
+            self.assertTrue(manager.rollback_last(root, runner=mock.Mock()))
+            self.assertEqual("before\n", target.read_text(encoding="utf-8"))
+
+    def test_rollback_accepts_nested_full_backup_manifest(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text("before\n", encoding="utf-8")
+            nested = root / "var/backups/adguardhome-doh/20240301T00000000000000Z/full"
+            manager.create_backup(root, nested)
+            target.write_text("after\n", encoding="utf-8")
+
+            self.assertTrue(manager.rollback_last(root, runner=mock.Mock()))
+            self.assertEqual("before\n", target.read_text(encoding="utf-8"))
+
+    def test_rollback_returns_false_when_only_incomplete_backups_exist(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "var/backups/adguardhome-doh/20240401T00000000000000Z"
+            backup.mkdir(parents=True)
+            (backup / "transaction.json").write_text("{}\n", encoding="utf-8")
+
+            self.assertFalse(manager.rollback_last(root, runner=mock.Mock()))
 
     def test_yes_answer_accepts_lowercase_and_terminal_invisibles(self):
         manager = load_manager()

@@ -380,7 +380,7 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "    - 127.0.0.1",
         "  port: 53",
         "  anonymize_client_ip: true",
-        "  ratelimit: 20",
+        "  ratelimit: 0",
         "  ratelimit_subnet_len_ipv4: 24",
         "  ratelimit_subnet_len_ipv6: 56",
         "  ratelimit_whitelist: []",
@@ -499,8 +499,9 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
     return "\n".join(lines)
 
 
-def render_mobileconfig(doh_host: str, doh_token: str) -> str:
+def render_mobileconfig(doh_host: str, doh_token: str, public_ip: str) -> str:
     doh_host = _hostname(doh_host, "doh-host")
+    public_ip = _public_ipv4(public_ip)
     if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
         raise ValueError("doh-token must be lowercase hexadecimal")
     profile_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "adguardhome-doh-profile:" + doh_host))
@@ -509,12 +510,18 @@ def render_mobileconfig(doh_host: str, doh_token: str) -> str:
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>PayloadContent</key><array><dict>
-<key>DNSSettings</key><dict><key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://{host}/doh/{token}</string></dict>
+<key>DNSSettings</key><dict><key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://{host}/doh/{token}</string><key>ServerAddresses</key><array><string>{public_ip}</string></array></dict>
 <key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{payload_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadType</key><string>com.apple.dnsSettings.managed</string><key>PayloadUUID</key><string>{payload_id}</string><key>PayloadVersion</key><integer>1</integer>
 </dict></array>
 <key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{profile_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadScope</key><string>System</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>{profile_id}</string><key>PayloadVersion</key><integer>1</integer>
 </dict></plist>
-""".format(host=doh_host, token=doh_token, payload_id=payload_id, profile_id=profile_id)
+""".format(
+        host=doh_host,
+        token=doh_token,
+        public_ip=public_ip,
+        payload_id=payload_id,
+        profile_id=profile_id,
+    )
 
 
 def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webroot: str) -> str:
@@ -547,6 +554,7 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "        default_type application/x-apple-aspen-config;",
         "        add_header Content-Disposition \"attachment; filename=%s.mobileconfig\" always;" % doh_host,
         "        add_header Cache-Control \"no-store\" always;",
+        "        access_log off;",
         "        try_files /%s.mobileconfig =404;" % doh_host,
         "    }",
         "    location = /dns-query { return 404; }",
@@ -558,6 +566,7 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "        proxy_set_header X-Forwarded-Proto https;",
         "        proxy_buffering off;",
         "        proxy_read_timeout 30s;",
+        "        access_log off;",
         "    }",
         "    location / {",
         "        proxy_pass http://127.0.0.1:3001;",

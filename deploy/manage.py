@@ -136,16 +136,58 @@ def create_backup(root: Path = Path("/"), backup_dir: Optional[Path] = None) -> 
     return backup_dir
 
 
-def _restore_backup(backup_dir: Path, root: Path = Path("/")) -> None:
-    manifest = _read_json(Path(backup_dir) / "manifest.json", [])
-    if not isinstance(manifest, list):
+def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
+    manifest_path = Path(backup_dir) / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("backup manifest is missing")
+    manifest = _read_json(manifest_path, None)
+    if not isinstance(manifest, list) or not manifest:
         raise RuntimeError("backup manifest is invalid")
+
+    entries = []
+    seen_paths = set()
+    seen_backups = set()
     for item in manifest:
         if not isinstance(item, Mapping):
-            continue
-        target = under_root(root, str(item.get("path", "")))
-        backup = Path(backup_dir) / str(item.get("backup", ""))
-        if item.get("present"):
+            raise RuntimeError("backup manifest is invalid")
+        relative = item.get("path")
+        if (
+            not isinstance(relative, str)
+            or relative not in MANAGED_FILES
+            or relative in seen_paths
+        ):
+            raise RuntimeError("backup manifest is invalid")
+        seen_paths.add(relative)
+        present = item.get("present")
+        if not isinstance(present, bool):
+            raise RuntimeError("backup manifest is invalid")
+        backup_name = item.get("backup")
+        if (
+            not isinstance(backup_name, str)
+            or not backup_name
+            or backup_name in (".", "..")
+            or Path(backup_name).name != backup_name
+            or "/" in backup_name
+            or "\\" in backup_name
+            or backup_name in seen_backups
+        ):
+            raise RuntimeError("backup manifest is invalid")
+        seen_backups.add(backup_name)
+        backup = Path(backup_dir) / backup_name
+        if present and not (backup.exists() or backup.is_symlink()):
+            raise RuntimeError("backup manifest is incomplete")
+        entries.append((relative, backup_name, present))
+    if seen_paths != set(MANAGED_FILES):
+        raise RuntimeError("backup manifest is incomplete")
+    return entries
+
+
+def _restore_backup(backup_dir: Path, root: Path = Path("/")) -> None:
+    entries = _validated_backup_manifest(backup_dir)
+    for relative, backup_name, present in entries:
+        target = under_root(root, relative)
+        backup = Path(backup_dir) / backup_name
+        if present:
             _remove_path(target)
             _copy_path(backup, target)
         else:
@@ -266,8 +308,17 @@ def restore_backup_runtime(
     if root != Path("/"):
         return
     runner(["systemctl", "daemon-reload"], check=False)
+    runner(
+        [
+            "/opt/AdGuardHome/AdGuardHome", "--check-config",
+            "-c", "/opt/AdGuardHome/AdGuardHome.yaml",
+            "-w", "/var/lib/AdGuardHome",
+        ],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
     runner(["nginx", "-t"], check=True)
     reload_runtime_services(root, domain, runner=runner)
+    runner(["systemctl", "restart", "adguardhome-doh-health.timer"], check=True)
 
 
 def _domain_set(catalog: Any, services: Iterable[str]) -> set:
@@ -799,15 +850,36 @@ def install_update(
 def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run) -> bool:
     root = Path(root)
     backup_root = _runtime_paths(root)["backup"]
-    candidates = sorted((item for item in backup_root.iterdir() if item.is_dir()), reverse=True) if backup_root.is_dir() else []
-    if not candidates:
+    if not backup_root.is_dir():
         return False
-    _restore_backup(candidates[0], root)
+    candidates = sorted(
+        (item for item in backup_root.iterdir() if item.is_dir()),
+        key=lambda item: item.name,
+        reverse=True,
+    )
+    selected = None
+    for candidate in candidates:
+        manifest_dirs = []
+        if (candidate / "manifest.json").is_file():
+            manifest_dirs.append(candidate)
+        if (candidate / "full" / "manifest.json").is_file():
+            manifest_dirs.append(candidate / "full")
+        for manifest_dir in manifest_dirs:
+            try:
+                _validated_backup_manifest(manifest_dir)
+            except RuntimeError:
+                continue
+            selected = manifest_dir
+            break
+        if selected is not None:
+            break
+    if selected is None:
+        return False
+
+    domain = ""
     if root == Path("/"):
-        runner(["systemctl", "daemon-reload"], check=False)
-        runner(["nginx", "-t"], check=True)
-        for unit in ("adguardhome-doh.service", "adguardhome-doh-health.timer", "nginx.service"):
-            runner(["systemctl", "restart", unit], check=False)
+        domain = str(_current_install_state(root)["domain"])
+    restore_backup_runtime(selected, root, domain, runner=runner)
     return True
 
 
