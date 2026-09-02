@@ -1,4 +1,6 @@
 import csv
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -189,6 +191,78 @@ class CatalogTests(unittest.TestCase):
                 stream.write("chatgpt,probe.unrelated.example\n")
             with self.assertRaises(ValueError):
                 Catalog.load(config_dir)
+
+
+class ActivationSeedingTests(unittest.TestCase):
+    def test_only_healthy_services_are_seeded_while_nginx_keeps_the_union(self):
+        """A restart must not send clients to the real addresses in between."""
+
+        root = Path(__file__).resolve().parents[1]
+        runtime = root / "deploy" / "lib" / "render_runtime.py"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "stage"
+            result = subprocess.run(
+                [
+                    sys.executable, str(runtime),
+                    "--config-dir", str(root / "config"),
+                    "--services", "chatgpt,claude",
+                    "--healthy-services", "chatgpt",
+                    "--public-ip", "203.0.113.10",
+                    "--doh-host", "dns.example.com",
+                    "--doh-token", "a" * 48,
+                    "--password-hash", "$2a$10$hash",
+                    "--certificate-root", "/etc/letsencrypt/live/dns.example.com",
+                    "--webroot", "/var/www/adguardhome-doh",
+                    "--output", str(output),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            adguard = (output / "AdGuardHome.yaml").read_text(encoding="utf-8")
+            stream = (output / "nginx-stream.conf").read_text(encoding="utf-8")
+
+        self.assertIn("    - domain: 'chatgpt.com'", adguard)
+        self.assertIn("      answer: 203.0.113.10", adguard)
+        # A service that has not proven itself yet stays for the gate to enable.
+        self.assertNotIn("claude.ai", adguard)
+        # SNI routing always covers the full selected union.
+        self.assertIn(".claude.ai $ssl_preread_server_name:443;", stream)
+        self.assertIn(".chatgpt.com $ssl_preread_server_name:443;", stream)
+
+    def test_activation_without_health_state_stays_gated(self):
+        root = Path(__file__).resolve().parents[1]
+        runtime = root / "deploy" / "lib" / "render_runtime.py"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "stage"
+            result = subprocess.run(
+                [
+                    sys.executable, str(runtime),
+                    "--config-dir", str(root / "config"),
+                    "--services", "chatgpt",
+                    "--public-ip", "203.0.113.10",
+                    "--doh-host", "dns.example.com",
+                    "--doh-token", "a" * 48,
+                    "--password-hash", "$2a$10$hash",
+                    "--certificate-root", "/etc/letsencrypt/live/dns.example.com",
+                    "--webroot", "/var/www/adguardhome-doh",
+                    "--output", str(output),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn(
+                "  rewrites: []",
+                (output / "AdGuardHome.yaml").read_text(encoding="utf-8"),
+            )
+
+    def test_installer_passes_the_persisted_health_state_to_the_renderer(self):
+        source = (Path(__file__).resolve().parents[1] / "deploy" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("adguardhome_doh_healthy_services", source)
+        self.assertIn('"$STATE_DIR/health-state.json"', source)
+        self.assertIn("--healthy-services", source)
 
 
 if __name__ == "__main__":

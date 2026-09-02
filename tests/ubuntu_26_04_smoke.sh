@@ -99,23 +99,29 @@ cat > "$MOCK_BIN/certbot" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 domain=
-standalone=0
-pre_hook=
-post_hook=
+webroot=
+webroot_path=
+deploy_hook=
 while (($#)); do
     case "$1" in
         -d) domain="$2"; shift 2 ;;
-        --standalone) standalone=1; shift ;;
-        --pre-hook) pre_hook="$2"; shift 2 ;;
-        --post-hook) post_hook="$2"; shift 2 ;;
+        --webroot) webroot=1; shift ;;
+        --webroot-path) webroot_path="$2"; shift 2 ;;
+        --deploy-hook) deploy_hook="$2"; shift 2 ;;
+        --standalone|--pre-hook|--post-hook)
+            printf 'certbot must not stop nginx to answer the challenge\n' >&2
+            exit 1 ;;
         *) shift ;;
     esac
 done
 [[ -n "$domain" ]]
-[[ "$standalone" -eq 1 ]]
-[[ "$pre_hook" == "systemctl stop nginx" ]]
-[[ "$post_hook" == "systemctl start nginx" ]]
-bash -c "$pre_hook"
+[[ "$webroot" == 1 ]]
+[[ "$webroot_path" == /var/www/adguardhome-doh ]]
+[[ "$deploy_hook" == "systemctl reload nginx" ]]
+# The challenge directory has to be writable and served while nginx keeps
+# running; a real HTTP-01 exchange fails otherwise.
+mkdir -p "$webroot_path/.well-known/acme-challenge"
+printf 'token\n' > "$webroot_path/.well-known/acme-challenge/smoke-token"
 certificate_root="/etc/letsencrypt/live/$domain"
 mkdir -p "$certificate_root"
 /usr/bin/openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
@@ -126,7 +132,16 @@ mkdir -p "$certificate_root"
 install -m 644 "$certificate_root/fullchain.pem" \
     /usr/local/share/ca-certificates/adguardhome-doh-smoke.crt
 update-ca-certificates >/dev/null
-bash -c "$post_hook"
+mkdir -p /etc/letsencrypt/renewal
+cat > "/etc/letsencrypt/renewal/$domain.conf" <<PROFILE
+version = 2.9.0
+archive_dir = /etc/letsencrypt/archive/$domain
+[renewalparams]
+account = 0123456789abcdef
+authenticator = standalone
+pre_hook = systemctl stop nginx
+post_hook = systemctl start nginx
+PROFILE
 EOF
 chmod 755 "$MOCK_BIN/certbot"
 
@@ -198,4 +213,19 @@ if install_once >/tmp/adguardhome-doh-failed-health.out 2>&1; then
     printf 'installer ignored a failed health-check\n' >&2
     exit 1
 fi
+renewal_profile="/etc/letsencrypt/renewal/$DOMAIN.conf"
+grep -Fq 'authenticator = webroot' "$renewal_profile"
+grep -Fq "$DOMAIN = /var/www/adguardhome-doh" "$renewal_profile"
+! grep -Fq 'pre_hook' "$renewal_profile"
+! grep -Fq 'post_hook' "$renewal_profile"
+test -f "$renewal_profile.pre-webroot"
+grep -Eq '^[[:space:]]*worker_connections 8192;' /etc/nginx/nginx.conf
+grep -Fq 'worker_rlimit_nofile 65535;' /etc/nginx/nginx.conf
+grep -Fq 'Restart=on-failure' /etc/systemd/system/nginx.service.d/adguardhome-doh.conf
+grep -Fq 'limit_req_zone $binary_remote_addr zone=adguardhome_doh_login' \
+    /etc/nginx/sites-enabled/adguardhome-doh
+grep -Fq 'auth_attempts: 0' /opt/AdGuardHome/AdGuardHome.yaml
+grep -Fq 'cache_optimistic: true' /opt/AdGuardHome/AdGuardHome.yaml
+grep -Fq 'upstream_timeout: 4s' /opt/AdGuardHome/AdGuardHome.yaml
+
 printf 'ubuntu 26.04 install smoke: ok\n'

@@ -8,6 +8,7 @@ remain active while any selected healthy service owns them.
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import json
 import os
@@ -27,7 +28,11 @@ CREDENTIALS = Path(os.environ.get("ADGUARDHOME_DOH_CREDENTIALS", "/var/lib/adgua
 PUBLIC_IP = os.environ.get("ADGUARDHOME_DOH_PUBLIC_IP", "127.0.0.1")
 LOCK = Path(os.environ.get("ADGUARDHOME_DOH_LOCK", "/run/lock/adguardhome-doh-health.lock"))
 SUCCESS_THRESHOLD = int(os.environ.get("ADGUARDHOME_DOH_SUCCESS_THRESHOLD", "3"))
-FAILURE_THRESHOLD = int(os.environ.get("ADGUARDHOME_DOH_FAILURE_THRESHOLD", "2"))
+# Disabling a rewrite sends clients to the real address of a service they
+# reach through this server on purpose, and the client then caches that answer
+# for the upstream TTL.  A short outage must therefore cost several minutes of
+# probing before anything is withdrawn.
+FAILURE_THRESHOLD = int(os.environ.get("ADGUARDHOME_DOH_FAILURE_THRESHOLD", "5"))
 MAX_CONCURRENT_PROBES = 8
 
 
@@ -262,7 +267,7 @@ def credentials() -> Dict[str, str]:
 
 def api(method: str, path: str, cookie: str, body: Optional[Mapping[str, Any]] = None) -> Any:
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
-    headers = {"Cookie": cookie}
+    headers = dict(_auth_header(cookie))
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = Request(AGH_URL + path, data=data, headers=headers, method=method)
@@ -276,8 +281,35 @@ def api(method: str, path: str, cookie: str, body: Optional[Mapping[str, Any]] =
         return None
 
 
+def _auth_header(credential: str) -> Dict[str, str]:
+    """Map a credential produced by :func:`login` onto its HTTP header."""
+
+    if credential.startswith("Basic "):
+        return {"Authorization": credential}
+    return {"Cookie": credential}
+
+
 def login() -> str:
+    """Return an authorization credential for the local AdGuard Home API.
+
+    Basic authentication is preferred because this worker authenticates once a
+    minute forever: a session cookie would leave one stored session per run in
+    AdGuard Home's session database for the whole ``session_ttl``.  Releases
+    without Basic authentication still get a session cookie.
+    """
+
     values = credentials()
+    token = base64.b64encode(
+        ("%s:%s" % (values["login"], values["password"])).encode("utf-8")
+    ).decode("ascii")
+    basic = "Basic " + token
+    request = Request(AGH_URL + "/control/status", headers={"Authorization": basic})
+    try:
+        with urlopen(request, timeout=8) as response:
+            if 200 <= response.status < 300:
+                return basic
+    except Exception:
+        pass
     body = json.dumps({"name": values["login"], "password": values["password"]}).encode()
     request = Request(AGH_URL + "/control/login", data=body,
                       headers={"Content-Type": "application/json"})
@@ -334,6 +366,19 @@ def reconcile(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP)
     return changes, len(desired)
 
 
+def is_global_failure(results: Mapping[str, bool]) -> bool:
+    """Report whether every probed service failed in the same cycle.
+
+    Services fail independently; they do not all break at the same second.  A
+    clean sweep means the fault is local - nginx down, the resolver dead, the
+    host's uplink gone - and withdrawing every rewrite in response would only
+    push clients onto addresses this server exists to reroute, for as long as
+    they cache them.  The gate therefore holds its previous state instead.
+    """
+
+    return len(results) > 1 and not any(results.values())
+
+
 def run_once(
     *,
     policy_path: Path = POLICY,
@@ -346,13 +391,28 @@ def run_once(
     old = load_json(state_path, {})
     with health_lock(lock_path):
         results = probe_services(policy, probe_func=probe_func)
-        state, transitions = update_health_state(old, results)
+        global_failure = is_global_failure(results)
+        if global_failure:
+            state = {
+                service_id: {
+                    "healthy": bool(old.get(service_id, {}).get("healthy", False))
+                    if isinstance(old, Mapping) else False,
+                    "successes": 0,
+                    "failures": int(old.get(service_id, {}).get("failures", 0) or 0)
+                    if isinstance(old, Mapping) else 0,
+                }
+                for service_id in sorted(results)
+            }
+            transitions: list = []
+        else:
+            state, transitions = update_health_state(old, results)
         save_json(state_path, state)
         reconcile_call = reconcile_func or reconcile
         changes, active = reconcile_call(policy, state, PUBLIC_IP)
     healthy = sum(1 for item in state.values() if item.get("healthy", False))
     return {"healthy_services": healthy, "active_rules": active,
-            "transitions": len(transitions), "changes": changes}
+            "transitions": len(transitions), "changes": changes,
+            "global_failure": int(global_failure)}
 
 
 def main() -> int:
@@ -366,9 +426,9 @@ def main() -> int:
         # private endpoint data into the unit journal.
         print("health check failed: %s" % type(exc).__name__)
         return 1
-    print("healthy_services=%d active_rules=%d transitions=%d changes=%d" % (
+    print("healthy_services=%d active_rules=%d transitions=%d changes=%d global_failure=%d" % (
         summary["healthy_services"], summary["active_rules"],
-        summary["transitions"], summary["changes"]))
+        summary["transitions"], summary["changes"], summary.get("global_failure", 0)))
     return 0
 
 

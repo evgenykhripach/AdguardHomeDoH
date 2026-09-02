@@ -62,6 +62,89 @@ adguardhome_doh_ensure_nginx_stream_include() {
     rm -f -- "$rendered"
 }
 
+adguardhome_doh_ensure_nginx_worker_limits() {
+    # One DoH connection occupies a stream slot, an internal TLS slot and an
+    # upstream slot at the same time, and the SNI listener carries the whole
+    # HTTPS traffic of every routed service on top of that.  Ubuntu's default
+    # of 768 connections per worker is reached long before the host is busy,
+    # and once it is, nginx stops accepting *everything*: DNS, the panel and
+    # SNI forwarding all fail together until connections drain.
+    #
+    # This is a capacity improvement, not an activation requirement: an
+    # unfamiliar nginx.conf is left exactly as it is and reported, never
+    # half-edited, and never a reason to fail an update.
+    local nginx_conf="${1:-/etc/nginx/nginx.conf}"
+    local connections="${2:-8192}" nofile="${3:-65535}" rendered has_rlimit
+    [[ -f "$nginx_conf" ]] || {
+        printf 'warning: nginx.conf is missing, worker limits unchanged: %s\n' "$nginx_conf" >&2
+        return 1
+    }
+    [[ "$connections" =~ ^[1-9][0-9]*$ ]] || adguardhome_doh_die "invalid worker_connections: $connections"
+    [[ "$nofile" =~ ^[1-9][0-9]*$ ]] || adguardhome_doh_die "invalid worker_rlimit_nofile: $nofile"
+    has_rlimit=0
+    grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]' "$nginx_conf" && has_rlimit=1
+    rendered="$(mktemp)"
+    if ! awk -v connections="$connections" -v nofile="$nofile" -v has_rlimit="$has_rlimit" '
+        /^[[:space:]]*worker_rlimit_nofile[[:space:]]/ {
+            print "worker_rlimit_nofile " nofile ";"; rlimit_done = 1; next
+        }
+        !events_seen && /^[[:space:]]*events[[:space:]]*\{/ && /\}/ {
+            line = $0
+            if (line ~ /worker_connections[[:space:]]+[0-9]+;/) {
+                sub(/worker_connections[[:space:]]+[0-9]+;/, "worker_connections " connections ";", line)
+            } else {
+                sub(/\}[[:space:]]*$/, "worker_connections " connections "; }", line)
+            }
+            if (!has_rlimit && !rlimit_done) { print "worker_rlimit_nofile " nofile ";"; rlimit_done = 1 }
+            print line; events_seen = 1; connections_done = 1; next
+        }
+        !events_seen && /^[[:space:]]*events[[:space:]]*\{/ {
+            if (!has_rlimit && !rlimit_done) { print "worker_rlimit_nofile " nofile ";"; rlimit_done = 1 }
+            print; events_seen = 1; in_events = 1; next
+        }
+        in_events && /^[[:space:]]*worker_connections[[:space:]]/ {
+            print "\tworker_connections " connections ";"; connections_done = 1; next
+        }
+        in_events && /^[[:space:]]*\}/ {
+            if (!connections_done) { print "\tworker_connections " connections ";"; connections_done = 1 }
+            in_events = 0; print; next
+        }
+        { print }
+        END { if (!rlimit_done || !connections_done) exit 42 }
+    ' "$nginx_conf" > "$rendered"; then
+        rm -f -- "$rendered"
+        printf 'warning: unrecognised nginx.conf layout, worker limits unchanged: %s\n' \
+            "$nginx_conf" >&2
+        return 1
+    fi
+    cat "$rendered" > "$nginx_conf"
+    rm -f -- "$rendered"
+}
+
+adguardhome_doh_install_nginx_restart_dropin() {
+    # nginx ships without a restart policy on Ubuntu, so a worker crash or an
+    # OOM kill leaves the whole endpoint down until somebody logs in.
+    local root="${1:-/}" directory
+    directory="$(adguardhome_doh_under_root "$root" /etc/systemd/system/nginx.service.d)"
+    mkdir -p "$directory"
+    cat > "$directory/adguardhome-doh.conf" <<'UNIT'
+[Service]
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65535
+UNIT
+    chmod 644 "$directory/adguardhome-doh.conf"
+}
+
+adguardhome_doh_migrate_certbot_renewal() {
+    local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" profile helper
+    profile="$(adguardhome_doh_under_root "$root" "/etc/letsencrypt/renewal/$domain.conf")"
+    helper="$project_root/deploy/lib/certbot_renewal.py"
+    [[ -f "$helper" ]] || helper=/usr/local/libexec/adguardhome-doh/certbot_renewal.py
+    [[ -f "$profile" && -f "$helper" ]] || return 0
+    python3 "$helper" --path "$profile" --domain "$domain" --webroot "$webroot"
+}
+
 adguardhome_doh_load_or_create_doh_token() {
     local token_file="$1" token temporary old_umask
     if [[ -f "$token_file" ]]; then
@@ -180,6 +263,7 @@ adguardhome_doh_install_health_templates() {
     [[ -f "$project_root/tools/render_config.py" ]] || adguardhome_doh_die "render_config.py is missing"
     [[ -f "$project_root/deploy/lib/render_runtime.py" ]] || adguardhome_doh_die "render_runtime.py is missing"
     [[ -f "$project_root/deploy/lib/releases.py" ]] || adguardhome_doh_die "releases.py is missing"
+    [[ -f "$project_root/deploy/lib/certbot_renewal.py" ]] || adguardhome_doh_die "certbot_renewal.py is missing"
     [[ -f "$project_root/VERSION" ]] || adguardhome_doh_die "VERSION is missing"
     mkdir -p "$libexec" "$systemd"
     chmod 700 "$libexec"
@@ -194,6 +278,7 @@ adguardhome_doh_install_health_templates() {
     install -m 755 "$project_root/tools/render_config.py" "$libexec/render_config.py"
     install -m 755 "$project_root/deploy/lib/render_runtime.py" "$libexec/render_runtime.py"
     install -m 755 "$project_root/deploy/lib/releases.py" "$libexec/releases.py"
+    install -m 755 "$project_root/deploy/lib/certbot_renewal.py" "$libexec/certbot_renewal.py"
     install -m 644 "$project_root/VERSION" "$libexec/VERSION"
 }
 

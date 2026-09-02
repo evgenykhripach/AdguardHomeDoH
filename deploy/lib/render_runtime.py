@@ -18,6 +18,7 @@ try:
         render_mobileconfig,
         render_nginx_http,
         render_nginx_stream,
+        render_rewrites,
     )
 except ModuleNotFoundError:
     # The manager runs this file after it has been installed outside the
@@ -36,6 +37,7 @@ except ModuleNotFoundError:
     render_mobileconfig = renderer.render_mobileconfig
     render_nginx_http = renderer.render_nginx_http
     render_nginx_stream = renderer.render_nginx_stream
+    render_rewrites = renderer.render_rewrites
 
 
 def render_service_health_policy(catalog, selected, rows):
@@ -110,6 +112,8 @@ def main(argv=None):
 
     catalog = None
     selected = []
+    healthy = split_services(args.healthy_services)
+    seeded_rewrites = []
     if args.config_dir is not None:
         catalog = Catalog.load(args.config_dir)
         selected = catalog.default_service_ids
@@ -118,13 +122,22 @@ def main(argv=None):
         # nginx must retain the full enabled-service union.  Health state is
         # applied later by the service-level gate to AdGuard rewrites.
         rows = catalog.enabled_policy(selected)
+        if healthy:
+            # Activation restarts AdGuard Home with this file, discarding the
+            # rewrites the gate had added over the API.  Services that were
+            # already healthy are written back immediately, so no client
+            # resolves a routed service to its real address in between.
+            seeded_rewrites = render_rewrites(
+                catalog.enabled_policy(selected, healthy), args.public_ip
+            )
     else:
         if args.services is not None or args.healthy_services is not None:
             parser.error("--services and --healthy-services require --config-dir")
         rows = load_policy(args.policy)
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     (args.output / "AdGuardHome.yaml").write_text(
-        render_adguard_yaml(rows, args.password_hash), encoding="utf-8"
+        render_adguard_yaml(rows, args.password_hash, rewrites=seeded_rewrites),
+        encoding="utf-8",
     )
     (args.output / "nginx-http.conf").write_text(
         render_nginx_http(args.doh_host, args.doh_token,

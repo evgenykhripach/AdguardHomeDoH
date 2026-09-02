@@ -15,7 +15,9 @@ UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/adguardhome-doh
+# ProtectSystem=strict mounts /run read-only as well, so the run lock needs an
+# explicit exception; without it every cycle fails before probing anything.
+ReadWritePaths=/var/lib/adguardhome-doh /run/lock
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true

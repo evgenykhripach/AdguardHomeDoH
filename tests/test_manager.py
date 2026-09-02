@@ -729,5 +729,77 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual("before\n", target.read_text(encoding="utf-8"))
 
 
+class ServiceChangeSeedingTests(unittest.TestCase):
+    """Changing services must not drop a working service for a probe cycle."""
+
+    def build_root(self, directory):
+        root = Path(directory)
+        project = Path(__file__).resolve().parents[1]
+        (root / "var/lib/adguardhome-doh").mkdir(parents=True)
+        (root / "etc/adguardhome-doh/catalog").mkdir(parents=True)
+        for name in ("services.csv", "domains.csv", "service-domains.csv",
+                     "service-probes.csv"):
+            (root / "etc/adguardhome-doh/catalog" / name).write_bytes(
+                (project / "config" / name).read_bytes()
+            )
+        (root / "var/lib/adguardhome-doh/health-state.json").write_text(
+            json.dumps({"chatgpt": {"healthy": True}, "claude": {"healthy": False}}),
+            encoding="utf-8",
+        )
+        (root / "var/lib/adguardhome-doh/install.json").write_text(
+            json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10"}),
+            encoding="utf-8",
+        )
+        (root / "var/lib/adguardhome-doh/doh-token").write_text("a" * 48, encoding="utf-8")
+        (root / "opt/AdGuardHome").mkdir(parents=True)
+        (root / "opt/AdGuardHome/AdGuardHome.yaml").write_text(
+            "users:\n  - name: admin\n    password: $2a$10$hash\n", encoding="utf-8"
+        )
+        return root
+
+    def test_render_command_passes_healthy_services_as_a_complete_pair(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            captured = {}
+            real_run = subprocess.run
+
+            def fake_run(command, **kwargs):
+                captured["command"] = list(command)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+                try:
+                    manager.apply_service_change(
+                        ["chatgpt", "claude"], root=root, validator=lambda: None
+                    )
+                except Exception:
+                    # Reloading live units is skipped for a non-/ root; the
+                    # rendered command is what this test is about.
+                    pass
+
+        command = captured.get("command")
+        self.assertIsNotNone(command)
+        # A flag spliced into the wrong position would corrupt its neighbour.
+        self.assertEqual("203.0.113.10", command[command.index("--public-ip") + 1])
+        self.assertEqual("chatgpt", command[command.index("--healthy-services") + 1])
+        self.assertEqual("chatgpt,claude", command[command.index("--services") + 1])
+
+    def test_healthy_services_ignores_unselected_and_unproven_services(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            paths = manager._runtime_paths(root)
+
+            self.assertEqual(
+                ["chatgpt"], manager.healthy_services(paths, ["chatgpt", "claude"])
+            )
+            self.assertEqual([], manager.healthy_services(paths, ["claude"]))
+
+            (root / "var/lib/adguardhome-doh/health-state.json").write_text(
+                "not json", encoding="utf-8"
+            )
+            self.assertEqual([], manager.healthy_services(paths, ["chatgpt"]))
+
 if __name__ == "__main__":
     unittest.main()

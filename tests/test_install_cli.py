@@ -523,5 +523,140 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual("a" * 48, values["password"])
 
 
+    def test_certificate_issuance_never_stops_nginx(self):
+        """Stopping nginx to renew takes DNS down for every client."""
+
+        source = INSTALL.read_text(encoding="utf-8")
+
+        self.assertIn('certbot certonly --webroot --webroot-path "$WEBROOT"', source)
+        self.assertIn("--deploy-hook 'systemctl reload nginx'", source)
+        self.assertNotIn("--standalone", source)
+        self.assertNotIn("--pre-hook", source)
+        self.assertNotIn("--post-hook", source)
+        # Servers installed before this change keep their stored hooks until
+        # the profile is migrated, so an update has to rewrite it.
+        self.assertIn("adguardhome_doh_migrate_certbot_renewal", source)
+
+    def test_runtime_units_recover_without_an_operator(self):
+        source = INSTALL.read_text(encoding="utf-8")
+
+        self.assertIn("Restart=always", source)
+        self.assertIn("StartLimitIntervalSec=0", source)
+        self.assertIn("adguardhome_doh_install_nginx_restart_dropin", source)
+        self.assertIn("adguardhome_doh_ensure_nginx_worker_limits", source)
+        self.assertIn("ADGUARDHOME_DOH_FAILURE_THRESHOLD=5", source)
+
+    def run_common(self, script, *args):
+        common = ROOT / "deploy" / "lib" / "common.sh"
+        return subprocess.run(
+            ["bash", "-c", 'source "$1"; shift; ' + script, "bash", str(common), *args],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_nginx_worker_limits_are_raised_idempotently(self):
+        """One DoH connection costs three slots; 768 is reached far too soon."""
+
+        default_conf = (
+            "user www-data;\nworker_processes auto;\npid /run/nginx.pid;\n"
+            "\nevents {\n\tworker_connections 768;\n}\n\nhttp {\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nginx.conf"
+            conf.write_text(default_conf, encoding="utf-8")
+
+            result = self.run_common(
+                'adguardhome_doh_ensure_nginx_worker_limits "$1"', str(conf)
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            once = conf.read_text(encoding="utf-8")
+            self.assertIn("worker_rlimit_nofile 65535;", once)
+            self.assertIn("worker_connections 8192;", once)
+            self.assertNotIn("worker_connections 768;", once)
+
+            result = self.run_common(
+                'adguardhome_doh_ensure_nginx_worker_limits "$1"', str(conf)
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(once, conf.read_text(encoding="utf-8"))
+            self.assertEqual(1, once.count("worker_rlimit_nofile"))
+            self.assertEqual(1, once.count("worker_connections"))
+
+    def test_nginx_worker_limits_keep_an_existing_rlimit_in_place(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nginx.conf"
+            conf.write_text(
+                "user www-data;\nevents {\n}\nworker_rlimit_nofile 1024;\nhttp {\n}\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_common(
+                'adguardhome_doh_ensure_nginx_worker_limits "$1"', str(conf)
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            updated = conf.read_text(encoding="utf-8")
+            # A duplicate directive would make nginx refuse to start at all.
+            self.assertEqual(1, updated.count("worker_rlimit_nofile"))
+            self.assertIn("worker_rlimit_nofile 65535;", updated)
+            self.assertIn("worker_connections 8192;", updated)
+
+    def test_nginx_worker_limits_handle_a_single_line_events_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nginx.conf"
+            conf.write_text(
+                "user www-data;\nevents { worker_connections 768; }\nhttp {\n}\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_common(
+                'adguardhome_doh_ensure_nginx_worker_limits "$1"', str(conf)
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            updated = conf.read_text(encoding="utf-8")
+            self.assertIn("events { worker_connections 8192; }", updated)
+            self.assertIn("worker_rlimit_nofile 65535;", updated)
+            self.assertEqual(1, updated.count("worker_connections"))
+
+    def test_nginx_worker_limits_leave_an_unfamiliar_file_untouched(self):
+        """Capacity tuning must never half-edit nginx.conf or fail an update."""
+
+        original = "http {\n}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nginx.conf"
+            conf.write_text(original, encoding="utf-8")
+
+            result = self.run_common(
+                'adguardhome_doh_ensure_nginx_worker_limits "$1"', str(conf)
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("warning", result.stderr)
+            self.assertEqual(original, conf.read_text(encoding="utf-8"))
+            # The installer tolerates the warning instead of aborting.
+            self.assertIn(
+                "adguardhome_doh_ensure_nginx_worker_limits || true",
+                INSTALL.read_text(encoding="utf-8"),
+            )
+
+    def test_nginx_restart_dropin_is_installed_under_the_target_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_common(
+                'adguardhome_doh_install_nginx_restart_dropin "$1"', directory
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            dropin = Path(directory) / "etc/systemd/system/nginx.service.d/adguardhome-doh.conf"
+            self.assertIn("Restart=on-failure", dropin.read_text(encoding="utf-8"))
+            self.assertEqual(0o644, dropin.stat().st_mode & 0o777)
+
+    def test_health_unit_can_write_its_run_lock(self):
+        """ProtectSystem=strict makes /run read-only for the unit."""
+
+        unit = (ROOT / "deploy" / "templates" / "healthcheck.service").read_text(encoding="utf-8")
+
+        self.assertIn("ReadWritePaths=/var/lib/adguardhome-doh /run/lock", unit)
+        self.assertIn("ProtectSystem=strict", unit)
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,7 @@ def main():
         ROOT / "deploy/install.sh",
         ROOT / "deploy/manage.py",
         ROOT / "deploy/lib/releases.py",
+        ROOT / "deploy/lib/certbot_renewal.py",
         ROOT / "config/policy.csv",
         ROOT / "config/services.csv",
         ROOT / "config/domains.csv",

@@ -28,6 +28,7 @@ REQUIRED_FILES = (
     "bootstrap.sh",
     "deploy/install.sh",
     "deploy/manage.py",
+    "deploy/lib/certbot_renewal.py",
     "config/services.csv",
     "config/domains.csv",
     "config/service-domains.csv",

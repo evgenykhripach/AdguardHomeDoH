@@ -6,13 +6,32 @@ import csv
 import ipaddress
 import json
 import re
+import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+NGINX_VERSION_RE = re.compile(r"nginx/(\d+)\.(\d+)\.(\d+)")
+
+# Encrypted upstreams keep queries private.  The IP-addressed fallbacks need no
+# bootstrap resolution and are used only when every upstream stops answering:
+# an Apple client with an installed DoH profile has no plain-DNS fallback of
+# its own, so a server-side dead end takes the whole device offline.
+DEFAULT_UPSTREAM_DNS = (
+    "https://dns10.quad9.net/dns-query",
+    "https://dns.cloudflare.com/dns-query",
+    "https://dns.google/dns-query",
+)
+DEFAULT_BOOTSTRAP_DNS = ("9.9.9.10", "149.112.112.10", "1.1.1.1", "8.8.8.8")
+DEFAULT_FALLBACK_DNS = ("tls://1.1.1.1", "tls://8.8.8.8", "1.1.1.1", "8.8.8.8")
+# nginx stream cannot route SNI without a working resolver, so the list spans
+# three operators instead of one.
+DEFAULT_STREAM_RESOLVERS = ("9.9.9.10", "149.112.112.10", "1.1.1.1", "8.8.8.8")
+# nginx 1.25.1 replaced the "listen ... http2" parameter with a directive.
+HTTP2_DIRECTIVE_VERSION = (1, 25, 1)
 
 
 @dataclass(frozen=True)
@@ -345,12 +364,18 @@ def render_rewrites_yaml(rows: Sequence[PolicyRow], public_ip: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams=None) -> str:
-    upstreams = list(upstreams or [
-        "https://dns10.quad9.net/dns-query",
-        "https://dns.cloudflare.com/dns-query",
-        "https://dns.google/dns-query",
-    ])
+def render_adguard_yaml(
+    rows: Sequence[PolicyRow],
+    password_hash: str,
+    upstreams=None,
+    *,
+    bootstrap=None,
+    fallbacks=None,
+    rewrites: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
+    upstreams = list(upstreams or DEFAULT_UPSTREAM_DNS)
+    bootstrap = list(bootstrap or DEFAULT_BOOTSTRAP_DNS)
+    fallbacks = list(fallbacks or DEFAULT_FALLBACK_DNS)
     if not password_hash or "\n" in password_hash:
         raise ValueError("password hash is required")
     lines = [
@@ -370,8 +395,14 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "users:",
         "  - name: admin",
         "    password: %s" % password_hash,
-        "auth_attempts: 5",
-        "block_auth_min: 15",
+        # AdGuard Home keys its login lockout on the TCP peer address and
+        # deliberately ignores forwarded headers, so behind nginx every client
+        # shares the 127.0.0.1 counter: five failed attempts from anyone on the
+        # internet would lock the panel - and the local health worker - for
+        # every client at once.  Brute force is throttled in nginx instead,
+        # per the limit_req zone in the generated site configuration.
+        "auth_attempts: 0",
+        "block_auth_min: 0",
         "http_proxy: \"\"",
         "language: ru",
         "theme: auto",
@@ -388,12 +419,12 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "  upstream_dns:",
     ]
     lines.extend("    - %s" % upstream for upstream in upstreams)
+    lines.append("  upstream_dns_file: \"\"")
+    lines.append("  bootstrap_dns:")
+    lines.extend("    - %s" % server for server in bootstrap)
+    lines.append("  fallback_dns:")
+    lines.extend("    - %s" % server for server in fallbacks)
     lines.extend([
-        "  upstream_dns_file: \"\"",
-        "  bootstrap_dns:",
-        "    - 9.9.9.10",
-        "    - 149.112.112.10",
-        "  fallback_dns: []",
         "  upstream_mode: parallel",
         "  fastest_timeout: 1s",
         "  allowed_clients: []",
@@ -407,9 +438,12 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "    - ::1/128",
         "  cache_enabled: true",
         "  cache_size: 4194304",
-        "  cache_ttl_min: 0",
+        # A short upstream TTL must not turn a brief upstream outage into a
+        # dead client: answers are held for a minute and stale entries are
+        # still served while they are refreshed in the background.
+        "  cache_ttl_min: 60",
         "  cache_ttl_max: 0",
-        "  cache_optimistic: false",
+        "  cache_optimistic: true",
         "  bogus_nxdomain: []",
         "  aaaa_disabled: false",
         "  enable_dnssec: true",
@@ -422,7 +456,9 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "  ipset: []",
         "  ipset_file: \"\"",
         "  bootstrap_prefer_ipv6: false",
-        "  upstream_timeout: 10s",
+        # Apple's resolver gives up well before ten seconds; a shorter budget
+        # leaves room for the fallback servers to answer instead.
+        "  upstream_timeout: 4s",
         "  private_networks: []",
         "  use_private_ptr_resolvers: true",
         "  local_ptr_upstreams: []",
@@ -466,8 +502,25 @@ def render_adguard_yaml(rows: Sequence[PolicyRow], password_hash: str, upstreams
         "  blocking_mode: default",
         "  blocking_ipv4: \"\"",
         "  blocking_ipv6: \"\"",
-        "  rewrites: []",
     ])
+    # Activation replaces this file wholesale and restarts AdGuard Home, which
+    # drops the rewrites the health gate had added through the API.  Until the
+    # next gate cycle re-adds them, clients would resolve routed services to
+    # their real addresses and cache that answer for the upstream TTL - an
+    # update would cause exactly the outage this project exists to avoid.
+    # Seeding the file with the rewrites that were already healthy closes that
+    # window; the gate then finds them in place and changes nothing.
+    rewrites = list(rewrites or [])
+    if not rewrites:
+        lines.append("  rewrites: []")
+    else:
+        lines.append("  rewrites:")
+        for item in rewrites:
+            lines.extend([
+                "    - domain: '%s'" % item["domain"],
+                "      answer: %s" % item["answer"],
+                "      enabled: %s" % ("true" if item.get("enabled", True) else "false"),
+            ])
     lines.extend([
         "  rewrites_enabled: true",
         "  filtering_enabled: true",
@@ -524,11 +577,62 @@ def render_mobileconfig(doh_host: str, doh_token: str, public_ip: str) -> str:
     )
 
 
-def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webroot: str) -> str:
+def nginx_version(runner=subprocess.run) -> Optional[Tuple[int, int, int]]:
+    """Return the locally installed nginx version, or None when unknown."""
+
+    try:
+        result = runner(
+            ["nginx", "-v"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = getattr(result, "stdout", b"") or b""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    match = NGINX_VERSION_RE.search(output)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def use_http2_directive(version: Optional[Tuple[int, int, int]] = None, runner=subprocess.run) -> bool:
+    """Decide which HTTP/2 syntax the installed nginx accepts.
+
+    nginx 1.25.1 introduced ``http2 on;`` and deprecated the ``listen ...
+    http2`` parameter; older releases (Ubuntu 24.04 ships nginx 1.24) only
+    understand the parameter and reject the directive outright.  An unknown
+    version falls back to the parameter, which every supported release still
+    accepts.
+    """
+
+    if version is None:
+        version = nginx_version(runner)
+    if version is None:
+        return False
+    return version >= HTTP2_DIRECTIVE_VERSION
+
+
+def render_nginx_http(
+    doh_host: str,
+    doh_token: str,
+    certificate_root: str,
+    webroot: str,
+    *,
+    http2_directive: Optional[bool] = None,
+) -> str:
     doh_host = _hostname(doh_host, "doh-host")
     if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
         raise ValueError("doh-token must be lowercase hexadecimal")
+    if http2_directive is None:
+        http2_directive = use_http2_directive()
+    listen_tls = "    listen 127.0.0.1:4443 ssl%s;" % ("" if http2_directive else " http2")
     lines = [
+        # Every request reaches this server through the stream listener, so the
+        # peer address is always 127.0.0.1 and the zone is a deliberate global
+        # budget rather than a per-client one.  It exists so that unattended
+        # brute force cannot flood AdGuard Home's login endpoint.
+        "limit_req_zone $binary_remote_addr zone=adguardhome_doh_login:1m rate=30r/m;",
         "server {",
         "    listen 80;",
         "    listen [::]:80;",
@@ -541,11 +645,18 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "    location / { return 301 https://$host$request_uri; }",
         "}",
         "server {",
-        "    listen 127.0.0.1:4443 ssl;",
+        listen_tls,
+    ]
+    if http2_directive:
+        lines.append("    http2 on;")
+    lines.extend([
         "    server_name %s;" % doh_host,
         "    ssl_certificate %s/fullchain.pem;" % certificate_root,
         "    ssl_certificate_key %s/privkey.pem;" % certificate_root,
         "    ssl_protocols TLSv1.2 TLSv1.3;",
+        # Without a cache the session timeout resumes nothing; Apple clients
+        # reconnect constantly, so resumption keeps the handshake cost down.
+        "    ssl_session_cache shared:adguardhome_doh:10m;",
         "    ssl_session_timeout 1d;",
         "    add_header Strict-Transport-Security \"max-age=31536000\" always;",
         "    client_max_body_size 2m;",
@@ -568,6 +679,17 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "        proxy_read_timeout 30s;",
         "        access_log off;",
         "    }",
+        "    location = /control/login {",
+        "        limit_req zone=adguardhome_doh_login burst=5 nodelay;",
+        "        limit_req_status 429;",
+        "        proxy_pass http://127.0.0.1:3001;",
+        "        proxy_http_version 1.1;",
+        "        proxy_set_header Host $host;",
+        "        proxy_set_header X-Forwarded-For $remote_addr;",
+        "        proxy_set_header X-Forwarded-Proto https;",
+        "        proxy_buffering off;",
+        "        proxy_read_timeout 30s;",
+        "    }",
         "    location / {",
         "        proxy_pass http://127.0.0.1:3001;",
         "        proxy_http_version 1.1;",
@@ -579,7 +701,7 @@ def render_nginx_http(doh_host: str, doh_token: str, certificate_root: str, webr
         "    }",
         "}",
         "",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -598,11 +720,14 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
         lines.append("        %s $ssl_preread_server_name:443;" % name)
     lines.extend([
         "    }",
-        "    resolver 9.9.9.10 149.112.112.10 valid=60s ipv4=on ipv6=off;",
+        "    resolver %s valid=60s ipv4=on ipv6=off;" % " ".join(DEFAULT_STREAM_RESOLVERS),
+        "    resolver_timeout 5s;",
         "    server {",
         "        listen 443;",
         "        proxy_connect_timeout 5s;",
-        "        proxy_timeout 10m;",
+        # Long-lived streaming responses (chat completions, websockets) idle
+        # for minutes at a time; ten minutes cut them mid-answer.
+        "        proxy_timeout 1h;",
         "        proxy_pass $adguardhome_doh_backend;",
         "        ssl_preread on;",
         "        access_log off;",

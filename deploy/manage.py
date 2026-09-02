@@ -717,6 +717,19 @@ def render_main_screen(
         print(_style(_clip(notice, width), ANSI_YELLOW, output), file=output)
 
 
+def healthy_services(paths: Mapping[str, Path], selected: Iterable[str]) -> list:
+    """Return selected services the gate currently considers healthy."""
+
+    state = _read_json(paths["health_state"], {})
+    if not isinstance(state, Mapping):
+        return []
+    return [
+        service_id for service_id in selected
+        if isinstance(state.get(str(service_id)), Mapping)
+        and state.get(str(service_id), {}).get("healthy", False)
+    ]
+
+
 def apply_service_change(
     selected: Sequence[str],
     *,
@@ -754,6 +767,13 @@ def apply_service_change(
                        "--password-hash", password_hash,
                        "--certificate-root", "/etc/letsencrypt/live/%s" % state["domain"],
                        "--webroot", str(paths["webroot"]), "--output", str(stage)]
+            # Activation restarts AdGuard Home, discarding the rewrites the
+            # health gate keeps over the API.  Services already proven healthy
+            # are written straight into the new file so that changing the
+            # selection never drops a working service for a probe cycle.
+            healthy = healthy_services(paths, selected)
+            if healthy:
+                command.extend(["--healthy-services", ",".join(healthy)])
             subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
             renderer(stage, selected)

@@ -36,9 +36,9 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "adguardhome-doh-1.0.0"
-            for relative in ("VERSION", "bootstrap.sh", "deploy/install.sh", "deploy/manage.py",
-                             "config/services.csv", "config/domains.csv",
-                             "config/service-domains.csv", "config/service-probes.csv"):
+            from deploy.lib.releases import REQUIRED_FILES
+
+            for relative in REQUIRED_FILES:
                 path = source / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("1.0.0\n" if relative == "VERSION" else "ok\n", encoding="utf-8")
@@ -47,8 +47,14 @@ class ReleaseTests(unittest.TestCase):
             checksum = root / "adguardhome-doh.tar.gz.sha256"
             checksum.write_text("%s  adguardhome-doh.tar.gz\n" %
                                 hashlib.sha256(archive.read_bytes()).hexdigest(), encoding="utf-8")
+            members = verify_archive(archive, checksum, version="1.0.0")
             self.assertTrue(any(item.endswith("/VERSION") or item == "VERSION"
-                                for item in verify_archive(archive, checksum, version="1.0.0")))
+                                for item in members))
+            # A release that cannot migrate a certbot profile would leave the
+            # standalone renewal hooks in place on every updated server.
+            self.assertIn("deploy/lib/certbot_renewal.py", REQUIRED_FILES)
+            self.assertTrue(any(item.endswith("/deploy/lib/certbot_renewal.py")
+                                for item in members))
             checksum.write_text("0" * 64 + "  adguardhome-doh.tar.gz\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 verify_archive(archive, checksum, version="1.0.0")

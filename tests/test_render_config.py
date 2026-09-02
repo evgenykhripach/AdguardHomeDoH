@@ -10,12 +10,14 @@ from pathlib import Path
 from tools.render_config import (
     Catalog,
     load_policy,
+    nginx_version,
     render,
     render_adguard_yaml,
     render_nginx_http,
     render_nginx_stream,
     render_rewrites,
     render_mobileconfig,
+    use_http2_directive,
 )
 
 
@@ -154,9 +156,11 @@ class RenderConfigTests(unittest.TestCase):
             path.unlink()
         nginx = render_nginx_stream(rows, "dns.example.com")
         self.assertIn(
-            "resolver 9.9.9.10 149.112.112.10 valid=60s ipv4=on ipv6=off;",
+            "resolver 9.9.9.10 149.112.112.10 1.1.1.1 8.8.8.8 valid=60s ipv4=on ipv6=off;",
             nginx,
         )
+        self.assertIn("resolver_timeout 5s;", nginx)
+        self.assertIn("proxy_timeout 1h;", nginx)
         self.assertIn(".oaiusercontent.com $ssl_preread_server_name:443;", nginx)
         self.assertIn("api.fitbit.com $ssl_preread_server_name:443;", nginx)
         self.assertNotIn("*.api.fitbit.com", nginx)
@@ -164,6 +168,115 @@ class RenderConfigTests(unittest.TestCase):
             "files.oaiusercontent.com",
             next(row.probe for row in rows if row.domain == "oaiusercontent.com"),
         )
+
+    def test_resolver_survives_a_single_upstream_operator_failing(self):
+        """A DoH client has no plain-DNS fallback, so the server must have one."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        adguard = render_adguard_yaml(rows, "$2a$10$hash")
+
+        self.assertIn("  fallback_dns:\n    - tls://1.1.1.1", adguard)
+        self.assertNotIn("  fallback_dns: []", adguard)
+        # Bootstrap must not depend on one operator: without it no DoH
+        # upstream hostname resolves and the server answers nothing at all.
+        for server in ("9.9.9.10", "149.112.112.10", "1.1.1.1", "8.8.8.8"):
+            self.assertIn("    - %s" % server, adguard)
+        self.assertIn("  upstream_timeout: 4s", adguard)
+        self.assertNotIn("  upstream_timeout: 10s", adguard)
+        self.assertIn("  cache_optimistic: true", adguard)
+        self.assertIn("  cache_ttl_min: 60", adguard)
+
+    def test_panel_lockout_is_delegated_to_nginx_rate_limiting(self):
+        """AdGuard keys its lockout on the proxy address shared by everyone."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        adguard = render_adguard_yaml(rows, "$2a$10$hash")
+        http = render_nginx_http(
+            "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com",
+            "/var/www/html", http2_directive=False,
+        )
+
+        self.assertIn("auth_attempts: 0", adguard)
+        self.assertNotIn("auth_attempts: 5", adguard)
+        self.assertIn(
+            "limit_req_zone $binary_remote_addr zone=adguardhome_doh_login:1m rate=30r/m;",
+            http,
+        )
+        login_block = http.split("    location = /control/login {", 1)[1].split("    }", 1)[0]
+        self.assertIn("limit_req zone=adguardhome_doh_login burst=5 nodelay;", login_block)
+        # DNS resolution itself must never be throttled.
+        doh_block = http.split("    location = /doh/" + "a" * 48 + " {", 1)[1].split("    }", 1)[0]
+        self.assertNotIn("limit_req", doh_block)
+
+    def test_http2_syntax_follows_the_installed_nginx_release(self):
+        legacy = render_nginx_http(
+            "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com",
+            "/var/www/html", http2_directive=False,
+        )
+        modern = render_nginx_http(
+            "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com",
+            "/var/www/html", http2_directive=True,
+        )
+
+        # Ubuntu 24.04 ships nginx 1.24, which rejects the directive outright.
+        self.assertIn("    listen 127.0.0.1:4443 ssl http2;", legacy)
+        self.assertNotIn("http2 on;", legacy)
+        # nginx 1.25.1+ deprecated the listen parameter in favour of it.
+        self.assertIn("    listen 127.0.0.1:4443 ssl;", modern)
+        self.assertIn("    http2 on;", modern)
+        self.assertIn("ssl_session_cache shared:adguardhome_doh:10m;", legacy)
+
+    def test_http2_style_detection_reads_the_nginx_version_banner(self):
+        class Result:
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        self.assertEqual(
+            (1, 24, 0),
+            nginx_version(lambda *a, **k: Result(b"nginx version: nginx/1.24.0 (Ubuntu)")),
+        )
+        self.assertFalse(use_http2_directive(runner=lambda *a, **k: Result(b"nginx/1.24.0")))
+        self.assertFalse(use_http2_directive(runner=lambda *a, **k: Result(b"nginx/1.25.0")))
+        self.assertTrue(use_http2_directive(runner=lambda *a, **k: Result(b"nginx/1.25.1")))
+        self.assertTrue(use_http2_directive(runner=lambda *a, **k: Result(b"nginx/1.28.0")))
+
+        def missing(*args, **kwargs):
+            raise OSError("nginx is not installed")
+
+        # An unknown version must render what every supported release accepts.
+        self.assertIsNone(nginx_version(missing))
+        self.assertFalse(use_http2_directive(runner=missing))
+
+    def test_healthy_rewrites_are_seeded_into_the_activated_configuration(self):
+        """An update restarts AdGuard and drops the gate's API rewrites."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+
+        empty = render_adguard_yaml(rows, "$2a$10$hash")
+        seeded = render_adguard_yaml(
+            rows, "$2a$10$hash",
+            rewrites=render_rewrites(rows, "203.0.113.10"),
+        )
+
+        self.assertIn("  rewrites: []", empty)
+        self.assertNotIn("  rewrites: []", seeded)
+        self.assertIn("    - domain: 'example.com'", seeded)
+        self.assertIn("    - domain: '*.example.com'", seeded)
+        self.assertIn("      answer: 203.0.113.10", seeded)
+        self.assertIn("      enabled: true", seeded)
+        self.assertIn("  rewrites_enabled: true", seeded)
 
     def test_runtime_renderers_escape_only_validated_values(self):
         path = self.write_policy([("example.com", "suffix", "")])

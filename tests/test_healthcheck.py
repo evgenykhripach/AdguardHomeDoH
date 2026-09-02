@@ -146,6 +146,120 @@ class HealthcheckTests(unittest.TestCase):
             deleted,
         )
 
+    def test_a_total_probe_sweep_keeps_the_previous_state(self):
+        """A fault that takes out every service at once is local, not remote."""
+
+        health = load_healthcheck()
+        policy = {
+            "services": {"chatgpt": ["chatgpt.com"], "claude": ["claude.ai"]},
+            "domains": [
+                {"domain": "chatgpt.com", "kind": "suffix", "services": ["chatgpt"]},
+                {"domain": "claude.ai", "kind": "suffix", "services": ["claude"]},
+            ],
+        }
+        self.assertTrue(health.is_global_failure({"chatgpt": False, "claude": False}))
+        self.assertFalse(health.is_global_failure({"chatgpt": False, "claude": True}))
+        # One configured service cannot be told apart from a local fault.
+        self.assertFalse(health.is_global_failure({"chatgpt": False}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy_path = root / "health-policy.json"
+            state_path = root / "health-state.json"
+            policy_path.write_text(json.dumps(policy), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "chatgpt": {"healthy": True, "successes": 9, "failures": 0},
+                "claude": {"healthy": True, "successes": 9, "failures": 0},
+            }), encoding="utf-8")
+            reconciled = {}
+
+            def fake_reconcile(policy_value, state_value, public_ip):
+                reconciled.update(state_value)
+                return 0, len(health.desired_rules(policy_value, state_value, public_ip))
+
+            summary = health.run_once(
+                policy_path=policy_path, state_path=state_path,
+                lock_path=root / "health.lock",
+                probe_func=lambda host: False, reconcile_func=fake_reconcile,
+            )
+
+        self.assertEqual(1, summary["global_failure"])
+        self.assertEqual(2, summary["healthy_services"])
+        self.assertEqual(0, summary["transitions"])
+        # Rewrites stay in place; withdrawing them would send clients to the
+        # very addresses this server exists to reroute, for a cached TTL.
+        self.assertEqual(4, summary["active_rules"])
+        self.assertTrue(all(item["healthy"] for item in reconciled.values()))
+
+    def test_failure_threshold_defaults_to_five_cycles(self):
+        health = load_healthcheck()
+        self.assertEqual(5, health.FAILURE_THRESHOLD)
+        self.assertEqual(3, health.SUCCESS_THRESHOLD)
+
+    def test_api_prefers_basic_auth_over_accumulating_sessions(self):
+        """One session per minute would fill the session store for 30 days."""
+
+        health = load_healthcheck()
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(request, timeout=None):
+            requests.append((request.full_url, dict(request.header_items())))
+            return Response()
+
+        with mock.patch.object(health, "credentials", return_value={"login": "admin", "password": "secret"}), \
+                mock.patch.object(health, "urlopen", side_effect=fake_urlopen):
+            credential = health.login()
+
+        self.assertEqual("Basic YWRtaW46c2VjcmV0", credential)
+        self.assertNotIn("/control/login", requests[0][0])
+        self.assertEqual({"Authorization": credential}, health._auth_header(credential))
+        self.assertEqual({"Cookie": "sid=x"}, health._auth_header("sid=x"))
+
+    def test_login_falls_back_to_a_session_when_basic_auth_is_refused(self):
+        health = load_healthcheck()
+
+        class Response:
+            def __init__(self, headers):
+                self._headers = headers
+
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            @property
+            def headers(self):
+                return self._headers
+
+        class Headers:
+            @staticmethod
+            def get_all(name):
+                return ["agh_session=abc; Path=/"]
+
+        def fake_urlopen(request, timeout=None):
+            if request.full_url.endswith("/control/status"):
+                raise OSError("401 unauthorized")
+            return Response(Headers())
+
+        with mock.patch.object(health, "credentials", return_value={"login": "admin", "password": "secret"}), \
+                mock.patch.object(health, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual("agh_session=abc", health.login())
+
 
 if __name__ == "__main__":
     unittest.main()

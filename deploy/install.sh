@@ -98,6 +98,29 @@ print(",".join(Catalog.load(Path(sys.argv[1]) / "config").default_service_ids))
 PY
 }
 
+adguardhome_doh_healthy_services() {
+    # Services the gate had already proven healthy before this activation.
+    local state_file="$1"
+    [[ -f "$state_file" ]] || return 0
+    python3 - "$state_file" <<'HEALTHY' || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        state = json.load(stream)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if not isinstance(state, dict):
+    raise SystemExit(0)
+print(",".join(
+    str(service_id)
+    for service_id, item in sorted(state.items())
+    if isinstance(item, dict) and item.get("healthy") is True
+))
+HEALTHY
+}
+
 adguardhome_doh_confirm_install() {
     local answer
     while :; do
@@ -310,7 +333,15 @@ adguardhome_doh_backup /etc/nginx/stream.d/adguardhome-doh.conf "$backup/nginx-s
 if ((POLICY_ARGUMENT)); then
     adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN"         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 else
-    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --config-dir "$PROJECT_ROOT/config" --services "$SERVICES"         --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN"         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
+    HEALTHY_SERVICES="$(adguardhome_doh_healthy_services "$STATE_DIR/health-state.json")"
+    healthy_args=()
+    [[ -n "$HEALTHY_SERVICES" ]] && healthy_args=(--healthy-services "$HEALTHY_SERVICES")
+    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py" \
+        --config-dir "$PROJECT_ROOT/config" --services "$SERVICES" \
+        ${healthy_args[@]+"${healthy_args[@]}"} \
+        --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN" \
+        --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH" \
+        --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 fi
 adguardhome_doh_progress 65 'конфигурация подготовлена'
 
@@ -318,6 +349,9 @@ install -m 640 "$stage/AdGuardHome.yaml" /opt/AdGuardHome/AdGuardHome.yaml
 install -m 644 "$stage/nginx-stream.conf" /etc/nginx/stream.d/adguardhome-doh.conf
 install -m 644 "$stage/$DOMAIN.mobileconfig" "$WEBROOT/$DOMAIN.mobileconfig"
 adguardhome_doh_ensure_nginx_stream_include
+# Capacity tuning must never block an activation: a warning is enough.
+adguardhome_doh_ensure_nginx_worker_limits || true
+adguardhome_doh_install_nginx_restart_dropin /
 cat > /etc/nginx/sites-enabled/adguardhome-doh <<EOF
 server {
     listen 80;
@@ -342,7 +376,12 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/AdGuardHome
 ExecStart=/opt/AdGuardHome/AdGuardHome -c /opt/AdGuardHome/AdGuardHome.yaml -w /var/lib/AdGuardHome
-Restart=on-failure
+# Clients with an installed DoH profile have no DNS at all while this process
+# is down, so it is restarted unconditionally and without a give-up limit.
+Restart=always
+RestartSec=2s
+StartLimitIntervalSec=0
+LimitNOFILE=65535
 User=root
 NoNewPrivileges=true
 ProtectHome=read-only
@@ -361,7 +400,7 @@ ADGUARDHOME_DOH_STATE=$STATE_DIR/health-state.json
 ADGUARDHOME_DOH_CREDENTIALS=$CREDENTIALS_FILE
 ADGUARDHOME_DOH_PUBLIC_IP=$PUBLIC_IP
 ADGUARDHOME_DOH_SUCCESS_THRESHOLD=3
-ADGUARDHOME_DOH_FAILURE_THRESHOLD=2
+ADGUARDHOME_DOH_FAILURE_THRESHOLD=5
 EOF
 chmod 600 /etc/adguardhome-doh/runtime.env
 
@@ -390,8 +429,17 @@ adguardhome_doh_run_logged systemctl restart adguardhome-doh
 adguardhome_doh_run_logged systemctl start nginx
 adguardhome_doh_progress 85 'службы запущены'
 if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
+    # HTTP-01 is answered from the webroot nginx already serves on port 80, so
+    # issuance and every later renewal keep DNS, the panel and SNI forwarding
+    # online instead of stopping nginx for the length of the ACME exchange.
     mapfile -t certbot_contact_args < <(adguardhome_doh_certbot_contact_args "$EMAIL")
-    adguardhome_doh_run_logged certbot certonly --standalone -d "$DOMAIN"         "${certbot_contact_args[@]}" --pre-hook 'systemctl stop nginx'         --post-hook 'systemctl start nginx' --agree-tos --non-interactive --keep-until-expiring
+    adguardhome_doh_run_logged certbot certonly --webroot --webroot-path "$WEBROOT" \
+        -d "$DOMAIN" "${certbot_contact_args[@]}" --deploy-hook 'systemctl reload nginx' \
+        --agree-tos --non-interactive --keep-until-expiring
+else
+    adguardhome_doh_run_logged adguardhome_doh_migrate_certbot_renewal \
+        / "$DOMAIN" "$WEBROOT" "$PROJECT_ROOT" ||
+        printf 'warning: certbot renewal profile was not migrated to webroot\n' >&2
 fi
 install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/adguardhome-doh
 adguardhome_doh_run_logged nginx -t
