@@ -143,8 +143,18 @@ def main(argv=None):
         render_nginx_http(args.doh_host, args.doh_token,
                           args.certificate_root, args.webroot), encoding="utf-8"
     )
+    # The profile scopes DoH to the whole catalog rather than to the selected
+    # services, so changing the selection never requires reinstalling it.
+    if catalog is not None:
+        match_domains = {row.domain for row in catalog.full_policy()}
+    else:
+        match_domains = {row.domain for row in rows}
     (args.output / (args.doh_host + ".mobileconfig")).write_text(
-        render_mobileconfig(args.doh_host, args.doh_token, args.public_ip), encoding="utf-8"
+        render_mobileconfig(
+            args.doh_host, args.doh_token, args.public_ip,
+            match_domains=sorted(match_domains),
+        ),
+        encoding="utf-8",
     )
     (args.output / "nginx-stream.conf").write_text(
         render_nginx_stream(rows, args.doh_host), encoding="utf-8"

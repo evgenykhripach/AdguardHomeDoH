@@ -208,6 +208,13 @@ grep -Fiq "Content-Disposition: attachment; filename=$DOMAIN.mobileconfig" \
 grep -Fq "https://$DOMAIN/doh/$second_token" /tmp/adguardhome-doh.mobileconfig
 test "$(grep -Foc "<key>PayloadDisplayName</key><string>$DOMAIN</string>" \
     /tmp/adguardhome-doh.mobileconfig)" -eq 2
+grep -Fq '<key>SupplementalMatchDomains</key>' /tmp/adguardhome-doh.mobileconfig
+grep -Fq '<string>chatgpt.com</string>' /tmp/adguardhome-doh.mobileconfig
+grep -Fq '<key>AllowFailover</key><true/>' /tmp/adguardhome-doh.mobileconfig
+# The ClientID variant of the public path must be closed as well.
+test "$(curl --silent --insecure --resolve "$DOMAIN:443:127.0.0.1" \
+    --output /dev/null --write-out '%{http_code}' \
+    "https://$DOMAIN/dns-query/smoke?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB")" = 404
 touch /tmp/adguardhome-doh-force-health-failure
 if install_once >/tmp/adguardhome-doh-failed-health.out 2>&1; then
     printf 'installer ignored a failed health-check\n' >&2
@@ -227,5 +234,9 @@ grep -Fq 'limit_req_zone $binary_remote_addr zone=adguardhome_doh_login' \
 grep -Fq 'auth_attempts: 0' /opt/AdGuardHome/AdGuardHome.yaml
 grep -Fq 'cache_optimistic: true' /opt/AdGuardHome/AdGuardHome.yaml
 grep -Fq 'upstream_timeout: 4s' /opt/AdGuardHome/AdGuardHome.yaml
+grep -Fq 'blocked_response_ttl: 300' /opt/AdGuardHome/AdGuardHome.yaml
+grep -Fq 'so_keepalive=30s:10s:3' /etc/nginx/stream.d/adguardhome-doh.conf
+grep -Fq 'net.ipv4.tcp_mtu_probing = 1' /etc/sysctl.d/90-adguardhome-doh.conf
+grep -Fq 'ADGUARDHOME_DOH_DOMAIN=dns.example.com' /etc/adguardhome-doh/runtime.env
 
 printf 'ubuntu 26.04 install smoke: ok\n'

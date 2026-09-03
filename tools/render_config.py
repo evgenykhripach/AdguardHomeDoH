@@ -385,10 +385,11 @@ def render_adguard_yaml(
         "    enabled: false",
         "  doh:",
         "    routes:",
+        # Only the tokenized nginx location reaches these routes.  The
+        # ClientID variants are deliberately absent: they would answer on
+        # /dns-query/<anything>, which no token protects.
         "      - GET /dns-query",
         "      - POST /dns-query",
-        "      - GET /dns-query/{ClientID}",
-        "      - POST /dns-query/{ClientID}",
         "    insecure_enabled: true",
         "  address: 127.0.0.1:3001",
         "  session_ttl: 30d",
@@ -502,6 +503,13 @@ def render_adguard_yaml(
         "  blocking_mode: default",
         "  blocking_ipv4: \"\"",
         "  blocking_ipv6: \"\"",
+        # Rewritten answers carry this TTL; since schema 23 the key lives
+        # under "filtering", and AdGuard Home silently drops it anywhere
+        # else when it rewrites the file.  The default of ten seconds makes
+        # a phone re-ask for every routed domain six times a minute; on a
+        # cellular path each round trip is a chance to stall, and the answer
+        # cannot change between two gate cycles anyway.
+        "  blocked_response_ttl: 300",
     ])
     # Activation replaces this file wholesale and restarts AdGuard Home, which
     # drops the rewrites the health gate had added through the API.  Until the
@@ -552,18 +560,42 @@ def render_adguard_yaml(
     return "\n".join(lines)
 
 
-def render_mobileconfig(doh_host: str, doh_token: str, public_ip: str) -> str:
+def render_mobileconfig(
+    doh_host: str,
+    doh_token: str,
+    public_ip: str,
+    *,
+    match_domains: Optional[Iterable[str]] = None,
+    allow_failover: bool = True,
+) -> str:
     doh_host = _hostname(doh_host, "doh-host")
     public_ip = _public_ipv4(public_ip)
     if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
         raise ValueError("doh-token must be lowercase hexadecimal")
     profile_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "adguardhome-doh-profile:" + doh_host))
     payload_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "adguardhome-doh-payload:" + doh_host))
+    # Without SupplementalMatchDomains the profile sends every query of the
+    # device here, and Apple offers no plain-DNS fallback: any hiccup on the
+    # path from a phone to this host - carrier NAT, a network hand-over, a
+    # throttled hosting range - takes the whole device offline, not just the
+    # routed services.  Scoped to the catalog, an unreachable server costs
+    # exactly the domains it exists to route.  Apple matches a bare domain
+    # against itself and every subdomain.  AllowFailover (iOS 26+) lets the
+    # device fall back to the system resolver on top of that.
+    domains = sorted({_hostname(item, "match-domain") for item in (match_domains or ())})
+    supplemental = ""
+    if domains:
+        supplemental = (
+            "<key>SupplementalMatchDomains</key><array>"
+            + "".join("<string>%s</string>" % item for item in domains)
+            + "</array>"
+        )
+    failover = "<key>AllowFailover</key><%s/>" % ("true" if allow_failover else "false")
     return """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>PayloadContent</key><array><dict>
-<key>DNSSettings</key><dict><key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://{host}/doh/{token}</string><key>ServerAddresses</key><array><string>{public_ip}</string></array></dict>
+<key>DNSSettings</key><dict>{failover}<key>DNSProtocol</key><string>HTTPS</string><key>ServerURL</key><string>https://{host}/doh/{token}</string><key>ServerAddresses</key><array><string>{public_ip}</string></array>{supplemental}</dict>
 <key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{payload_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadType</key><string>com.apple.dnsSettings.managed</string><key>PayloadUUID</key><string>{payload_id}</string><key>PayloadVersion</key><integer>1</integer>
 </dict></array>
 <key>PayloadDisplayName</key><string>{host}</string><key>PayloadIdentifier</key><string>com.adguardhome.doh.{profile_id}</string><key>PayloadOrganization</key><string>AdGuard Home DoH</string><key>PayloadScope</key><string>System</string><key>PayloadRemovalDisallowed</key><false/><key>PayloadType</key><string>Configuration</string><key>PayloadUUID</key><string>{profile_id}</string><key>PayloadVersion</key><integer>1</integer>
@@ -574,6 +606,8 @@ def render_mobileconfig(doh_host: str, doh_token: str, public_ip: str) -> str:
         public_ip=public_ip,
         payload_id=payload_id,
         profile_id=profile_id,
+        failover=failover,
+        supplemental=supplemental,
     )
 
 
@@ -660,6 +694,10 @@ def render_nginx_http(
         "    ssl_session_timeout 1d;",
         "    add_header Strict-Transport-Security \"max-age=31536000\" always;",
         "    client_max_body_size 2m;",
+        # Apple multiplexes every query of the device over one HTTP/2
+        # connection; closing it after the default thousand requests forces
+        # a reconnect in the middle of a burst of lookups.
+        "    keepalive_requests 100000;",
         "    location = /%s.mobileconfig {" % doh_token,
         "        root %s;" % webroot,
         "        default_type application/x-apple-aspen-config;",
@@ -668,7 +706,10 @@ def render_nginx_http(
         "        access_log off;",
         "        try_files /%s.mobileconfig =404;" % doh_host,
         "    }",
-        "    location = /dns-query { return 404; }",
+        # The prefix form also covers /dns-query/<ClientID>, which AdGuard
+        # Home serves as an untokenized DoH endpoint; an exact match left
+        # that path open to anyone on the internet.
+        "    location ^~ /dns-query { return 404; }",
         "    location = /doh/%s {" % doh_token,
         "        proxy_pass http://127.0.0.1:3001/dns-query;",
         "        proxy_http_version 1.1;",
@@ -723,7 +764,13 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
         "    resolver %s valid=60s ipv4=on ipv6=off;" % " ".join(DEFAULT_STREAM_RESOLVERS),
         "    resolver_timeout 5s;",
         "    server {",
-        "        listen 443;",
+        # Carrier NAT drops idle mappings silently.  Keepalive probes from
+        # this side keep the mapping alive while a phone's HTTP/2 connection
+        # idles, and detect a vanished peer within a minute instead of
+        # holding a dead slot for the whole proxy_timeout.
+        "        listen 443 so_keepalive=30s:10s:3;",
+        "        listen [::]:443 so_keepalive=30s:10s:3;",
+        "        proxy_socket_keepalive on;",
         "        proxy_connect_timeout 5s;",
         # Long-lived streaming responses (chat completions, websockets) idle
         # for minutes at a time; ten minutes cut them mid-answer.

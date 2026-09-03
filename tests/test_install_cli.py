@@ -545,6 +545,9 @@ class InstallerCliTests(unittest.TestCase):
         self.assertIn("adguardhome_doh_install_nginx_restart_dropin", source)
         self.assertIn("adguardhome_doh_ensure_nginx_worker_limits", source)
         self.assertIn("ADGUARDHOME_DOH_FAILURE_THRESHOLD=5", source)
+        self.assertIn("adguardhome_doh_install_sysctl / || true", source)
+        self.assertIn("ADGUARDHOME_DOH_DOMAIN=$DOMAIN", source)
+        self.assertIn("ADGUARDHOME_DOH_TOKEN_FILE=$DOH_TOKEN_FILE", source)
 
     def run_common(self, script, *args):
         common = ROOT / "deploy" / "lib" / "common.sh"
@@ -649,6 +652,18 @@ class InstallerCliTests(unittest.TestCase):
             dropin = Path(directory) / "etc/systemd/system/nginx.service.d/adguardhome-doh.conf"
             self.assertIn("Restart=on-failure", dropin.read_text(encoding="utf-8"))
             self.assertEqual(0o644, dropin.stat().st_mode & 0o777)
+
+    def test_kernel_parameters_for_mobile_clients_are_installed_under_the_target_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_common('adguardhome_doh_install_sysctl "$1"', directory)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            conf = Path(directory) / "etc/sysctl.d/90-adguardhome-doh.conf"
+            text = conf.read_text(encoding="utf-8")
+            self.assertIn("net.ipv4.tcp_mtu_probing = 1", text)
+            self.assertEqual(0o644, conf.stat().st_mode & 0o777)
+            # BBR is only enabled on a live host where the module can be probed.
+            self.assertNotIn("bbr", text)
 
     def test_health_unit_can_write_its_run_lock(self):
         """ProtectSystem=strict makes /run read-only for the unit."""

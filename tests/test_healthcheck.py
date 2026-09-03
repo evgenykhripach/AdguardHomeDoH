@@ -191,6 +191,69 @@ class HealthcheckTests(unittest.TestCase):
         self.assertEqual(4, summary["active_rules"])
         self.assertTrue(all(item["healthy"] for item in reconciled.values()))
 
+    def test_doh_self_probe_walks_the_public_path_from_loopback(self):
+        health = load_healthcheck()
+        commands = []
+
+        class Result:
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def runner(command, **kwargs):
+            commands.append(command)
+            return Result(b"200 application/dns-message")
+
+        self.assertTrue(health.probe_doh("dns.example.com", "a" * 48, runner=runner, attempts=1))
+        command = commands[0]
+        self.assertIn("--resolve", command)
+        self.assertIn("dns.example.com:443:127.0.0.1", command)
+        self.assertTrue(command[-1].startswith("https://dns.example.com/doh/" + "a" * 48 + "?dns="))
+        self.assertFalse(health.probe_doh(
+            "dns.example.com", "a" * 48, attempts=1,
+            runner=lambda command, **kwargs: Result(b"404 text/html"),
+        ))
+        self.assertFalse(health.probe_doh(
+            "dns.example.com", "a" * 48, attempts=1,
+            runner=lambda command, **kwargs: Result(b"200 application/json"),
+        ))
+
+    def test_doh_probe_target_needs_a_domain_and_a_saved_token(self):
+        health = load_healthcheck()
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "doh-token"
+            self.assertIsNone(health.doh_probe_target("dns.example.com", token_file))
+            token_file.write_text("b" * 48 + "\n", encoding="utf-8")
+            self.assertEqual(
+                ("dns.example.com", "b" * 48),
+                health.doh_probe_target("dns.example.com", token_file),
+            )
+            self.assertIsNone(health.doh_probe_target("", token_file))
+            token_file.write_text("not-a-token\n", encoding="utf-8")
+            self.assertIsNone(health.doh_probe_target("dns.example.com", token_file))
+
+    def test_run_once_reports_the_doh_self_probe_without_touching_state(self):
+        health = load_healthcheck()
+        policy = {
+            "services": {"chatgpt": ["chatgpt.com"]},
+            "domains": [{"domain": "chatgpt.com", "kind": "suffix", "services": ["chatgpt"]}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "health-policy.json").write_text(json.dumps(policy), encoding="utf-8")
+            common = dict(
+                policy_path=root / "health-policy.json", state_path=root / "health-state.json",
+                lock_path=root / "health.lock", probe_func=lambda host: True,
+                reconcile_func=lambda *args: (0, 0),
+            )
+            failed = health.run_once(doh_probe_func=lambda: False, **common)
+            state = json.loads((root / "health-state.json").read_text(encoding="utf-8"))
+            unconfigured = health.run_once(**common)
+
+        self.assertEqual(0, failed["doh_ok"])
+        # The self-probe is diagnostic only: the state file keeps service IDs.
+        self.assertEqual({"chatgpt"}, set(state))
+        self.assertEqual(-1, unconfigured["doh_ok"])
+
     def test_failure_threshold_defaults_to_five_cycles(self):
         health = load_healthcheck()
         self.assertEqual(5, health.FAILURE_THRESHOLD)

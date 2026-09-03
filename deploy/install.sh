@@ -352,6 +352,7 @@ adguardhome_doh_ensure_nginx_stream_include
 # Capacity tuning must never block an activation: a warning is enough.
 adguardhome_doh_ensure_nginx_worker_limits || true
 adguardhome_doh_install_nginx_restart_dropin /
+adguardhome_doh_install_sysctl / || true
 cat > /etc/nginx/sites-enabled/adguardhome-doh <<EOF
 server {
     listen 80;
@@ -399,6 +400,8 @@ ADGUARDHOME_DOH_POLICY=$CONFIG_DIR/health-policy.json
 ADGUARDHOME_DOH_STATE=$STATE_DIR/health-state.json
 ADGUARDHOME_DOH_CREDENTIALS=$CREDENTIALS_FILE
 ADGUARDHOME_DOH_PUBLIC_IP=$PUBLIC_IP
+ADGUARDHOME_DOH_DOMAIN=$DOMAIN
+ADGUARDHOME_DOH_TOKEN_FILE=$DOH_TOKEN_FILE
 ADGUARDHOME_DOH_SUCCESS_THRESHOLD=3
 ADGUARDHOME_DOH_FAILURE_THRESHOLD=5
 EOF

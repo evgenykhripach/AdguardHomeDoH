@@ -25,12 +25,19 @@ class RenderConfigTests(unittest.TestCase):
     def test_mobileconfig_uses_system_scope_for_macos_dns_settings(self):
         token = "a" * 48
         payload = plistlib.loads(
-            render_mobileconfig("dns.example.com", token, "203.0.113.10").encode("utf-8")
+            render_mobileconfig(
+                "dns.example.com", token, "203.0.113.10",
+                match_domains=["openai.com", "chatgpt.com", "OpenAI.com"],
+            ).encode("utf-8")
         )
 
         self.assertEqual("System", payload["PayloadScope"])
         dns_settings = payload["PayloadContent"][0]["DNSSettings"]
         self.assertEqual("HTTPS", dns_settings["DNSProtocol"])
+        # Scoped to the routed domains, an unreachable server costs exactly
+        # those domains instead of every lookup on the device.
+        self.assertEqual(["chatgpt.com", "openai.com"], dns_settings["SupplementalMatchDomains"])
+        self.assertIs(True, dns_settings["AllowFailover"])
         self.assertEqual(
             "https://dns.example.com/doh/" + token,
             dns_settings["ServerURL"],
@@ -49,6 +56,16 @@ class RenderConfigTests(unittest.TestCase):
         for public_ip in ("not-an-ip", "2001:db8::10"):
             with self.assertRaises(ValueError):
                 render_mobileconfig("dns.example.com", "a" * 48, public_ip)
+
+    def test_mobileconfig_without_match_domains_keeps_the_device_wide_scope(self):
+        payload = plistlib.loads(
+            render_mobileconfig("dns.example.com", "a" * 48, "203.0.113.10").encode("utf-8")
+        )
+        self.assertNotIn("SupplementalMatchDomains", payload["PayloadContent"][0]["DNSSettings"])
+        with self.assertRaises(ValueError):
+            render_mobileconfig(
+                "dns.example.com", "a" * 48, "203.0.113.10", match_domains=["bad host"]
+            )
 
     def test_runtime_renderer_imports_when_installed_next_to_renderer(self):
         root = Path(__file__).resolve().parents[1]
@@ -97,6 +114,16 @@ class RenderConfigTests(unittest.TestCase):
             ["203.0.113.10"],
             payload["PayloadContent"][0]["DNSSettings"]["ServerAddresses"],
         )
+        with (root / "config" / "domains.csv").open(encoding="utf-8", newline="") as stream:
+            catalog_domains = sorted(row["domain"] for row in csv.DictReader(stream))
+        # The whole catalog is listed even though only ChatGPT is selected, so
+        # a later service change never requires reinstalling the profile.
+        self.assertEqual(
+            catalog_domains,
+            payload["PayloadContent"][0]["DNSSettings"]["SupplementalMatchDomains"],
+        )
+        self.assertIn("spotify.com", catalog_domains)
+        self.assertIs(True, payload["PayloadContent"][0]["DNSSettings"]["AllowFailover"])
 
     def write_policy(self, rows):
         handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", delete=False)
@@ -313,6 +340,54 @@ class RenderConfigTests(unittest.TestCase):
             http.rsplit("    location / {", 1)[1].split("    }", 1)[0],
         )
         self.assertNotIn("listen 443 ssl", http)
+
+    def test_routed_answers_outlive_a_cellular_stall(self):
+        """Ten-second answers make a phone re-ask six times a minute."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        adguard = render_adguard_yaml(rows, "$2a$10$hash")
+
+        self.assertIn("  blocked_response_ttl: 300", adguard)
+
+    def test_untokenized_doh_paths_are_closed(self):
+        """AdGuard also answers on /dns-query/<ClientID>, which no token guards."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        adguard = render_adguard_yaml(rows, "$2a$10$hash")
+        http = render_nginx_http(
+            "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com",
+            "/var/www/html", http2_directive=False,
+        )
+
+        self.assertIn("    location ^~ /dns-query { return 404; }", http)
+        self.assertNotIn("location = /dns-query {", http)
+        self.assertIn("      - POST /dns-query", adguard)
+        self.assertNotIn("{ClientID}", adguard)
+
+    def test_listeners_keep_carrier_nat_mappings_alive(self):
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        stream = render_nginx_stream(rows, "dns.example.com")
+        http = render_nginx_http(
+            "dns.example.com", "a" * 48, "/etc/letsencrypt/live/dns.example.com",
+            "/var/www/html", http2_directive=False,
+        )
+
+        self.assertIn("        listen 443 so_keepalive=30s:10s:3;", stream)
+        self.assertIn("        listen [::]:443 so_keepalive=30s:10s:3;", stream)
+        self.assertIn("        proxy_socket_keepalive on;", stream)
+        self.assertIn("    keepalive_requests 100000;", http)
 
     def test_catalog_rows_render_deterministically_for_selected_services(self):
         root = Path(__file__).resolve().parents[1]

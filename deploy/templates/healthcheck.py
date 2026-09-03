@@ -12,8 +12,10 @@ import base64
 import fcntl
 import json
 import os
+import re
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,6 +36,11 @@ SUCCESS_THRESHOLD = int(os.environ.get("ADGUARDHOME_DOH_SUCCESS_THRESHOLD", "3")
 # probing before anything is withdrawn.
 FAILURE_THRESHOLD = int(os.environ.get("ADGUARDHOME_DOH_FAILURE_THRESHOLD", "5"))
 MAX_CONCURRENT_PROBES = 8
+DOMAIN = os.environ.get("ADGUARDHOME_DOH_DOMAIN", "")
+TOKEN_FILE = Path(os.environ.get("ADGUARDHOME_DOH_TOKEN_FILE", "/var/lib/adguardhome-doh/doh-token"))
+HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+# The RFC 8484 example query: A for www.example.com, base64url without padding.
+DOH_PROBE_QUERY = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
 
 
 class LockBusy(RuntimeError):
@@ -153,6 +160,74 @@ def probe(host: str) -> bool:
         return False
     text = result.stdout.decode("utf-8", "replace")
     return result.returncode == 0 and "Protocol version:" in text and "Peer certificate" in text
+
+
+def doh_probe_target(domain: str = DOMAIN, token_file: Path = TOKEN_FILE) -> Optional[Tuple[str, str]]:
+    """Return ``(domain, token)`` for the DoH self-probe, or None when unset."""
+
+    domain = (domain or "").strip().lower()
+    if not HOST_RE.fullmatch(domain):
+        return None
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not re.fullmatch(r"[a-f0-9]{32,64}", token):
+        return None
+    return domain, token
+
+
+def probe_doh(
+    domain: str,
+    token: str,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+    attempts: int = 3,
+    delay: float = 2.0,
+) -> bool:
+    """Resolve one name over the public DoH path exactly as a client does.
+
+    The service probes prove only that nginx forwards SNI.  A phone with the
+    profile installed crosses nginx, the internal TLS listener, AdGuard Home
+    and its upstreams in a single request; this probe walks that same chain
+    from loopback so the journal can tell a dead DoH path from a dead route
+    between the phone and this host.
+    """
+
+    command = [
+        "/usr/bin/curl", "--silent", "--show-error",
+        "--resolve", "%s:443:127.0.0.1" % domain,
+        "--connect-timeout", "3", "--max-time", "8",
+        "--header", "accept: application/dns-message",
+        "--output", "/dev/null", "--write-out", "%{http_code} %{content_type}",
+        "https://%s/doh/%s?dns=%s" % (domain, token, DOH_PROBE_QUERY),
+    ]
+    for attempt in range(max(1, int(attempts))):
+        if attempt:
+            time.sleep(delay)
+        try:
+            result = runner(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        output = result.stdout or b""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        fields = str(output).strip().split()
+        if fields and fields[0] == "200" and "application/dns-message" in " ".join(fields[1:]):
+            return True
+    return False
+
+
+def _doh_self_probe(probe_func: Optional[Callable[[], Optional[bool]]]) -> Optional[bool]:
+    if probe_func is not None:
+        return probe_func()
+    target = doh_probe_target()
+    if target is None:
+        return None
+    return probe_doh(*target)
 
 
 def probe_services(
@@ -386,11 +461,13 @@ def run_once(
     lock_path: Path = LOCK,
     probe_func: Optional[Callable[[str], bool]] = None,
     reconcile_func: Optional[Callable[[Any, Mapping[str, Any], str], Tuple[int, int]]] = None,
+    doh_probe_func: Optional[Callable[[], Optional[bool]]] = None,
 ) -> Dict[str, int]:
     policy = load_json(policy_path, {})
     old = load_json(state_path, {})
     with health_lock(lock_path):
         results = probe_services(policy, probe_func=probe_func)
+        doh_ok = _doh_self_probe(doh_probe_func)
         global_failure = is_global_failure(results)
         if global_failure:
             state = {
@@ -412,7 +489,9 @@ def run_once(
     healthy = sum(1 for item in state.values() if item.get("healthy", False))
     return {"healthy_services": healthy, "active_rules": active,
             "transitions": len(transitions), "changes": changes,
-            "global_failure": int(global_failure)}
+            "global_failure": int(global_failure),
+            # -1 means the probe is not configured, never that it failed.
+            "doh_ok": -1 if doh_ok is None else int(bool(doh_ok))}
 
 
 def main() -> int:
@@ -426,9 +505,10 @@ def main() -> int:
         # private endpoint data into the unit journal.
         print("health check failed: %s" % type(exc).__name__)
         return 1
-    print("healthy_services=%d active_rules=%d transitions=%d changes=%d global_failure=%d" % (
+    print("healthy_services=%d active_rules=%d transitions=%d changes=%d global_failure=%d doh_ok=%d" % (
         summary["healthy_services"], summary["active_rules"],
-        summary["transitions"], summary["changes"], summary.get("global_failure", 0)))
+        summary["transitions"], summary["changes"], summary.get("global_failure", 0),
+        summary.get("doh_ok", -1)))
     return 0
 
 

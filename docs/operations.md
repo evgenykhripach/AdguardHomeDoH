@@ -14,8 +14,9 @@ The generated private DoH endpoint is:
 https://HOST/doh/<random-token>
 ```
 
-The public `/dns-query` path intentionally returns 404. The token is generated
-on the server and is never stored in GitHub.
+The public `/dns-query` path, including the `/dns-query/<ClientID>` variant,
+intentionally returns 404. The token is generated on the server and is never
+stored in GitHub.
 
 ## Admin access
 
@@ -72,8 +73,10 @@ generated from the same catalog, preventing configuration drift.
 ## Staying reachable
 
 An Apple client with an installed DoH profile has no plain-DNS fallback of its
-own: if this server stops answering, the device has no DNS at all, for every
-domain. The deployment therefore keeps several independent recovery paths:
+own before iOS 26: if this server stops answering, every domain the profile
+covers is dead on the device. The profile therefore covers only the catalog
+domains (`SupplementalMatchDomains`) and asks iOS 26+ for `AllowFailover`, and
+the deployment keeps several independent recovery paths:
 
 - `fallback_dns` holds IP-addressed resolvers used when every DoH upstream
   stops answering, and `bootstrap_dns` spans three operators so one of them
@@ -92,7 +95,18 @@ domain. The deployment therefore keeps several independent recovery paths:
   clients resolve routed services to their real addresses and cache that;
 - `worker_connections` is raised to 8192: one DoH connection occupies a stream
   slot, an internal TLS slot and an upstream slot at once, and when the limit
-  is reached nginx stops accepting *everything* - DNS, panel and SNI alike.
+  is reached nginx stops accepting *everything* - DNS, panel and SNI alike;
+- `blocked_response_ttl` is 300 instead of AdGuard Home's default 10: routed
+  answers are re-asked once in five minutes rather than six times a minute
+  over a cellular path;
+- `so_keepalive` on the stream listener and `proxy_socket_keepalive` keep
+  carrier NAT mappings alive under the phone's single HTTP/2 connection and
+  drop vanished peers within a minute; `keepalive_requests` is raised so that
+  connection is not closed mid-burst;
+- `net.ipv4.tcp_mtu_probing=1` (and BBR where the module loads) survives
+  cellular paths that filter ICMP "fragmentation needed";
+- the health gate resolves one name through the public DoH path every cycle
+  and logs `doh_ok=1` or `doh_ok=0`; `-1` means the probe is not configured.
 
 If clients lose DNS periodically, check these first:
 
@@ -100,6 +114,7 @@ If clients lose DNS periodically, check these first:
 grep -cE 'worker_connections are not enough|Too many open files' /var/log/nginx/error.log
 journalctl -u adguardhome-doh.service --since -1day | grep -c 'Started\|Stopped'
 journalctl -u adguardhome-doh-health.service --since -1h | grep global_failure
+journalctl -u adguardhome-doh-health.service --since -1h | grep -c doh_ok=0
 ```
 
 Check status:
@@ -120,8 +135,9 @@ newest complete backup after validating nginx configuration.
 ## Client setup
 
 Use the generated DoH URL in the operating system or browser's custom DoH
-settings. The generated Apple profile pins the server's public IPv4 address;
-regenerate and reinstall the profile whenever that address changes. If the
+settings. The generated Apple profile pins the server's public IPv4 address and lists
+the catalog domains; regenerate and reinstall the profile whenever that address
+changes and after updating from a release older than v1.1.1. If the
 client has cached the previous DNS answer, flush its DNS cache and restart the
 browser. Do not copy the server credential or DoH token into a public issue or
 chat.

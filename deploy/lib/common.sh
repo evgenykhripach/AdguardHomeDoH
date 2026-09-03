@@ -136,6 +136,45 @@ UNIT
     chmod 644 "$directory/adguardhome-doh.conf"
 }
 
+adguardhome_doh_bbr_available() {
+    local root="${1:-/}" available=/proc/sys/net/ipv4/tcp_available_congestion_control
+    [[ "$root" == / ]] || return 1
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    [[ -r "$available" ]] && grep -qw bbr "$available"
+}
+
+adguardhome_doh_install_sysctl() {
+    # Phones sit behind carrier NAT on paths that often filter ICMP
+    # "fragmentation needed": without MTU probing a TLS handshake whose
+    # certificate chain exceeds the path MTU just stalls, which reads as
+    # "works on Wi-Fi, hangs on LTE".  BBR keeps throughput up over the lossy
+    # cellular hop and is optional because its module is not loaded
+    # everywhere.  Neither setting may block an activation.
+    local root="${1:-/}" path modules bbr=0
+    path="$(adguardhome_doh_under_root "$root" /etc/sysctl.d/90-adguardhome-doh.conf)"
+    modules="$(adguardhome_doh_under_root "$root" /etc/modules-load.d/adguardhome-doh.conf)"
+    adguardhome_doh_bbr_available "$root" && bbr=1
+    mkdir -p "$(dirname "$path")"
+    {
+        printf '# Managed by adguardhome-doh: mobile clients behind carrier NAT.\n'
+        printf 'net.ipv4.tcp_mtu_probing = 1\n'
+        if (( bbr )); then
+            printf 'net.core.default_qdisc = fq\n'
+            printf 'net.ipv4.tcp_congestion_control = bbr\n'
+        fi
+    } > "$path"
+    chmod 644 "$path"
+    if (( bbr )); then
+        mkdir -p "$(dirname "$modules")"
+        printf 'tcp_bbr\n' > "$modules"
+        chmod 644 "$modules"
+    fi
+    if [[ "$root" == / ]]; then
+        sysctl -q -p "$path" >/dev/null 2>&1 || \
+            printf 'warning: kernel parameters were written but not applied: %s\n' "$path" >&2
+    fi
+}
+
 adguardhome_doh_migrate_certbot_renewal() {
     local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" profile helper
     profile="$(adguardhome_doh_under_root "$root" "/etc/letsencrypt/renewal/$domain.conf")"
