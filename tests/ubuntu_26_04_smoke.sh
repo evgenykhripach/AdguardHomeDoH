@@ -215,6 +215,16 @@ grep -Fq '<key>AllowFailover</key><true/>' /tmp/adguardhome-doh.mobileconfig
 test "$(curl --silent --insecure --resolve "$DOMAIN:443:127.0.0.1" \
     --output /dev/null --write-out '%{http_code}' \
     "https://$DOMAIN/dns-query/smoke?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB")" = 404
+# Every connection above must have left a line in the stream access log, and
+# the summary command must read it back.
+grep -Fq 'nginx-stream.access.log' /etc/nginx/stream.d/adguardhome-doh.conf
+test -f /etc/logrotate.d/adguardhome-doh
+test -x /usr/local/sbin/adguardhome-doh-diag
+sleep 7
+/usr/local/sbin/adguardhome-doh-diag --minutes 5 | tee /tmp/adguardhome-doh-diag.out
+grep -Eq '^connections=[1-9]' /tmp/adguardhome-doh-diag.out
+grep -Fq "sni=$DOMAIN status=200" /var/log/adguardhome-doh/nginx-stream.access.log
+! grep -Eq 'client=127\.0\.0\.1' /var/log/adguardhome-doh/nginx-stream.access.log
 touch /tmp/adguardhome-doh-force-health-failure
 if install_once >/tmp/adguardhome-doh-failed-health.out 2>&1; then
     printf 'installer ignored a failed health-check\n' >&2

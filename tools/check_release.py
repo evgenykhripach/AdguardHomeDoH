@@ -32,6 +32,8 @@ def main():
         ROOT / "config/service-probes.csv",
         ROOT / "tools/render_config.py",
         ROOT / "deploy/templates/healthcheck.py",
+        ROOT / "deploy/templates/diag.py",
+        ROOT / "tools/client-probe.sh",
         ROOT / "tests/ubuntu_26_04_smoke.sh",
         ROOT / ".github/workflows/release.yml",
     ]
@@ -69,6 +71,7 @@ def main():
         ROOT / "bootstrap.sh",
         ROOT / "deploy/install.sh",
         ROOT / "deploy/lib/common.sh",
+        ROOT / "tools/client-probe.sh",
         ROOT / "tests/ubuntu_26_04_smoke.sh",
     ):
         subprocess.run(["bash", "-n", str(shell_file)], check=True)

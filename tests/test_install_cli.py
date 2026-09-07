@@ -230,6 +230,9 @@ class InstallerCliTests(unittest.TestCase):
             self.assertTrue(
                 (destination / "etc/systemd/system/adguardhome-doh-health.timer").is_file()
             )
+            diag = destination / "usr/local/sbin/adguardhome-doh-diag"
+            self.assertTrue(diag.is_file())
+            self.assertTrue(diag.stat().st_mode & 0o111)
 
     def test_required_packages_include_nginx_stream_module(self):
         common = ROOT / "deploy" / "lib" / "common.sh"
@@ -546,6 +549,7 @@ class InstallerCliTests(unittest.TestCase):
         self.assertIn("adguardhome_doh_ensure_nginx_worker_limits", source)
         self.assertIn("ADGUARDHOME_DOH_FAILURE_THRESHOLD=5", source)
         self.assertIn("adguardhome_doh_install_sysctl / || true", source)
+        self.assertIn("adguardhome_doh_install_logrotate /", source)
         self.assertIn("ADGUARDHOME_DOH_DOMAIN=$DOMAIN", source)
         self.assertIn("ADGUARDHOME_DOH_TOKEN_FILE=$DOH_TOKEN_FILE", source)
 
@@ -664,6 +668,20 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(0o644, conf.stat().st_mode & 0o777)
             # BBR is only enabled on a live host where the module can be probed.
             self.assertNotIn("bbr", text)
+
+    def test_stream_logs_rotate_under_the_target_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_common('adguardhome_doh_install_logrotate "$1"', directory)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            profile = Path(directory) / "etc/logrotate.d/adguardhome-doh"
+            text = profile.read_text(encoding="utf-8")
+            self.assertIn("/var/log/adguardhome-doh/nginx-stream.access.log", text)
+            self.assertIn("/var/log/adguardhome-doh/nginx-stream.error.log", text)
+            self.assertIn("rotate 7", text)
+            # Reopen, never restart: a restart would drop every live session.
+            self.assertIn("kill -USR1", text)
+            self.assertNotIn("systemctl restart", text)
 
     def test_health_unit_can_write_its_run_lock(self):
         """ProtectSystem=strict makes /run read-only for the unit."""

@@ -353,6 +353,7 @@ adguardhome_doh_ensure_nginx_stream_include
 adguardhome_doh_ensure_nginx_worker_limits || true
 adguardhome_doh_install_nginx_restart_dropin /
 adguardhome_doh_install_sysctl / || true
+adguardhome_doh_install_logrotate /
 cat > /etc/nginx/sites-enabled/adguardhome-doh <<EOF
 server {
     listen 80;

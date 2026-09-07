@@ -125,6 +125,45 @@ journalctl -u adguardhome-doh-health.service -n 80 --no-pager
 cat /var/lib/adguardhome-doh/health-state.json
 ```
 
+## Diagnosing stalls
+
+A client that sees `HOST` and the routed services hang at the same time while
+ping still answers is looking at TCP 443 on this address, which everything
+shares. The host and the client each keep one record so the two can be laid
+side by side.
+
+On the host, nginx writes one line per stream connection to
+`/var/log/adguardhome-doh/nginx-stream.access.log` (client address truncated
+to its /24, SNI, status, session time, bytes in and out, upstream address and
+connect time; buffered, so lines appear within five seconds; rotated daily,
+seven copies). Summarize a window with:
+
+```bash
+sudo adguardhome-doh-diag --minutes 60
+```
+
+`no_clienthello` counts sessions that completed the TCP handshake and then
+received no byte at all: the path swallowed the TLS record, which is what DPI
+throttling looks like. `upstream_failures` means this host could not reach the
+target site. Zero connections during a reported stall means the client's
+packets never arrived.
+
+On the client, run the probe on the network where the stalls happen, for
+example a laptop tethered to the phone's hotspot with every VPN switched off:
+
+```bash
+DOH_URL='https://HOST/doh/<token>' tools/client-probe.sh HOST chatgpt.com 10
+```
+
+Each line records ping, then TCP connect, TLS handshake, total time and HTTP
+code for the host itself, for a routed site, for the DoH endpoint and for a
+control host. `rc=28` with `connect=0` is an unanswered SYN, `rc=28` with a
+connect time but `tls=0` is a swallowed ClientHello, `rc=35` is a reset
+handshake. `site_ip` shows whether the routed site actually resolves to this
+host on that network. A stall on the host with the control host healthy and
+nothing in the host log at that time is a path problem between the client
+and this address, not a fault of the deployment.
+
 ## Update and rollback
 
 Run the same bootstrap command with `--update`, or execute the local installer.

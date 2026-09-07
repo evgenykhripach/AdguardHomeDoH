@@ -175,6 +175,31 @@ adguardhome_doh_install_sysctl() {
     fi
 }
 
+adguardhome_doh_install_logrotate() {
+    # nginx's own logrotate profile covers /var/log/nginx only; the stream
+    # logs live in the private directory and would otherwise grow forever.
+    # USR1 makes nginx reopen its files, nothing is restarted.
+    local root="${1:-/}" path
+    path="$(adguardhome_doh_under_root "$root" /etc/logrotate.d/adguardhome-doh)"
+    mkdir -p "$(dirname "$path")"
+    cat > "$path" <<'ROTATE'
+/var/log/adguardhome-doh/nginx-stream.access.log /var/log/adguardhome-doh/nginx-stream.error.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0600 root root
+    sharedscripts
+    postrotate
+        if [ -s /run/nginx.pid ]; then kill -USR1 "$(cat /run/nginx.pid)"; fi
+    endscript
+}
+ROTATE
+    chmod 644 "$path"
+}
+
 adguardhome_doh_migrate_certbot_renewal() {
     local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" profile helper
     profile="$(adguardhome_doh_under_root "$root" "/etc/letsencrypt/renewal/$domain.conf")"
@@ -298,6 +323,7 @@ adguardhome_doh_install_health_templates() {
     [[ -f "$templates/healthcheck.py" ]] || adguardhome_doh_die "healthcheck.py template is missing"
     [[ -f "$templates/healthcheck.service" ]] || adguardhome_doh_die "healthcheck.service template is missing"
     [[ -f "$templates/healthcheck.timer" ]] || adguardhome_doh_die "healthcheck.timer template is missing"
+    [[ -f "$templates/diag.py" ]] || adguardhome_doh_die "diag.py template is missing"
     [[ -f "$project_root/deploy/manage.py" ]] || adguardhome_doh_die "manage.py is missing"
     [[ -f "$project_root/tools/render_config.py" ]] || adguardhome_doh_die "render_config.py is missing"
     [[ -f "$project_root/deploy/lib/render_runtime.py" ]] || adguardhome_doh_die "render_runtime.py is missing"
@@ -314,6 +340,7 @@ adguardhome_doh_install_health_templates() {
     manager="$(adguardhome_doh_under_root "$root" /usr/local/sbin/adguardhome-doh)"
     mkdir -p "$(dirname "$manager")"
     install -m 755 "$project_root/deploy/manage.py" "$manager"
+    install -m 755 "$templates/diag.py" "$(dirname "$manager")/adguardhome-doh-diag"
     install -m 755 "$project_root/tools/render_config.py" "$libexec/render_config.py"
     install -m 755 "$project_root/deploy/lib/render_runtime.py" "$libexec/render_runtime.py"
     install -m 755 "$project_root/deploy/lib/releases.py" "$libexec/releases.py"

@@ -389,6 +389,31 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn("        proxy_socket_keepalive on;", stream)
         self.assertIn("    keepalive_requests 100000;", http)
 
+    def test_stream_connections_are_logged_with_truncated_client_addresses(self):
+        """A stall report needs to say whether the ClientHello ever arrived."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        stream = render_nginx_stream(rows, "dns.example.com")
+
+        self.assertNotIn("access_log off;", stream)
+        self.assertIn(
+            "        access_log /var/log/adguardhome-doh/nginx-stream.access.log"
+            " adguardhome_doh_stream buffer=32k flush=5s;",
+            stream,
+        )
+        self.assertIn("    map $remote_addr $adguardhome_doh_client {", stream)
+        self.assertIn("        default anon;", stream)
+        self.assertIn("$adguardhome_doh_net.0;", stream)
+        for variable in ("$ssl_preread_server_name", "$status", "$session_time",
+                         "$bytes_received", "$upstream_addr", "$upstream_connect_time"):
+            self.assertIn(variable, stream)
+        # The raw address must never reach the log.
+        self.assertNotIn("client=$remote_addr", stream)
+
     def test_catalog_rows_render_deterministically_for_selected_services(self):
         root = Path(__file__).resolve().parents[1]
         catalog = Catalog.load(root / "config")

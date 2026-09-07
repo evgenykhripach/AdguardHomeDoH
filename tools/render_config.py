@@ -761,6 +761,20 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
         lines.append("        %s $ssl_preread_server_name:443;" % name)
     lines.extend([
         "    }",
+        # Clients report stalls while this host looks healthy, so every
+        # connection leaves one line: whether a ClientHello ever arrived
+        # (in=0 means the TCP handshake completed and the TLS record was
+        # then swallowed on the path), how the upstream connect went and how
+        # long the session lived.  The client address is truncated to its
+        # /24, the same privacy level as the anonymized query log.
+        "    map $remote_addr $adguardhome_doh_client {",
+        "        ~^(?<adguardhome_doh_net>[0-9]+[.][0-9]+[.][0-9]+)[.][0-9]+$ $adguardhome_doh_net.0;",
+        "        default anon;",
+        "    }",
+        "    log_format adguardhome_doh_stream '$time_iso8601 client=$adguardhome_doh_client'",
+        "        ' sni=$ssl_preread_server_name status=$status session=$session_time'",
+        "        ' in=$bytes_received out=$bytes_sent upstream=$upstream_addr'",
+        "        ' connect=$upstream_connect_time';",
         "    resolver %s valid=60s ipv4=on ipv6=off;" % " ".join(DEFAULT_STREAM_RESOLVERS),
         "    resolver_timeout 5s;",
         "    server {",
@@ -777,7 +791,8 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
         "        proxy_timeout 1h;",
         "        proxy_pass $adguardhome_doh_backend;",
         "        ssl_preread on;",
-        "        access_log off;",
+        "        access_log /var/log/adguardhome-doh/nginx-stream.access.log"
+        " adguardhome_doh_stream buffer=32k flush=5s;",
         "        error_log /var/log/adguardhome-doh/nginx-stream.error.log warn;",
         "    }",
         "}",
