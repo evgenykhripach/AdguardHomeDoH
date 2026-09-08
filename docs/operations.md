@@ -127,6 +127,8 @@ cat /var/lib/adguardhome-doh/health-state.json
 
 ## Relay mode
 
+Step-by-step setup for both hosts: [relay-setup.md](relay-setup.md).
+
 When `adguardhome-doh-diag` shows `no_clienthello` from the client network
 and the client probe shows TCP connecting but TLS never completing, the
 client's path filters this address and no setting on this host can help.
