@@ -746,10 +746,63 @@ def render_nginx_http(
     return "\n".join(lines)
 
 
+def _local_sites(
+    value: Optional[Iterable[Any]], doh_host: str, rows: Sequence[PolicyRow]
+) -> Tuple[Optional[str], List[Tuple[str, str]]]:
+    """Validate ``HOST=IPV4:PORT`` pairs for sites served behind the listener.
+
+    On a host that already serves a site on 443, the stream listener takes
+    the port over and hands that site's SNI back to it on an internal port.
+    ``*`` names the default target for connections with an unknown or absent
+    SNI, which such a site usually answered before.
+    """
+
+    default = None
+    entries: List[Tuple[str, str]] = []
+    seen = set()
+    catalog = {row.domain for row in rows}
+    for item in value or ():
+        if isinstance(item, str):
+            host, separator, addr = item.partition("=")
+        else:
+            host, addr = item
+            separator = "="
+        if not separator:
+            raise ValueError("local site must be HOST=IPV4:PORT: %r" % (item,))
+        host = host.strip().lower()
+        match = re.fullmatch(r"([0-9.]+):([0-9]+)", addr.strip())
+        if not match:
+            raise ValueError("local site address must be IPV4:PORT: %r" % (addr,))
+        address = ipaddress.ip_address(match.group(1))
+        port = int(match.group(2))
+        if address.version != 4 or not 1 <= port <= 65535:
+            raise ValueError("local site address must be IPV4:PORT: %r" % (addr,))
+        if port == 443:
+            raise ValueError("local site cannot stay on port 443: the stream listener owns it")
+        target = "%s:%d" % (address, port)
+        if host == "*":
+            default = target
+            continue
+        host = _hostname(host, "local site")
+        if host == doh_host:
+            raise ValueError("local site cannot be the DoH host")
+        if host in catalog:
+            raise ValueError("local site collides with a routed domain: %s" % host)
+        if host in seen:
+            raise ValueError("duplicate local site: %s" % host)
+        seen.add(host)
+        entries.append((host, target))
+    return default, entries
+
+
 def render_nginx_stream(
-    rows: Sequence[PolicyRow], doh_host: str, relay: Optional[str] = None
+    rows: Sequence[PolicyRow],
+    doh_host: str,
+    relay: Optional[str] = None,
+    local_sites: Optional[Iterable[Any]] = None,
 ) -> str:
     doh_host = _hostname(doh_host, "doh-host")
+    default_target, sites = _local_sites(local_sites, doh_host, rows)
     # A relay host sits where clients can reach it and hands every routed
     # service to one exit host that can reach the real sites.  The TLS bytes
     # are forwarded untouched, so the exit host routes them by the same SNI
@@ -767,9 +820,11 @@ def render_nginx_stream(
         "    map_hash_bucket_size 128;",
         "    map $ssl_preread_server_name $adguardhome_doh_backend {",
         "        hostnames;",
-        "        default 127.0.0.1:9;",
+        "        default %s;" % (default_target or "127.0.0.1:9"),
         "        %s 127.0.0.1:4443;" % doh_host,
     ]
+    for host, site_target in sites:
+        lines.append("        %s %s;" % (host, site_target))
     for row in _ordered_rows(rows):
         name = "." + row.domain if row.kind == "suffix" else row.domain
         lines.append("        %s %s;" % (name, target))

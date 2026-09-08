@@ -141,6 +141,20 @@ the whole chain, so `healthy_services` there means the path through the exit
 works. The value is stored in `install.json` and carried through updates and
 service changes automatically; the relay must not equal the host's own address.
 
+## Fronting an existing site
+
+On a host whose nginx already serves a site on 443, install with
+`--local-site HOST=IPV4:PORT` for each site name and, if the site used to
+answer connections without SNI, `--local-site '*=IPV4:PORT'` for the default
+target. Move the site's `listen 443 ssl` to that internal port beforehand
+without reloading nginx; the installer validates the combined configuration
+and applies both changes in one graceful reload, then issues its own
+certificate through its port-80 server block. The preflight accepts busy 80
+and 443 when nginx owns both. The site sees every client as `127.0.0.1`, since
+TLS is not terminated and no PROXY protocol is spoken; a certbot `nginx`
+authenticator keeps renewing through the site's port-80 block. Both values are
+kept in `install.json` and carried through updates and service changes.
+
 ## Diagnosing stalls
 
 A client that sees `HOST` and the routed services hang at the same time while

@@ -435,6 +435,38 @@ class RenderConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 render_nginx_stream(rows, "dns.example.com", relay=bad)
 
+    def test_local_sites_are_served_behind_the_stream_listener(self):
+        """An existing site keeps its name; unknown SNI can keep reaching it."""
+
+        path = self.write_policy([("example.com", "suffix", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        stream = render_nginx_stream(
+            rows, "dns.example.com",
+            local_sites=["App.Example.org=127.0.0.1:9443", "*=127.0.0.1:9443"],
+        )
+
+        self.assertIn("        app.example.org 127.0.0.1:9443;", stream)
+        self.assertIn("        default 127.0.0.1:9443;", stream)
+        self.assertNotIn("default 127.0.0.1:9;", stream)
+        self.assertIn("        dns.example.com 127.0.0.1:4443;", stream)
+        self.assertIn("        default 127.0.0.1:9;", render_nginx_stream(rows, "dns.example.com"))
+        for bad in (
+            "app.example.org",                    # no address
+            "app.example.org=127.0.0.1",          # no port
+            "app.example.org=127.0.0.1:443",      # the listener owns 443
+            "app.example.org=::1:9443",           # IPv6
+            "dns.example.com=127.0.0.1:9443",     # the DoH host itself
+            "example.com=127.0.0.1:9443",         # a routed domain
+        ):
+            with self.assertRaises(ValueError):
+                render_nginx_stream(rows, "dns.example.com", local_sites=[bad])
+        with self.assertRaises(ValueError):
+            render_nginx_stream(rows, "dns.example.com",
+                                local_sites=["a.example.org=127.0.0.1:1", "a.example.org=127.0.0.1:2"])
+
     def test_catalog_rows_render_deterministically_for_selected_services(self):
         root = Path(__file__).resolve().parents[1]
         catalog = Catalog.load(root / "config")

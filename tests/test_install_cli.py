@@ -66,6 +66,40 @@ class InstallerCliTests(unittest.TestCase):
         self.assertEqual(4, source.count('${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"}'))
         self.assertIn("relay=relay or None", source)
 
+    def test_dry_run_accepts_local_sites_served_behind_the_listener(self):
+        base = ("--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                "--email", "admin@example.com", "--dry-run")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_install(
+                *base, "--local-site", "app.example.org=127.0.0.1:9443",
+                "--local-site", "*=127.0.0.1:9443", "--root", directory,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            bad = self.run_install(*base, "--local-site", "app.example.org=127.0.0.1:443", "--root", directory)
+            self.assertNotEqual(0, bad.returncode)
+            self.assertIn("invalid local site", bad.stderr)
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertEqual(4, source.count('${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"}'))
+        self.assertIn('adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE" "${#LOCAL_SITES[@]}"', source)
+
+    def test_fronting_preflight_requires_nginx_to_own_both_ports(self):
+        nginx_only = (
+            'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=10,fd=7))\n'
+            'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=10,fd=8))\n'
+            'LISTEN 0 511 127.0.0.1:3000 0.0.0.0:* users:(("node",pid=11,fd=9))\n'
+        )
+        mixed = nginx_only + 'LISTEN 0 511 [::]:443 [::]:* users:(("apache2",pid=12,fd=5))\n'
+        for listeners, expected in ((nginx_only, 0), (mixed, 1), ("", 1)):
+            result = self.run_common('adguardhome_doh_nginx_owns_listeners "$1"', listeners)
+            self.assertEqual(expected, result.returncode, listeners)
+        for value, expected in (
+            ("app.example.org=127.0.0.1:9443", 0), ("*=10.0.0.5:9443", 0),
+            ("app.example.org=127.0.0.1:443", 1), ("app.example.org=127.0.0.1", 1),
+            ("=127.0.0.1:9443", 1), ("bad host=127.0.0.1:9443", 1),
+        ):
+            result = self.run_common('adguardhome_doh_validate_local_site "$1"', value)
+            self.assertEqual(expected, result.returncode, value)
+
     def test_missing_required_argument_fails(self):
         result = self.run_install("--domain", "dns.example.com")
         self.assertNotEqual(0, result.returncode)
@@ -391,11 +425,16 @@ class InstallerCliTests(unittest.TestCase):
     def test_installer_reloads_nginx_once_after_final_config_and_smoke_checks(self):
         source = INSTALL.read_text(encoding="utf-8")
         reload_command = "adguardhome_doh_run_logged systemctl reload nginx"
-        self.assertEqual(1, source.count(reload_command))
+        # One reload activates the stream listener and the port-80 site
+        # before the ACME challenge; the final one follows the TLS site.
+        self.assertEqual(2, source.count(reload_command))
+        first_reload = source.index(reload_command)
+        self.assertLess(source.index("adguardhome_doh_run_logged systemctl start nginx"), first_reload)
+        self.assertLess(first_reload, source.index("certbot certonly --webroot"))
         final_config = source.index(
             'install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/adguardhome-doh'
         )
-        reload_index = source.index(reload_command)
+        reload_index = source.rindex(reload_command)
         smoke_index = source.index(
             'adguardhome_doh_run_logged adguardhome_doh_smoke_https_sni "$DOMAIN"'
         )

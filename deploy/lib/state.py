@@ -21,7 +21,8 @@ MODE = 0o600
 INSTALL_FIELDS = ("domain", "public_ip", "email", "version", "repository")
 # A relay host forwards routed services to one exit host instead of the real
 # sites; the field is absent on ordinary installations.
-OPTIONAL_INSTALL_FIELDS = ("relay",)
+OPTIONAL_INSTALL_FIELDS = ("relay", "local_sites")
+LOCAL_SITE_RE = re.compile(r"^(\*|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)=(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
 SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 HOSTNAME_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
@@ -109,6 +110,20 @@ def _validate_install_state(value: Any) -> dict[str, str]:
         if str(relay_address) == result["public_ip"]:
             raise ValueError("relay must differ from public_ip")
         result["relay"] = str(relay_address)
+    if "local_sites" in value:
+        sites = value["local_sites"]
+        if not isinstance(sites, list) or not sites:
+            raise ValueError("local_sites must be a non-empty JSON array")
+        cleaned = []
+        for item in sites:
+            item = _string(item, "local site").strip().lower()
+            match = LOCAL_SITE_RE.fullmatch(item)
+            if not match or not 1 <= int(match.group(3)) <= 65535 or int(match.group(3)) == 443:
+                raise ValueError("invalid local site: %s" % item)
+            if item in cleaned:
+                raise ValueError("duplicate local site: %s" % item)
+            cleaned.append(item)
+        result["local_sites"] = cleaned
     return result
 
 
@@ -133,6 +148,7 @@ def save_install_state(
     version: str,
     repository: str,
     relay: str | None = None,
+    local_sites: Iterable[str] | None = None,
 ) -> dict[str, str]:
     """Validate and atomically save installer metadata."""
 
@@ -145,6 +161,9 @@ def save_install_state(
     }
     if relay:
         raw["relay"] = relay
+    sites = [item for item in (local_sites or ()) if item]
+    if sites:
+        raw["local_sites"] = sites
     value = _validate_install_state(raw)
     _atomic_write(Path(path), value)
     return value

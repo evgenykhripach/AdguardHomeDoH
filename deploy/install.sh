@@ -15,6 +15,8 @@ DOMAIN=
 PUBLIC_IP=
 RELAY=
 RELAY_ARGS=()
+LOCAL_SITES=()
+LOCAL_SITE_ARGS=()
 EMAIL=
 SERVICES=
 POLICY="$PROJECT_ROOT/config/policy.csv"
@@ -36,6 +38,8 @@ usage: install.sh [options]
   --domain HOST       public DNS hostname (prompted when omitted)
   --public-ip IPV4    public IPv4 address (prompted when omitted)
   --relay IPV4        forward routed services to this exit host instead of the sites
+  --local-site H=A    serve an existing site behind the listener: HOST=IPV4:PORT,
+                      repeatable; *=IPV4:PORT sets the target for unknown SNI
   --email EMAIL       certificate contact (prompted when omitted)
   --services IDS      comma-separated stable service IDs
   --policy PATH       compatibility policy CSV (default: catalog rendering)
@@ -58,6 +62,9 @@ while (($#)); do
         --relay)
             (($# >= 2)) || adguardhome_doh_die "--relay requires a value"
             RELAY="$2"; shift 2 ;;
+        --local-site)
+            (($# >= 2)) || adguardhome_doh_die "--local-site requires a value"
+            LOCAL_SITES+=("$2"); shift 2 ;;
         --email)
             (($# >= 2)) || adguardhome_doh_die "--email requires a value"
             EMAIL="$2"; shift 2 ;;
@@ -203,13 +210,13 @@ adguardhome_doh_render_dry_run() {
     local output status
     output="$(mktemp -d)"
     if ((POLICY_ARGUMENT)); then
-        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
+        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
         else
             status=$?
         fi
     else
-        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --config-dir "$PROJECT_ROOT/config" --services "$SERVICES"             --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
+        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --config-dir "$PROJECT_ROOT/config" --services "$SERVICES"             --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
         else
             status=$?
@@ -228,6 +235,13 @@ if [[ -n "$RELAY" ]]; then
     [[ "$RELAY" != "$PUBLIC_IP" ]] || adguardhome_doh_die "relay must differ from the public IPv4"
     RELAY_ARGS=(--relay "$RELAY")
 fi
+LOCAL_SITES_CSV=
+for local_site in ${LOCAL_SITES[@]+"${LOCAL_SITES[@]}"}; do
+    adguardhome_doh_validate_local_site "$local_site" || \
+        adguardhome_doh_die "invalid local site (expected HOST=IPV4:PORT, port not 443): $local_site"
+    LOCAL_SITE_ARGS+=(--local-site "$local_site")
+    LOCAL_SITES_CSV+="${LOCAL_SITES_CSV:+,}$local_site"
+done
 if ((POLICY_ARGUMENT && SERVICES_ARGUMENT)); then
     adguardhome_doh_die "--policy and --services cannot be combined"
 fi
@@ -268,7 +282,7 @@ command -v systemctl >/dev/null 2>&1 || adguardhome_doh_die "systemd is required
 adguardhome_doh_require_ubuntu
 adguardhome_doh_init_log /
 LOG_PATH="$ADGUARDHOME_DOH_LOG_PATH"
-adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE"
+adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE" "${#LOCAL_SITES[@]}"
 adguardhome_doh_progress 20 'предварительная проверка завершена'
 
 mapfile -t required_packages < <(adguardhome_doh_required_packages)
@@ -344,7 +358,7 @@ adguardhome_doh_backup /etc/nginx/sites-enabled/adguardhome-doh "$backup/nginx-h
 adguardhome_doh_backup /etc/nginx/stream.d/adguardhome-doh.conf "$backup/nginx-stream.conf"
 
 if ((POLICY_ARGUMENT)); then
-    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN"         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
+    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} --doh-host "$DOMAIN"         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 else
     HEALTHY_SERVICES="$(adguardhome_doh_healthy_services "$STATE_DIR/health-state.json")"
     healthy_args=()
@@ -352,7 +366,7 @@ else
     adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py" \
         --config-dir "$PROJECT_ROOT/config" --services "$SERVICES" \
         ${healthy_args[@]+"${healthy_args[@]}"} \
-        --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN" \
+        --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} --doh-host "$DOMAIN" \
         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH" \
         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 fi
@@ -424,17 +438,18 @@ chmod 600 /etc/adguardhome-doh/runtime.env
 if [[ ! -f "$CREDENTIALS_FILE" ]]; then
     python3 "$SCRIPT_DIR/lib/credentials.py" --path "$CREDENTIALS_FILE"         --url "https://$DOMAIN/" --password "$ADMIN_PASSWORD" >/dev/null
 fi
-python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" "$RELAY" <<'PY'
+python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" "$RELAY" "$LOCAL_SITES_CSV" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
 
-module_path, install_path, domain, public_ip, email, version, repository, services_path, services, relay = sys.argv[1:]
+module_path, install_path, domain, public_ip, email, version, repository, services_path, services, relay, local_sites = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("adguardhome_doh_state", module_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.save_install_state(Path(install_path), domain=domain, public_ip=public_ip, email=email,
-                          version=version, repository=repository, relay=relay or None)
+                          version=version, repository=repository, relay=relay or None,
+                          local_sites=[item for item in local_sites.split(",") if item])
 module.save_enabled_services(Path(services_path), [item for item in services.split(",") if item])
 PY
 adguardhome_doh_progress 75 'состояние и профили сохранены'
@@ -444,6 +459,11 @@ adguardhome_doh_run_logged nginx -t
 adguardhome_doh_run_logged systemctl enable adguardhome-doh nginx
 adguardhome_doh_run_logged systemctl restart adguardhome-doh
 adguardhome_doh_run_logged systemctl start nginx
+# A package-started or pre-existing nginx is still running its old
+# configuration: without this reload the ACME challenge below would be
+# answered by whatever served port 80 before, and a fronted site would keep
+# 443 while the stream listener waits to take it over.
+adguardhome_doh_run_logged systemctl reload nginx
 adguardhome_doh_progress 85 'службы запущены'
 if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
     # HTTP-01 is answered from the webroot nginx already serves on port 80, so

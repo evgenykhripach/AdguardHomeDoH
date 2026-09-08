@@ -54,6 +54,22 @@ class StateTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         save_install_state(path, relay=bad, **common)
 
+    def test_install_state_keeps_local_sites_served_behind_the_listener(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "install.json"
+            common = dict(domain="dns.example.com", public_ip="203.0.113.10",
+                          email="admin@example.com", version="1.0.0", repository="repo")
+            save_install_state(path, local_sites=["app.example.org=127.0.0.1:9443", "*=127.0.0.1:9443"], **common)
+            self.assertEqual(
+                ["app.example.org=127.0.0.1:9443", "*=127.0.0.1:9443"],
+                load_install_state(path)["local_sites"],
+            )
+            save_install_state(path, local_sites=[], **common)
+            self.assertNotIn("local_sites", load_install_state(path))
+            for bad in ("app.example.org", "app.example.org=127.0.0.1:443", "app=::1:9443"):
+                with self.assertRaises(ValueError):
+                    save_install_state(path, local_sites=[bad], **common)
+
     def test_enabled_services_are_json_string_array_and_private(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "enabled-services.json"

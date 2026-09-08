@@ -254,5 +254,10 @@ grep -Fq 'ADGUARDHOME_DOH_DOMAIN=dns.example.com' /etc/adguardhome-doh/runtime.e
     --email admin@example.com --relay 203.0.113.99 \
     --root /tmp/adguardhome-doh-relay --dry-run > /tmp/adguardhome-doh-relay.out
 grep -Fq 'dry-run завершён' /tmp/adguardhome-doh-relay.out
+"$PROJECT_ROOT/deploy/install.sh" --domain "$DOMAIN" --public-ip "$PUBLIC_IP" \
+    --email admin@example.com --local-site app.example.org=127.0.0.1:9443 \
+    --local-site '*=127.0.0.1:9443' --root /tmp/adguardhome-doh-front --dry-run \
+    > /tmp/adguardhome-doh-front.out
+grep -Fq 'dry-run завершён' /tmp/adguardhome-doh-front.out
 
 printf 'ubuntu 26.04 install smoke: ok\n'

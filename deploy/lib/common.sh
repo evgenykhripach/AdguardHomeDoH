@@ -455,8 +455,39 @@ adguardhome_doh_managed_nginx_update_allowed() {
     (( found ))
 }
 
+adguardhome_doh_nginx_owns_listeners() {
+    # True when every listener on 80 and 443 belongs to nginx: the stream
+    # layer can then take 443 over and hand existing sites their SNI back on
+    # internal ports.  Any other owner is a real conflict.
+    local listeners="$1" line endpoint port found=0
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        endpoint="$(awk '{print $4}' <<< "$line")"
+        port="${endpoint##*:}"
+        case "$port" in
+            80|443)
+                found=1
+                [[ "$line" == *'users:(("nginx"'* ]] || return 1
+                ;;
+        esac
+    done <<< "$listeners"
+    (( found ))
+}
+
+adguardhome_doh_validate_local_site() {
+    # HOST=IPV4:PORT, or *=IPV4:PORT for the default target; 443 stays ours.
+    local value="${1:-}" host addr ip port
+    host="${value%%=*}"; addr="${value#*=}"
+    [[ "$value" == *=* && -n "$host" && -n "$addr" ]] || return 1
+    [[ "$host" == '*' ]] || adguardhome_doh_validate_hostname "$host" || return 1
+    ip="${addr%:*}"; port="${addr##*:}"
+    [[ "$addr" == *:* ]] || return 1
+    adguardhome_doh_validate_ipv4 "$ip" || return 1
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 && port != 443 ))
+}
+
 adguardhome_doh_preflight() {
-    local root="$1" domain="$2" public_ip="$3" allow_managed_update="${4:-0}" os_release
+    local root="$1" domain="$2" public_ip="$3" allow_managed_update="${4:-0}" fronting="${5:-0}" os_release
     adguardhome_doh_require_valid_input "$domain" "$public_ip" "preflight@example.com"
     os_release="$(adguardhome_doh_under_root "$root" /etc/os-release)"
     adguardhome_doh_require_ubuntu "$os_release"
@@ -476,6 +507,9 @@ adguardhome_doh_preflight() {
             local listeners_with_process
             listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
             if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
+                :
+            elif (( fronting )) && adguardhome_doh_nginx_owns_listeners "$listeners_with_process"; then
+                # Existing sites keep running behind the stream listener.
                 :
             else
                 adguardhome_doh_die "required listener ports 80/443 are already in use"

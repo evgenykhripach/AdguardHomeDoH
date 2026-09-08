@@ -771,6 +771,8 @@ def apply_service_change(
             # stream map has to keep doing so after a service change.
             if state.get("relay"):
                 command.extend(["--relay", str(state["relay"])])
+            for item in state.get("local_sites") or []:
+                command.extend(["--local-site", str(item)])
             # Activation restarts AdGuard Home, discarding the rewrites the
             # health gate keeps over the API.  Services already proven healthy
             # are written straight into the new file so that changing the
@@ -1372,6 +1374,8 @@ def install_update(
                    "--services", ",".join(selected), "--yes", "--update"]
         if state.get("relay"):
             command.extend(["--relay", str(state["relay"])])
+        for item in state.get("local_sites") or []:
+            command.extend(["--local-site", str(item)])
         try:
             result = runner(command, check=False)
             if getattr(result, "returncode", 1) != 0:

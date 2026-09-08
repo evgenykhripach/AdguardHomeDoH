@@ -793,7 +793,8 @@ class ServiceChangeSeedingTests(unittest.TestCase):
             root = self.build_root(directory)
             (root / "var/lib/adguardhome-doh/install.json").write_text(
                 json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10",
-                            "relay": "203.0.113.99"}),
+                            "relay": "203.0.113.99",
+                            "local_sites": ["app.example.org=127.0.0.1:9443"]}),
                 encoding="utf-8",
             )
             captured = {}
@@ -813,6 +814,7 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         self.assertIsNotNone(command)
         self.assertEqual("203.0.113.99", command[command.index("--relay") + 1])
         self.assertEqual("203.0.113.10", command[command.index("--public-ip") + 1])
+        self.assertEqual("app.example.org=127.0.0.1:9443", command[command.index("--local-site") + 1])
 
     def test_update_command_keeps_the_relay_exit_host(self):
         manager = load_manager()
@@ -823,7 +825,8 @@ class ServiceChangeSeedingTests(unittest.TestCase):
                 json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10",
                             "email": "admin@example.com", "version": "1.0.0",
                             "repository": "evgenykhripach/AdguardHomeDoH",
-                            "relay": "203.0.113.99"}),
+                            "relay": "203.0.113.99",
+                            "local_sites": ["app.example.org=127.0.0.1:9443", "*=127.0.0.1:9443"]}),
                 encoding="utf-8",
             )
             fixture = Path(directory) / "fixture" / "adguardhome-doh-9.9.9"
@@ -873,6 +876,8 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         self.assertEqual("203.0.113.99", install[install.index("--relay") + 1])
         self.assertEqual("203.0.113.10", install[install.index("--public-ip") + 1])
         self.assertIn("--update", install)
+        self.assertEqual(2, install.count("--local-site"))
+        self.assertIn("*=127.0.0.1:9443", install)
 
     def test_healthy_services_ignores_unselected_and_unproven_services(self):
         manager = load_manager()
