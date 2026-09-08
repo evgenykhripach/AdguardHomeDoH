@@ -767,6 +767,10 @@ def apply_service_change(
                        "--password-hash", password_hash,
                        "--certificate-root", "/etc/letsencrypt/live/%s" % state["domain"],
                        "--webroot", str(paths["webroot"]), "--output", str(stage)]
+            # A relay host forwards routed services to one exit host; the
+            # stream map has to keep doing so after a service change.
+            if state.get("relay"):
+                command.extend(["--relay", str(state["relay"])])
             # Activation restarts AdGuard Home, discarding the rewrites the
             # health gate keeps over the API.  Services already proven healthy
             # are written straight into the new file so that changing the
@@ -1366,6 +1370,8 @@ def install_update(
                    "--domain", str(state["domain"]), "--public-ip", str(state["public_ip"]),
                    "--email", str(state.get("email", "admin@example.com")),
                    "--services", ",".join(selected), "--yes", "--update"]
+        if state.get("relay"):
+            command.extend(["--relay", str(state["relay"])])
         try:
             result = runner(command, check=False)
             if getattr(result, "returncode", 1) != 0:

@@ -13,6 +13,8 @@ REPOSITORY="${ADGUARDHOME_DOH_REPOSITORY:-evgenykhripach/AdguardHomeDoH}"
 ROOT=/
 DOMAIN=
 PUBLIC_IP=
+RELAY=
+RELAY_ARGS=()
 EMAIL=
 SERVICES=
 POLICY="$PROJECT_ROOT/config/policy.csv"
@@ -33,6 +35,7 @@ usage() {
 usage: install.sh [options]
   --domain HOST       public DNS hostname (prompted when omitted)
   --public-ip IPV4    public IPv4 address (prompted when omitted)
+  --relay IPV4        forward routed services to this exit host instead of the sites
   --email EMAIL       certificate contact (prompted when omitted)
   --services IDS      comma-separated stable service IDs
   --policy PATH       compatibility policy CSV (default: catalog rendering)
@@ -52,6 +55,9 @@ while (($#)); do
         --public-ip)
             (($# >= 2)) || adguardhome_doh_die "--public-ip requires a value"
             PUBLIC_IP="$2"; shift 2 ;;
+        --relay)
+            (($# >= 2)) || adguardhome_doh_die "--relay requires a value"
+            RELAY="$2"; shift 2 ;;
         --email)
             (($# >= 2)) || adguardhome_doh_die "--email requires a value"
             EMAIL="$2"; shift 2 ;;
@@ -197,13 +203,13 @@ adguardhome_doh_render_dry_run() {
     local output status
     output="$(mktemp -d)"
     if ((POLICY_ARGUMENT)); then
-        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
+        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
         else
             status=$?
         fi
     else
-        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --config-dir "$PROJECT_ROOT/config" --services "$SERVICES"             --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
+        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --config-dir "$PROJECT_ROOT/config" --services "$SERVICES"             --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
         else
             status=$?
@@ -215,6 +221,13 @@ adguardhome_doh_render_dry_run() {
 
 adguardhome_doh_progress 0 'проверка параметров'
 adguardhome_doh_prompt_missing_values || exit $?
+if [[ -n "$RELAY" ]]; then
+    # The relay is an exit host that can reach the real sites; forwarding to
+    # ourselves would loop every routed connection back into this listener.
+    adguardhome_doh_validate_ipv4 "$RELAY" || adguardhome_doh_die "invalid relay IPv4: $RELAY"
+    [[ "$RELAY" != "$PUBLIC_IP" ]] || adguardhome_doh_die "relay must differ from the public IPv4"
+    RELAY_ARGS=(--relay "$RELAY")
+fi
 if ((POLICY_ARGUMENT && SERVICES_ARGUMENT)); then
     adguardhome_doh_die "--policy and --services cannot be combined"
 fi
@@ -331,7 +344,7 @@ adguardhome_doh_backup /etc/nginx/sites-enabled/adguardhome-doh "$backup/nginx-h
 adguardhome_doh_backup /etc/nginx/stream.d/adguardhome-doh.conf "$backup/nginx-stream.conf"
 
 if ((POLICY_ARGUMENT)); then
-    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN"         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
+    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN"         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 else
     HEALTHY_SERVICES="$(adguardhome_doh_healthy_services "$STATE_DIR/health-state.json")"
     healthy_args=()
@@ -339,7 +352,7 @@ else
     adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py" \
         --config-dir "$PROJECT_ROOT/config" --services "$SERVICES" \
         ${healthy_args[@]+"${healthy_args[@]}"} \
-        --public-ip "$PUBLIC_IP" --doh-host "$DOMAIN" \
+        --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} --doh-host "$DOMAIN" \
         --doh-token "$DOH_TOKEN" --password-hash "$ADMIN_HASH" \
         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 fi
@@ -411,17 +424,17 @@ chmod 600 /etc/adguardhome-doh/runtime.env
 if [[ ! -f "$CREDENTIALS_FILE" ]]; then
     python3 "$SCRIPT_DIR/lib/credentials.py" --path "$CREDENTIALS_FILE"         --url "https://$DOMAIN/" --password "$ADMIN_PASSWORD" >/dev/null
 fi
-python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" <<'PY'
+python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" "$RELAY" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
 
-module_path, install_path, domain, public_ip, email, version, repository, services_path, services = sys.argv[1:]
+module_path, install_path, domain, public_ip, email, version, repository, services_path, services, relay = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("adguardhome_doh_state", module_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.save_install_state(Path(install_path), domain=domain, public_ip=public_ip, email=email,
-                          version=version, repository=repository)
+                          version=version, repository=repository, relay=relay or None)
 module.save_enabled_services(Path(services_path), [item for item in services.split(",") if item])
 PY
 adguardhome_doh_progress 75 'состояние и профили сохранены'

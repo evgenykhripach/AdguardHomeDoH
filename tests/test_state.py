@@ -37,6 +37,23 @@ class StateTests(unittest.TestCase):
                 load_install_state(path),
             )
 
+    def test_install_state_keeps_an_optional_relay_exit_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "install.json"
+            common = dict(domain="dns.example.com", public_ip="203.0.113.10",
+                          email="admin@example.com", version="1.0.0", repository="repo")
+            save_install_state(path, **common)
+            self.assertNotIn("relay", load_install_state(path))
+            save_install_state(path, relay="203.0.113.99", **common)
+            self.assertEqual("203.0.113.99", load_install_state(path)["relay"])
+            # Forwarding to ourselves would loop every routed connection.
+            with self.assertRaises(ValueError):
+                save_install_state(path, relay="203.0.113.10", **common)
+            for bad in ("2001:db8::1", "relay.example.com", ""):
+                if bad:
+                    with self.assertRaises(ValueError):
+                        save_install_state(path, relay=bad, **common)
+
     def test_enabled_services_are_json_string_array_and_private(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "enabled-services.json"

@@ -746,8 +746,22 @@ def render_nginx_http(
     return "\n".join(lines)
 
 
-def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
+def render_nginx_stream(
+    rows: Sequence[PolicyRow], doh_host: str, relay: Optional[str] = None
+) -> str:
     doh_host = _hostname(doh_host, "doh-host")
+    # A relay host sits where clients can reach it and hands every routed
+    # service to one exit host that can reach the real sites.  The TLS bytes
+    # are forwarded untouched, so the exit host routes them by the same SNI
+    # and the real certificate still reaches the client.  The DoH host and
+    # the drop target for unknown names stay local either way.
+    if relay:
+        address = ipaddress.ip_address(relay)
+        if address.version != 4:
+            raise ValueError("relay must be IPv4")
+        target = "%s:443" % address
+    else:
+        target = "$ssl_preread_server_name:443"
     lines = [
         "stream {",
         "    map_hash_bucket_size 128;",
@@ -758,7 +772,7 @@ def render_nginx_stream(rows: Sequence[PolicyRow], doh_host: str) -> str:
     ]
     for row in _ordered_rows(rows):
         name = "." + row.domain if row.kind == "suffix" else row.domain
-        lines.append("        %s $ssl_preread_server_name:443;" % name)
+        lines.append("        %s %s;" % (name, target))
     lines.extend([
         "    }",
         # Clients report stalls while this host looks healthy, so every

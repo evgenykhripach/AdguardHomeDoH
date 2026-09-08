@@ -92,6 +92,7 @@ def main(argv=None):
     parser.add_argument("--services", help="comma-separated service IDs")
     parser.add_argument("--healthy-services", help="comma-separated healthy service IDs")
     parser.add_argument("--public-ip", required=True)
+    parser.add_argument("--relay", help="forward routed services to this exit host")
     parser.add_argument("--doh-host", required=True)
     parser.add_argument("--doh-token", required=True)
     parser.add_argument("--password-hash", required=True)
@@ -157,7 +158,7 @@ def main(argv=None):
         encoding="utf-8",
     )
     (args.output / "nginx-stream.conf").write_text(
-        render_nginx_stream(rows, args.doh_host), encoding="utf-8"
+        render_nginx_stream(rows, args.doh_host, relay=args.relay), encoding="utf-8"
     )
     if catalog is None:
         health_policy = {

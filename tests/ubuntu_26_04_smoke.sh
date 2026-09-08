@@ -249,4 +249,10 @@ grep -Fq 'so_keepalive=30s:10s:3' /etc/nginx/stream.d/adguardhome-doh.conf
 grep -Fq 'net.ipv4.tcp_mtu_probing = 1' /etc/sysctl.d/90-adguardhome-doh.conf
 grep -Fq 'ADGUARDHOME_DOH_DOMAIN=dns.example.com' /etc/adguardhome-doh/runtime.env
 
+# Relay mode renders and validates like an ordinary installation.
+"$PROJECT_ROOT/deploy/install.sh" --domain "$DOMAIN" --public-ip "$PUBLIC_IP" \
+    --email admin@example.com --relay 203.0.113.99 \
+    --root /tmp/adguardhome-doh-relay --dry-run > /tmp/adguardhome-doh-relay.out
+grep -Fq 'dry-run завершён' /tmp/adguardhome-doh-relay.out
+
 printf 'ubuntu 26.04 install smoke: ok\n'

@@ -19,6 +19,9 @@ from typing import Any, Iterable, Mapping
 
 MODE = 0o600
 INSTALL_FIELDS = ("domain", "public_ip", "email", "version", "repository")
+# A relay host forwards routed services to one exit host instead of the real
+# sites; the field is absent on ordinary installations.
+OPTIONAL_INSTALL_FIELDS = ("relay",)
 SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 HOSTNAME_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
@@ -74,8 +77,13 @@ def _string(value: Any, field: str) -> str:
 
 
 def _validate_install_state(value: Any) -> dict[str, str]:
-    if not isinstance(value, dict) or set(value) != set(INSTALL_FIELDS):
-        raise ValueError("install.json fields must be exactly: %s" % ",".join(INSTALL_FIELDS))
+    required = set(INSTALL_FIELDS)
+    allowed = required | set(OPTIONAL_INSTALL_FIELDS)
+    if not isinstance(value, dict) or not required <= set(value) or not set(value) <= allowed:
+        raise ValueError(
+            "install.json fields must be: %s and optionally %s"
+            % (",".join(INSTALL_FIELDS), ",".join(OPTIONAL_INSTALL_FIELDS))
+        )
     result = {field: _string(value[field], field) for field in INSTALL_FIELDS}
     domain = result["domain"].lower()
     if not HOSTNAME_RE.fullmatch(domain):
@@ -90,6 +98,17 @@ def _validate_install_state(value: Any) -> dict[str, str]:
         raise ValueError("invalid install email: %s" % result["email"])
     result["domain"] = domain
     result["email"] = result["email"]
+    if "relay" in value:
+        relay = _string(value["relay"], "relay")
+        try:
+            relay_address = ipaddress.ip_address(relay)
+        except ValueError as exc:
+            raise ValueError("invalid install relay: %s" % relay) from exc
+        if relay_address.version != 4:
+            raise ValueError("relay must be IPv4")
+        if str(relay_address) == result["public_ip"]:
+            raise ValueError("relay must differ from public_ip")
+        result["relay"] = str(relay_address)
     return result
 
 
@@ -113,18 +132,20 @@ def save_install_state(
     email: str,
     version: str,
     repository: str,
+    relay: str | None = None,
 ) -> dict[str, str]:
     """Validate and atomically save installer metadata."""
 
-    value = _validate_install_state(
-        {
-            "domain": domain,
-            "public_ip": public_ip,
-            "email": email,
-            "version": version,
-            "repository": repository,
-        }
-    )
+    raw = {
+        "domain": domain,
+        "public_ip": public_ip,
+        "email": email,
+        "version": version,
+        "repository": repository,
+    }
+    if relay:
+        raw["relay"] = relay
+    value = _validate_install_state(raw)
     _atomic_write(Path(path), value)
     return value
 

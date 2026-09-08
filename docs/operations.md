@@ -125,6 +125,22 @@ journalctl -u adguardhome-doh-health.service -n 80 --no-pager
 cat /var/lib/adguardhome-doh/health-state.json
 ```
 
+## Relay mode
+
+When `adguardhome-doh-diag` shows `no_clienthello` from the client network
+and the client probe shows TCP connecting but TLS never completing, the
+client's path filters this address and no setting on this host can help.
+Split the deployment instead: a **relay** host on a network the clients reach
+cleanly, and the existing host as the **exit**. Install the relay with the
+ordinary command plus `--relay <exit IPv4>`. The relay runs DoH, AdGuard Home,
+the health gate and serves the profile; its stream map forwards every catalog
+domain to the exit host instead of the real site, and the exit host routes the
+untouched TLS bytes by the same SNI. Enable the same services on both hosts,
+because the exit drops SNIs it does not know. The relay's health gate probes
+the whole chain, so `healthy_services` there means the path through the exit
+works. The value is stored in `install.json` and carried through updates and
+service changes automatically; the relay must not equal the host's own address.
+
 ## Diagnosing stalls
 
 A client that sees `HOST` and the routed services hang at the same time while

@@ -48,6 +48,24 @@ class InstallerCliTests(unittest.TestCase):
             self.assertIn("dry-run завершён", result.stdout)
             self.assertEqual([], list(Path(directory).iterdir()))
 
+    def test_dry_run_accepts_a_relay_exit_host_but_not_itself(self):
+        base = ("--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                "--email", "admin@example.com", "--dry-run")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_install(*base, "--relay", "203.0.113.99", "--root", directory)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("dry-run завершён", result.stdout)
+            same = self.run_install(*base, "--relay", "203.0.113.10", "--root", directory)
+            self.assertNotEqual(0, same.returncode)
+            self.assertIn("relay must differ", same.stderr)
+            bad = self.run_install(*base, "--relay", "nope", "--root", directory)
+            self.assertNotEqual(0, bad.returncode)
+            self.assertIn("invalid relay", bad.stderr)
+        source = INSTALL.read_text(encoding="utf-8")
+        # Every render call and the saved state must carry the relay.
+        self.assertEqual(4, source.count('${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"}'))
+        self.assertIn("relay=relay or None", source)
+
     def test_missing_required_argument_fails(self):
         result = self.run_install("--domain", "dns.example.com")
         self.assertNotEqual(0, result.returncode)

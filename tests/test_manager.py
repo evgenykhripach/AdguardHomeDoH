@@ -1,6 +1,8 @@
+import hashlib
 import importlib.util
 import io
 import json
+import shutil
 import re
 import subprocess
 import tempfile
@@ -784,6 +786,93 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         self.assertEqual("203.0.113.10", command[command.index("--public-ip") + 1])
         self.assertEqual("chatgpt", command[command.index("--healthy-services") + 1])
         self.assertEqual("chatgpt,claude", command[command.index("--services") + 1])
+
+    def test_service_change_keeps_the_relay_exit_host(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            (root / "var/lib/adguardhome-doh/install.json").write_text(
+                json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10",
+                            "relay": "203.0.113.99"}),
+                encoding="utf-8",
+            )
+            captured = {}
+            real_run = subprocess.run
+
+            def fake_run(command, **kwargs):
+                captured["command"] = list(command)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+                try:
+                    manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+                except Exception:
+                    pass
+
+        command = captured.get("command")
+        self.assertIsNotNone(command)
+        self.assertEqual("203.0.113.99", command[command.index("--relay") + 1])
+        self.assertEqual("203.0.113.10", command[command.index("--public-ip") + 1])
+
+    def test_update_command_keeps_the_relay_exit_host(self):
+        manager = load_manager()
+        releases = manager._load_releases()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            (root / "var/lib/adguardhome-doh/install.json").write_text(
+                json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10",
+                            "email": "admin@example.com", "version": "1.0.0",
+                            "repository": "evgenykhripach/AdguardHomeDoH",
+                            "relay": "203.0.113.99"}),
+                encoding="utf-8",
+            )
+            fixture = Path(directory) / "fixture" / "adguardhome-doh-9.9.9"
+            # The archive contract lists every required file; real copies
+            # keep the catalog loadable, stubs satisfy the rest.
+            for name in releases.REQUIRED_FILES:
+                target = fixture / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if (ROOT / name).is_file() and name != "VERSION":
+                    shutil.copy2(ROOT / name, target)
+                else:
+                    target.write_text("# fixture\n", encoding="utf-8")
+            (fixture / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+            (fixture / "deploy/install.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fixture / "deploy/install.sh").chmod(0o755)
+            archive = Path(directory) / "adguardhome-doh.tar.gz"
+            subprocess.run(["tar", "-czf", str(archive), "adguardhome-doh-9.9.9"],
+                           cwd=fixture.parent, check=True)
+            checksum = Path(directory) / "adguardhome-doh.tar.gz.sha256"
+            checksum.write_text(
+                "%s  adguardhome-doh.tar.gz\n" % hashlib.sha256(archive.read_bytes()).hexdigest(),
+                encoding="utf-8",
+            )
+            release = releases.parse_release({
+                "tag_name": "v9.9.9", "draft": False, "prerelease": False,
+                "assets": [
+                    {"name": "adguardhome-doh.tar.gz", "browser_download_url": "https://fixture/archive"},
+                    {"name": "adguardhome-doh.tar.gz.sha256", "browser_download_url": "https://fixture/checksum"},
+                ],
+            })
+            commands = []
+
+            def downloader(url, path):
+                shutil.copy2(archive if url.endswith("archive") else checksum, path)
+
+            def runner(command, **kwargs):
+                commands.append([str(part) for part in command])
+                return subprocess.CompletedProcess(command, 0)
+
+            self.assertTrue(manager.install_update(
+                root=root, release=release, downloader=downloader, runner=runner
+            ))
+
+        install = next(c for c in commands if any(part.endswith("deploy/install.sh") for part in c))
+        # The relay must survive an update, or the exit host silently becomes
+        # the real sites and every routed service breaks on the client path.
+        self.assertEqual("203.0.113.99", install[install.index("--relay") + 1])
+        self.assertEqual("203.0.113.10", install[install.index("--public-ip") + 1])
+        self.assertIn("--update", install)
 
     def test_healthy_services_ignores_unselected_and_unproven_services(self):
         manager = load_manager()

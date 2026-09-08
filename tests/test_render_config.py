@@ -414,6 +414,27 @@ class RenderConfigTests(unittest.TestCase):
         # The raw address must never reach the log.
         self.assertNotIn("client=$remote_addr", stream)
 
+    def test_relay_hands_routed_services_to_one_exit_host(self):
+        """Clients reach the relay; only the exit host can reach the sites."""
+
+        path = self.write_policy([("example.com", "suffix", ""), ("api.fitbit.com", "fqdn", "")])
+        try:
+            rows = load_policy(path)
+        finally:
+            path.unlink()
+        stream = render_nginx_stream(rows, "dns.example.com", relay="203.0.113.99")
+
+        self.assertIn("        .example.com 203.0.113.99:443;", stream)
+        self.assertIn("        api.fitbit.com 203.0.113.99:443;", stream)
+        self.assertNotIn("$ssl_preread_server_name:443", stream)
+        # DoH stays local and unknown names are still dropped on the relay.
+        self.assertIn("        dns.example.com 127.0.0.1:4443;", stream)
+        self.assertIn("        default 127.0.0.1:9;", stream)
+        self.assertIn("$ssl_preread_server_name:443", render_nginx_stream(rows, "dns.example.com"))
+        for bad in ("2001:db8::1", "not-an-ip"):
+            with self.assertRaises(ValueError):
+                render_nginx_stream(rows, "dns.example.com", relay=bad)
+
     def test_catalog_rows_render_deterministically_for_selected_services(self):
         root = Path(__file__).resolve().parents[1]
         catalog = Catalog.load(root / "config")
