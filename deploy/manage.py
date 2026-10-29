@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import ipaddress
 import io
 import json
 import os
@@ -1050,7 +1051,7 @@ def preview_service_change(catalog: Any, current: Iterable[str], selected: Itera
     }
 
 
-def _load_catalog(catalog_dir: Path) -> Any:
+def _load_render_config() -> Any:
     candidates = [PROJECT_ROOT / "tools" / "render_config.py",
                   Path("/usr/local/libexec/adguardhome-doh/render_config.py")]
     for candidate in candidates:
@@ -1061,8 +1062,42 @@ def _load_catalog(catalog_dir: Path) -> Any:
             assert spec.loader is not None
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
-            return module.Catalog.load(Path(catalog_dir))
+            return module
     raise RuntimeError("catalog renderer is unavailable")
+
+
+def _load_catalog(catalog_dir: Path) -> Any:
+    return _load_render_config().Catalog.load(Path(catalog_dir))
+
+
+def _service_change_admin_host(state: Mapping[str, Any], catalog: Any) -> Optional[str]:
+    if "admin_host" not in state:
+        return None
+    admin_host = state["admin_host"]
+    domain = state.get("domain")
+    if (not isinstance(admin_host, str) or not admin_host or admin_host != admin_host.strip()
+            or not isinstance(domain, str) or not domain or domain != domain.strip()):
+        raise RuntimeError("некорректный admin_host в данных установки")
+    if _front_mode(state) != "mtproxyl":
+        raise RuntimeError("admin_host требует front mtproxyl")
+    try:
+        renderer = _load_render_config()
+        domain = renderer._hostname(domain, "doh-host")
+        return renderer._admin_hostname(admin_host, domain, catalog.full_policy())
+    except (AttributeError, ValueError, RuntimeError) as exc:
+        raise RuntimeError("некорректный admin_host в данных установки") from exc
+
+
+def _validate_service_change_install_state(state: Any) -> None:
+    if not isinstance(state, Mapping):
+        raise ValueError("invalid install state")
+    domain = state.get("domain")
+    public_ip = state.get("public_ip")
+    if (not isinstance(domain, str) or not domain or domain != domain.strip()
+            or not isinstance(public_ip, str) or not public_ip or public_ip != public_ip.strip()):
+        raise ValueError("invalid install state")
+    _load_render_config()._hostname(domain, "doh-host")
+    ipaddress.IPv4Address(public_ip)
 
 
 def _load_releases() -> Any:
@@ -1497,6 +1532,7 @@ def apply_service_change(
     expected_relay: Optional[str] = None,
     expected_policy: Optional[str] = None,
     expected_policy_hash: Optional[str] = None,
+    expected_admin_host: Optional[str] = None,
 ) -> Path:
     """Render selected services to staging, validate, then atomically activate."""
 
@@ -1504,6 +1540,7 @@ def apply_service_change(
     with operation_lock(root), health_lock(root):
         _check_incomplete_transactions(root)
         paths = _runtime_paths(root)
+        current_catalog = None
         if expected_services is not None:
             try:
                 if catalog is None:
@@ -1522,10 +1559,27 @@ def apply_service_change(
             if (set(current) != set(expected_services)
                     or state.get("relay") != expected_relay
                     or state.get("policy") != expected_policy
+                    or state.get("admin_host") != expected_admin_host
                     or policy_hash != expected_policy_hash):
                 raise RuntimeError("Повторите выбор: состояние изменилось.")
         else:
             state = _read_json(paths["install"], {})
+        if renderer is None:
+            try:
+                healthcheck = _load_healthcheck(root)
+                strict_state = healthcheck.load_json(paths["install"], None)
+                if strict_state != state:
+                    raise ValueError("install state is unavailable or changed")
+                _validate_service_change_install_state(strict_state)
+            except (OSError, ValueError, RuntimeError, AttributeError, TypeError) as exc:
+                raise RuntimeError("данные установки недоступны или повреждены") from exc
+        if isinstance(state, Mapping) and "admin_host" in state:
+            try:
+                current_catalog = current_catalog or _load_catalog(paths["catalog"])
+                _service_change_admin_host(state, current_catalog)
+                catalog = catalog or current_catalog
+            except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+                raise RuntimeError("некорректный admin_host или каталог") from exc
         domain = str(state.get("domain", "")) if isinstance(state, Mapping) else ""
         if isinstance(state, Mapping) and _front_mode(state) == "mtproxyl":
             _require_front_files(root)
@@ -1534,7 +1588,7 @@ def apply_service_change(
                 _verify_mtproxyl_active_config(root, subprocess.run)
         if renderer is None:
             try:
-                _load_healthcheck(root).load_policy(paths["health_policy"])
+                healthcheck.load_policy(paths["health_policy"])
             except (OSError, ValueError, RuntimeError, AttributeError) as exc:
                 raise RuntimeError("политика доменов недоступна или повреждена") from exc
         try:
@@ -1557,6 +1611,8 @@ def _apply_service_change_locked(
     if not isinstance(state, Mapping):
         raise RuntimeError("install state is unavailable")
     front = _front_mode(state)
+    admin_host = (_service_change_admin_host(state, _load_catalog(paths["catalog"]))
+                  if "admin_host" in state else None)
     if not paths["agh"].is_file():
         raise RuntimeError("AdGuard configuration is unavailable")
     stage = Path(tempfile.mkdtemp(prefix=".services.", dir=str(paths["config"])))
@@ -1577,6 +1633,9 @@ def _apply_service_change_locked(
                 command.extend(["--existing-policy", str(paths["health_policy"])])
             if front == "mtproxyl":
                 command.extend(["--front", "mtproxyl"])
+            if admin_host is not None:
+                command.extend(["--admin-host", admin_host,
+                                "--admin-certificate-root", "/etc/letsencrypt/live/%s" % admin_host])
             # A relay host forwards routed services to one exit host; the
             # stream map has to keep doing so after a service change.
             if state.get("relay"):
@@ -2434,11 +2493,18 @@ def print_access_data(root: Path = Path("/"), output: TextIO = sys.stdout) -> No
     print(file=output)
     credentials = _read_json(paths["credentials"], {})
     token = paths["token"].read_text(encoding="utf-8").strip() if paths["token"].is_file() else ""
+    install = _read_json(paths["install"], {})
     if isinstance(credentials, Mapping):
-        print("URL: %s" % credentials.get("url", ""), file=output)
+        url = credentials.get("url", "")
+        if isinstance(install, Mapping) and "admin_host" in install:
+            try:
+                admin_host = _service_change_admin_host(install, _load_catalog(paths["catalog"]))
+                url = "https://%s/" % admin_host
+            except (OSError, ValueError, RuntimeError, AttributeError, TypeError):
+                url = "не определён: имя панели не подтверждено"
+        print("URL: %s" % url, file=output)
         print("Логин: %s" % credentials.get("login", ""), file=output)
         print("Пароль: %s" % credentials.get("password", ""), file=output)
-    install = _read_json(paths["install"], {})
     domain = install.get("domain", "") if isinstance(install, Mapping) else ""
     if domain and token:
         print("DoH URL: https://%s/doh/%s" % (domain, token), file=output)
@@ -2535,6 +2601,7 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                 try:
                     catalog = _load_catalog(paths["catalog"])
                     state, individual_policy, policy_hash, policy = _service_change_install_snapshot(Path(root))
+                    _service_change_admin_host(state, catalog)
                     current = _load_enabled(paths, catalog, strict=True)
                     _validate_relay_service_policy(state, individual_policy, policy, catalog, current)
                     selected = select_services_interactive(
@@ -2581,7 +2648,7 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                     apply_service_change(
                         selected, root=root, catalog=catalog, expected_services=current,
                         expected_relay=state.get("relay"), expected_policy=state.get("policy"),
-                        expected_policy_hash=policy_hash,
+                        expected_policy_hash=policy_hash, expected_admin_host=state.get("admin_host"),
                     )
                     notice = "Сервисы активированы."
                 except Exception as exc:

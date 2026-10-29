@@ -21,7 +21,7 @@ MODE = 0o600
 INSTALL_FIELDS = ("domain", "public_ip", "email", "version", "repository")
 # A relay host forwards routed services to one exit host instead of the real
 # sites; the field is absent on ordinary installations.
-OPTIONAL_INSTALL_FIELDS = ("relay", "local_sites", "policy", "front")
+OPTIONAL_INSTALL_FIELDS = ("relay", "local_sites", "policy", "front", "admin_host")
 MANAGED_POLICY_PATH = "/etc/adguardhome-doh/compat-policy.csv"
 LOCAL_SITE_RE = re.compile(r"^(\*|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)=(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
 SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -149,6 +149,15 @@ def _validate_install_state(value: Any) -> dict[str, str]:
         if value["front"] != "mtproxyl":
             raise ValueError("front must be mtproxyl when present")
         result["front"] = value["front"]
+    if "admin_host" in value:
+        if value.get("front") != "mtproxyl":
+            raise ValueError("admin_host requires mtproxyl front")
+        admin_host = _string(value["admin_host"], "admin_host").lower()
+        if not _valid_hostname(admin_host):
+            raise ValueError("invalid admin_host: %s" % admin_host)
+        if admin_host in (domain, "web." + domain):
+            raise ValueError("admin_host conflicts with an existing MTProxyL route")
+        result["admin_host"] = admin_host
     return result
 
 
@@ -176,6 +185,7 @@ def save_install_state(
     local_sites: Iterable[str] | None = None,
     policy: str | None = None,
     front: str | None = None,
+    admin_host: str | None = None,
 ) -> dict[str, str]:
     """Validate and atomically save installer metadata."""
 
@@ -195,6 +205,8 @@ def save_install_state(
         raw["policy"] = policy
     if front is not None:
         raw["front"] = front
+    if admin_host is not None:
+        raw["admin_host"] = admin_host
     value = _validate_install_state(raw)
     _atomic_write(Path(path), value)
     return value

@@ -461,6 +461,45 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("admin-password", text)
         self.assertIn("https://dns.example.com/doh/private-token", text)
 
+    def test_access_screen_shows_admin_host_without_rewriting_credentials(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "var/lib/adguardhome-doh"
+            state_dir.mkdir(parents=True)
+            catalog_dir = root / "etc/adguardhome-doh/catalog"
+            catalog_dir.parent.mkdir(parents=True)
+            shutil.copytree(ROOT / "config", catalog_dir)
+            credentials = state_dir / "admin-credentials.json"
+            credentials.write_text(json.dumps({
+                "url": "https://dns.example.com/", "login": "admin-user", "password": "admin-password",
+            }))
+            original = credentials.read_bytes()
+            (state_dir / "doh-token").write_text("private-token\n")
+            install = state_dir / "install.json"
+            state = {"domain": "dns.example.com", "front": "mtproxyl", "admin_host": "Admin.Example.org"}
+            install.write_text(json.dumps(state))
+            output = io.StringIO()
+            manager.print_access_data(root, output)
+            self.assertIn("URL: https://admin.example.org/", output.getvalue())
+            self.assertIn("DoH URL: https://dns.example.com/doh/private-token", output.getvalue())
+            self.assertIn("admin-password", output.getvalue())
+            self.assertEqual(original, credentials.read_bytes())
+
+            state.pop("admin_host")
+            install.write_text(json.dumps(state))
+            output = io.StringIO()
+            manager.print_access_data(root, output)
+            self.assertIn("URL: https://dns.example.com/", output.getvalue())
+            self.assertEqual(original, credentials.read_bytes())
+
+            state["admin_host"] = "web.dns.example.com"
+            install.write_text(json.dumps(state))
+            output = io.StringIO()
+            manager.print_access_data(root, output)
+            self.assertNotIn("URL: https://web.dns.example.com/", output.getvalue())
+            self.assertNotIn("URL: https://dns.example.com/\n", output.getvalue())
+
     def test_runtime_services_are_reloaded_after_service_change(self):
         manager = load_manager()
         runner = mock.Mock()
@@ -1728,6 +1767,7 @@ class ServiceChangeMenuSafetyTests(unittest.TestCase):
 
     def test_parallel_service_or_relay_drift_stops_before_adguard(self):
         for drift in ("services", "enabled_missing", "relay_added", "relay_removed", "catalog",
+                      "admin_added", "admin_removed", "admin_changed",
                       "policy_added", "policy_removed", "health_changed", "health_invalid",
                       "install_missing"):
             with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
@@ -1737,9 +1777,15 @@ class ServiceChangeMenuSafetyTests(unittest.TestCase):
                 state_dir = self._state(root, ["chatgpt", "claude"], relay)
                 policy_path = "/etc/adguardhome-doh/compat-policy.csv" if drift == "policy_removed" else None
                 install = state_dir / "install.json"
-                if policy_path:
+                expected_admin = "admin.example.org" if drift in ("admin_removed", "admin_changed") else None
+                if policy_path or drift.startswith("admin_"):
                     state = json.loads(install.read_text())
-                    state["policy"] = policy_path
+                    if policy_path:
+                        state["policy"] = policy_path
+                    if drift.startswith("admin_"):
+                        state["front"] = "mtproxyl"
+                    if expected_admin:
+                        state["admin_host"] = expected_admin
                     install.write_text(json.dumps(state))
                 health_policy = root / "etc/adguardhome-doh/health-policy.json"
                 policy_hash = hashlib.sha256(health_policy.read_bytes()).hexdigest() if relay else None
@@ -1754,6 +1800,7 @@ class ServiceChangeMenuSafetyTests(unittest.TestCase):
                             ["chatgpt"], root=root, catalog=catalog,
                             expected_services=["chatgpt", "claude"], expected_relay=relay,
                             expected_policy=policy_path, expected_policy_hash=policy_hash,
+                            expected_admin_host=expected_admin,
                         )
                     except Exception as exc:
                         errors.append(exc)
@@ -1790,6 +1837,12 @@ class ServiceChangeMenuSafetyTests(unittest.TestCase):
                                 state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
                             elif drift == "policy_removed":
                                 state.pop("policy")
+                            elif drift == "admin_added":
+                                state["admin_host"] = "admin.example.org"
+                            elif drift == "admin_removed":
+                                state.pop("admin_host")
+                            elif drift == "admin_changed":
+                                state["admin_host"] = "other.example.org"
                             install.write_text(json.dumps(state))
                     thread.join(3)
                 self.assertFalse(thread.is_alive())
@@ -1816,6 +1869,61 @@ class ServiceChangeMenuSafetyTests(unittest.TestCase):
                 )
             stop.assert_called_once_with(root)
             apply.assert_called_once()
+
+    def test_menu_passes_admin_host_for_drift_check(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = self._state(root, ["chatgpt", "claude"])
+            install = state_dir / "install.json"
+            state = json.loads(install.read_text())
+            state.update({"front": "mtproxyl", "admin_host": "admin.example.org"})
+            install.write_text(json.dumps(state))
+            catalog = Catalog.load(ROOT / "config")
+            patches = self._menu_patches(manager, catalog, ["chatgpt"])
+            with patches[0], patches[1], patches[2], \
+                 mock.patch.object(manager, "apply_service_change") as apply:
+                manager.run_menu(root, io.StringIO("2\ny\n0\n"), io.StringIO())
+            apply.assert_called_once()
+            self.assertEqual("admin.example.org", apply.call_args.kwargs["expected_admin_host"])
+
+    def test_new_unselected_catalog_route_conflicting_with_admin_blocks_before_stop(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = self._state(root, ["chatgpt", "claude"])
+            install = state_dir / "install.json"
+            state = json.loads(install.read_text())
+            state.update({"front": "mtproxyl", "admin_host": "admin.example.org"})
+            install.write_text(json.dumps(state))
+            original_catalog = Catalog.load(root / "etc/adguardhome-doh/catalog")
+            started = threading.Event()
+            errors = []
+
+            def worker():
+                started.set()
+                try:
+                    manager.apply_service_change(
+                        ["chatgpt"], root=root, catalog=original_catalog,
+                        expected_services=["chatgpt", "claude"], expected_admin_host="admin.example.org",
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(manager, "_stop_adguard") as stop:
+                with manager.operation_lock(root):
+                    thread = threading.Thread(target=worker)
+                    thread.start()
+                    self.assertTrue(started.wait(1))
+                    domains = root / "etc/adguardhome-doh/catalog/domains.csv"
+                    domains.write_text(domains.read_text() + "admin.example.org,fqdn\n")
+                    associations = root / "etc/adguardhome-doh/catalog/service-domains.csv"
+                    associations.write_text(associations.read_text() + "notion,admin.example.org\n")
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(1, len(errors))
+            self.assertIn("admin_host", str(errors[0]))
+            stop.assert_not_called()
 
     def test_menu_asks_to_retry_after_drift_on_narrow_terminal(self):
         manager = load_manager()
@@ -1969,6 +2077,33 @@ class ServiceChangeSeedingTests(unittest.TestCase):
                 activate.assert_not_called()
                 self.assertEqual(before, {path: path.read_bytes() for path in protected})
                 self.assertEqual(policy_before, policy.read_bytes() if policy.exists() else None)
+
+    def test_real_service_change_rejects_invalid_install_state_before_stop(self):
+        invalid = (
+            None, "{broken", "[]", "{}",
+            '{"domain":"dns.example.com","public_ip":"203.0.113.10",'
+            '"domain":"other.example.com"}',
+            json.dumps({"domain": "dns.example.com"}),
+            json.dumps({"domain": "dns/example.com", "public_ip": "203.0.113.10"}),
+            json.dumps({"domain": "dns.example.com", "public_ip": "not-an-ip"}),
+            json.dumps({"domain": "dns.example.com", "public_ip": "2001:db8::1"}),
+        )
+        for content in invalid:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = self.build_root(directory)
+                install = root / "var/lib/adguardhome-doh/install.json"
+                if content is None:
+                    install.unlink()
+                else:
+                    install.write_text(content, encoding="utf-8")
+                adguard = root / "opt/AdGuardHome/AdGuardHome.yaml"
+                before = adguard.read_bytes()
+                with mock.patch.object(manager, "_stop_adguard") as stop:
+                    with self.assertRaises(RuntimeError):
+                        manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+                stop.assert_not_called()
+                self.assertEqual(before, adguard.read_bytes())
 
     def test_render_command_passes_healthy_services_as_a_complete_pair(self):
         manager = load_manager()
@@ -2199,16 +2334,18 @@ class ServiceChangeSeedingTests(unittest.TestCase):
 
     def test_live_failure_or_interrupt_recovers_runtime_and_reports_recovery_failure(self):
         manager = load_manager()
+        state = {"domain": "dns.example.com", "public_ip": "203.0.113.10"}
         for original in (RuntimeError("failed"), KeyboardInterrupt()):
             with self.subTest(original=type(original).__name__), \
                  mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
                  mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
                  mock.patch.object(manager, "_check_incomplete_transactions"), \
-                 mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+                 mock.patch.object(manager, "_read_json", return_value=state), \
                  mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
                  mock.patch.object(manager, "_stop_adguard") as stop, \
                  mock.patch.object(manager, "_apply_service_change_locked", side_effect=original), \
                  mock.patch.object(manager, "reload_runtime_services") as reload:
+                healthcheck.return_value.load_json.return_value = state
                 with self.assertRaises(type(original)):
                     manager.apply_service_change(["chatgpt"], root=Path("/"))
                 healthcheck.return_value.load_policy.assert_called_once_with(
@@ -2219,11 +2356,12 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         with mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "_check_incomplete_transactions"), \
-             mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+             mock.patch.object(manager, "_read_json", return_value=state), \
              mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
              mock.patch.object(manager, "_stop_adguard"), \
              mock.patch.object(manager, "_apply_service_change_locked", side_effect=RuntimeError("activation")), \
              mock.patch.object(manager, "reload_runtime_services", side_effect=RuntimeError("restart")):
+            healthcheck.return_value.load_json.return_value = state
             with self.assertRaisesRegex(RuntimeError, "restoring previous runtime also failed: restart"):
                 manager.apply_service_change(["chatgpt"], root=Path("/"))
             healthcheck.return_value.load_policy.assert_called_once_with(
@@ -2412,15 +2550,17 @@ class ServiceChangeSeedingTests(unittest.TestCase):
 
     def test_live_file_recovery_failure_leaves_adguard_stopped(self):
         manager = load_manager()
+        state = {"domain": "dns.example.com", "public_ip": "203.0.113.10"}
         with mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "_check_incomplete_transactions"), \
-             mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+             mock.patch.object(manager, "_read_json", return_value=state), \
              mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
              mock.patch.object(manager, "_stop_adguard") as stop, \
              mock.patch.object(manager, "_apply_service_change_locked",
                                side_effect=manager._FileRecoveryError("disk error")), \
              mock.patch.object(manager, "reload_runtime_services") as reload:
+            healthcheck.return_value.load_json.return_value = state
             with self.assertRaisesRegex(RuntimeError, "AdGuard left stopped"):
                 manager.apply_service_change(["chatgpt"], root=Path("/"))
             healthcheck.return_value.load_policy.assert_called_once_with(
@@ -2719,12 +2859,83 @@ class MTProxyFrontTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = self.build_root(directory)
             map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
-            manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            commands = []
+            real_run = subprocess.run
+
+            def run(command, **kwargs):
+                commands.append(command)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(manager.subprocess, "run", side_effect=run):
+                manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
             stream = (root / "etc/adguardhome-doh/mtproxyl-stream-site.conf").read_text()
             self.assertIn("listen 127.0.0.1:24443 proxy_protocol", stream)
             self.assertNotIn("listen 443", stream)
             self.assertEqual("old map", map_path.read_text())
             self.assertFalse((root / "etc/nginx/stream.d/adguardhome-doh.conf").exists())
+            command = next(item for item in commands if "--services" in item)
+            self.assertNotIn("--admin-host", command)
+            self.assertNotIn("--admin-certificate-root", command)
+
+    def test_service_change_preserves_admin_route_and_fixed_certificate_root(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_file.read_text())
+            state["admin_host"] = "Admin.Example.org"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            commands = []
+            real_run = subprocess.run
+
+            def run(command, **kwargs):
+                commands.append(command)
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(manager.subprocess, "run", side_effect=run):
+                manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            command = next(item for item in commands if "--services" in item)
+            self.assertEqual("admin.example.org", command[command.index("--admin-host") + 1])
+            self.assertEqual("/etc/letsencrypt/live/admin.example.org",
+                             command[command.index("--admin-certificate-root") + 1])
+            stream = (root / "etc/adguardhome-doh/mtproxyl-stream-site.conf").read_text()
+            self.assertIn("admin.example.org 127.0.0.1:4443;", stream)
+
+    def test_invalid_admin_state_or_catalog_blocks_before_stop(self):
+        invalid = (
+            ("mtproxyl", None), ("mtproxyl", ""), ("mtproxyl", "admin.example.org/../bad"),
+            ("mtproxyl", " admin.example.org"), ("mtproxyl", "admin.example.xn--x"),
+            ("mtproxyl", "DNS.EXAMPLE.COM"), ("mtproxyl", "web.dns.example.com"),
+            ("mtproxyl", "chatgpt.com"), ("mtproxyl", "www.chatgpt.com"),
+            (None, "admin.example.org"),
+        )
+        for front, host in invalid:
+            with self.subTest(front=front, host=host), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = self.build_root(directory)
+                state_file = root / "var/lib/adguardhome-doh/install.json"
+                state = json.loads(state_file.read_text())
+                if front is None:
+                    state.pop("front")
+                state["admin_host"] = host
+                state_file.write_text(json.dumps(state))
+                with mock.patch.object(manager, "_stop_adguard") as stop:
+                    with self.assertRaisesRegex(RuntimeError, "admin_host"):
+                        manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+                stop.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = load_manager()
+            root = self.build_root(directory)
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_file.read_text())
+            state["admin_host"] = "admin.example.org"
+            state_file.write_text(json.dumps(state))
+            (root / "etc/adguardhome-doh/catalog/domains.csv").write_text("bad catalog")
+            with mock.patch.object(manager, "_stop_adguard") as stop:
+                with self.assertRaises((RuntimeError, ValueError)):
+                    manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            stop.assert_not_called()
 
     def test_shared_activation_failure_restores_private_stream_only(self):
         manager = load_manager()
@@ -2887,9 +3098,12 @@ class MTProxyFrontTests(unittest.TestCase):
 
                 under_root = manager.under_root
                 with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
-                     mock.patch.object(manager, "_load_healthcheck"), \
+                     mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
                      mock.patch.object(manager.subprocess, "run", side_effect=runner), \
                      mock.patch.object(manager, "_stop_adguard") as stop:
+                    healthcheck.return_value.load_json.side_effect = (
+                        lambda path, _fallback: json.loads(Path(path).read_text())
+                    )
                     status = manager.collect_menu_status(Path("/"), runner=runner)
                     report = manager.collect_system_check(Path("/"), runner=runner)
                     with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
@@ -2913,9 +3127,12 @@ class MTProxyFrontTests(unittest.TestCase):
             under_root = manager.under_root
             runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, b"123\n", b""))
             with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
-                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
                  mock.patch.object(manager.subprocess, "run", runner), \
                  mock.patch.object(manager, "_stop_adguard") as stop:
+                healthcheck.return_value.load_json.side_effect = (
+                    lambda path, _fallback: json.loads(Path(path).read_text())
+                )
                 with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
                     manager.apply_service_change(["chatgpt"], root=Path("/"))
             stop.assert_not_called()

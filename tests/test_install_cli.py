@@ -23,10 +23,44 @@ class InstallerCliTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         )
 
+    def run_install_capturing_renderer(self, capture, *args, extra_env=None):
+        fake_bin = capture / "bin"
+        fake_bin.mkdir(parents=True)
+        shim = fake_bin / "python3"
+        shim.write_text(
+            '#!/bin/sh\n'
+            'case "$1" in\n'
+            '  */deploy/lib/render_runtime.py)\n'
+            '    printf "CALL\\n" >> "$RENDER_ARGS"\n'
+            '    for arg in "$@"; do printf "%s\\n" "$arg" >> "$RENDER_ARGS"; done\n'
+            '    "$REAL_PYTHON" "$@" || exit $?\n'
+            '    while [ "$#" -gt 0 ]; do\n'
+            '      if [ "$1" = --output ]; then output="$2"; break; fi\n'
+            '      shift\n'
+            '    done\n'
+            '    cp "$output/nginx-stream.conf" "$CAPTURE_DIR/stream"\n'
+            '    cp "$output/nginx-http.conf" "$CAPTURE_DIR/http"\n'
+            '    cp "$output/AdGuardHome.yaml" "$CAPTURE_DIR/adguard"\n'
+            '    cp "$output/health-policy.json" "$CAPTURE_DIR/policy"\n'
+            '    if [ -f "$output/mtproxyl-sni.map" ]; then\n'
+            '      cp "$output/mtproxyl-sni.map" "$CAPTURE_DIR/map"\n'
+            '    fi\n'
+            '    exit 0;;\n'
+            'esac\nexec "$REAL_PYTHON" "$@"\n', encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+                   REAL_PYTHON=sys.executable, RENDER_ARGS=str(capture / "args"),
+                   CAPTURE_DIR=str(capture))
+        env.update(extra_env or {})
+        return subprocess.run([str(INSTALL), *args], cwd=ROOT, env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def test_help_is_available(self):
         result = self.run_install("--help")
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("--domain HOST", result.stdout)
+        self.assertIn("--admin-host HOST", result.stdout)
         self.assertIn("--rollback", result.stdout)
 
     def test_adguard_release_version_is_independent_from_project_version(self):
@@ -54,48 +88,27 @@ class InstallerCliTests(unittest.TestCase):
     def test_front_dry_runs_render_the_selected_topology_and_full_map(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            shim = fake_bin / "python3"
-            shim.write_text(
-                '#!/bin/sh\n'
-                'case "$1" in\n'
-                '  */deploy/lib/render_runtime.py)\n'
-                '    printf "CALL\\n" >> "$RENDER_ARGS"\n'
-                '    for arg in "$@"; do printf "%s\\n" "$arg" >> "$RENDER_ARGS"; done\n'
-                '    "$REAL_PYTHON" "$@" || exit $?\n'
-                '    while [ "$#" -gt 0 ]; do\n'
-                '      if [ "$1" = --output ]; then output="$2"; break; fi\n'
-                '      shift\n'
-                '    done\n'
-                '    cp "$output/nginx-stream.conf" "$CAPTURE_DIR/stream"\n'
-                '    if [ -f "$output/mtproxyl-sni.map" ]; then\n'
-                '      cp "$output/mtproxyl-sni.map" "$CAPTURE_DIR/map"\n'
-                '    fi\n'
-                '    exit 0;;\n'
-                'esac\nexec "$REAL_PYTHON" "$@"\n', encoding="utf-8",
-            )
-            shim.chmod(0o755)
-            for front, policy in (("standard", False), ("mtproxyl", False), ("mtproxyl", True)):
-                with self.subTest(front=front, policy=policy):
-                    capture = root / f"capture-{front}-{policy}"
-                    capture.mkdir()
-                    isolated = root / f"target-{front}-{policy}"
+            cases = (("standard", False, False), ("mtproxyl", False, False),
+                     ("mtproxyl", True, False), ("mtproxyl", False, True),
+                     ("mtproxyl", True, True))
+            for front, policy, admin in cases:
+                with self.subTest(front=front, policy=policy, admin=admin):
+                    capture = root / f"capture-{front}-{policy}-{admin}"
+                    isolated = root / f"target-{front}-{policy}-{admin}"
                     isolated.mkdir()
-                    args_log = capture / "args"
-                    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
-                               REAL_PYTHON=sys.executable, RENDER_ARGS=str(args_log),
-                               CAPTURE_DIR=str(capture))
-                    command = [str(INSTALL), "--front", front, "--domain", "dns.example.com",
+                    command = ["--front", front, "--domain", "dns.example.com",
                                "--public-ip", "203.0.113.10", "--email", "admin@example.com",
                                "--root", str(isolated), "--dry-run"]
                     if policy:
-                        command += ["--policy", str(ROOT / "config/policy.csv")]
-                    result = subprocess.run(command, cwd=ROOT, env=env, text=True,
-                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        policy_path = root / "policy with spaces.csv"
+                        policy_path.write_bytes((ROOT / "config/policy.csv").read_bytes())
+                        command += ["--policy", str(policy_path)]
+                    if admin:
+                        command += ["--admin-host", "Admin.Example.COM"]
+                    result = self.run_install_capturing_renderer(capture, *command)
                     self.assertEqual(0, result.returncode, result.stderr)
                     self.assertIn(f"Front: {front}", result.stdout)
-                    arguments = args_log.read_text(encoding="utf-8")
+                    arguments = (capture / "args").read_text(encoding="utf-8")
                     self.assertEqual(2, arguments.count(f"--front\n{front}\n"))
                     stream = (capture / "stream").read_text(encoding="utf-8")
                     if front == "mtproxyl":
@@ -107,6 +120,22 @@ class InstallerCliTests(unittest.TestCase):
                         self.assertFalse((capture / "map").exists())
                     if policy:
                         self.assertEqual(2, arguments.count("--policy\n"))
+                    if admin:
+                        self.assertIn("Admin URL: https://admin.example.com/", result.stdout)
+                        self.assertEqual(2, arguments.count("--admin-host\nadmin.example.com\n"))
+                        self.assertEqual(2, arguments.count(
+                            "--admin-certificate-root\n/etc/letsencrypt/live/admin.example.com\n"))
+                        self.assertIn("admin.example.com adguardhome_doh;",
+                                      (capture / "map").read_text(encoding="utf-8"))
+                        self.assertIn("admin.example.com 127.0.0.1:4443;", stream)
+                        http = (capture / "http").read_text(encoding="utf-8")
+                        self.assertIn("server_name admin.example.com;", http)
+                        self.assertIn("ssl_certificate /etc/letsencrypt/live/admin.example.com/fullchain.pem;", http)
+                        self.assertIn("ssl_certificate_key /etc/letsencrypt/live/admin.example.com/privkey.pem;", http)
+                    else:
+                        self.assertIn("Admin URL: https://dns.example.com/", result.stdout)
+                        self.assertNotIn("--admin-host", arguments)
+                        self.assertNotIn("--admin-certificate-root", arguments)
                     self.assertEqual([], list(isolated.iterdir()))
 
     def test_front_option_validation_and_local_site_compatibility(self):
@@ -128,6 +157,92 @@ class InstallerCliTests(unittest.TestCase):
         self.assertNotEqual(0, shared.returncode)
         self.assertIn("local sites are not supported with mtproxyl front", shared.stderr)
 
+    def test_admin_host_rejects_invalid_names_and_route_conflicts_before_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = ("--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                    "--email", "admin@example.com", "--root", directory, "--dry-run")
+            for host, error in (("", "invalid --admin-host"),
+                                ("bad host", "invalid --admin-host"),
+                                ("admin.example.com;reboot", "invalid --admin-host"),
+                                ("dns.example.com", "conflicts"),
+                                ("WEB.DNS.EXAMPLE.COM", "conflicts"),
+                                ("admin.spotify.com", "conflicts with a routed domain")):
+                with self.subTest(host=host):
+                    result = self.run_install(*base, "--front", "mtproxyl", "--admin-host", host)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn(error, result.stderr)
+                    self.assertEqual([], list(root.iterdir()))
+            standard = self.run_install(*base, "--admin-host", "admin.example.com")
+            self.assertNotEqual(0, standard.returncode)
+            self.assertIn("--admin-host requires --front mtproxyl", standard.stderr)
+            self.assertEqual([], list(root.iterdir()))
+            missing = self.run_install("--admin-host")
+            self.assertNotEqual(0, missing.returncode)
+            self.assertIn("--admin-host requires a value", missing.stderr)
+
+    def test_update_inherits_or_overrides_admin_host_and_manager_uses_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.mkdir()
+            base = ("--root", str(target), "--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                    "--email", "admin@example.com", "--dry-run")
+            seed = root / "seed"
+            result = self.run_install_capturing_renderer(seed, *base, "--front", "mtproxyl",
+                                                        "--admin-host", "admin.example.com")
+            self.assertEqual(0, result.returncode, result.stderr)
+            state = target / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            saved = dict(domain="dns.example.com", public_ip="203.0.113.10",
+                         email="admin@example.com", version="1.0.0", repository="owner/repo",
+                         front="mtproxyl", admin_host="admin.example.com")
+            state.write_text(json.dumps(saved), encoding="utf-8")
+            state.chmod(0o600)
+            config = target / "opt/AdGuardHome/AdGuardHome.yaml"
+            config.parent.mkdir(parents=True)
+            secret_hash = "existing-secret-password-hash"
+            rendered = (seed / "adguard").read_text(encoding="utf-8")
+            self.assertIn("dry-run-hash", rendered)
+            config.write_text(rendered.replace("dry-run-hash", secret_hash), encoding="utf-8")
+            policy = target / "etc/adguardhome-doh/health-policy.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_bytes((seed / "policy").read_bytes())
+            credential_secret = "existing-secret-password"
+            token_secret = "existing-secret-token"
+            (state.parent / "admin-credentials.json").write_text(credential_secret, encoding="utf-8")
+            (state.parent / "doh-token").write_text(token_secret, encoding="utf-8")
+            before = {path: path.read_bytes() for path in target.rglob("*") if path.is_file()}
+
+            for name, flags, extra_env, expected in (
+                ("inherited", (), None, "admin.example.com"),
+                ("override", ("--admin-host", "new.example.com"), None, "new.example.com"),
+                ("manager", ("--front", "standard", "--admin-host", "stale.example.com"),
+                 {"ADGUARDHOME_DOH_MANAGER_UPDATE": "1"}, "admin.example.com"),
+            ):
+                with self.subTest(name=name):
+                    capture = root / name
+                    result = self.run_install_capturing_renderer(capture, *base, "--update", *flags,
+                                                                extra_env=extra_env)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn(f"Admin URL: https://{expected}/", result.stdout)
+                    arguments = (capture / "args").read_text(encoding="utf-8")
+                    self.assertEqual(2, arguments.count(f"--admin-host\n{expected}\n"))
+                    self.assertEqual(2, arguments.count(
+                        f"--admin-certificate-root\n/etc/letsencrypt/live/{expected}\n"))
+                    self.assertEqual(1, arguments.count(f"--existing-config\n{config}\n"))
+                    self.assertIn(f"{expected} adguardhome_doh;", (capture / "map").read_text(encoding="utf-8"))
+                    self.assertIn(f"ssl_certificate /etc/letsencrypt/live/{expected}/fullchain.pem;",
+                                  (capture / "http").read_text(encoding="utf-8"))
+                    for secret in (secret_hash, credential_secret, token_secret):
+                        self.assertNotIn(secret, result.stdout + result.stderr + arguments)
+                    self.assertEqual(before, {path: path.read_bytes() for path in target.rglob("*") if path.is_file()})
+
+            incompatible = self.run_install(*base, "--update", "--front", "standard")
+            self.assertNotEqual(0, incompatible.returncode)
+            self.assertIn("--admin-host requires --front mtproxyl", incompatible.stderr)
+            self.assertEqual(before, {path: path.read_bytes() for path in target.rglob("*") if path.is_file()})
+
     def test_update_inherits_front_and_explicit_direct_override(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,6 +257,15 @@ class InstallerCliTests(unittest.TestCase):
             result = self.run_install(*base)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("Front: standard", result.stdout)
+            manager_env = dict(os.environ, ADGUARDHOME_DOH_MANAGER_UPDATE="1")
+            manager_legacy = subprocess.run(
+                [str(INSTALL), *base, "--front", "mtproxyl", "--admin-host", "stale.example.com"],
+                cwd=ROOT, env=manager_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, manager_legacy.returncode, manager_legacy.stderr)
+            self.assertIn("Front: standard", manager_legacy.stdout)
+            self.assertIn("Admin URL: https://dns.example.com/", manager_legacy.stdout)
+            self.assertNotIn("stale.example.com", manager_legacy.stdout + manager_legacy.stderr)
             state.write_text(json.dumps({**legacy, "front": "mtproxyl"}), encoding="utf-8")
             before = state.read_bytes()
             inherited = self.run_install(*base)
@@ -165,6 +289,7 @@ class InstallerCliTests(unittest.TestCase):
             fresh_result = self.run_install(
                 "--root", str(fresh), "--domain", "dns.example.com", "--public-ip", "203.0.113.10",
                 "--email", "admin@example.com", "--yes", "--front", "mtproxyl",
+                "--admin-host", "admin.example.com",
             )
             self.assertNotEqual(0, fresh_result.returncode)
             self.assertIn("совместный front MTProxyL ещё не активирован", fresh_result.stderr)
@@ -174,7 +299,7 @@ class InstallerCliTests(unittest.TestCase):
             state.parent.mkdir(parents=True)
             saved = dict(domain="dns.example.com", public_ip="203.0.113.10",
                          email="admin@example.com", version="1.0.0", repository="owner/repo",
-                         front="mtproxyl")
+                         front="mtproxyl", admin_host="admin.example.com")
             state.write_text(json.dumps(saved), encoding="utf-8")
             state.chmod(0o600)
             before = state.read_bytes()
@@ -189,7 +314,8 @@ class InstallerCliTests(unittest.TestCase):
                     self.assertEqual(before, state.read_bytes())
                     self.assertEqual([state], [path for path in root.rglob("*") if path.is_file()])
 
-            state.write_text(json.dumps({key: value for key, value in saved.items() if key != "front"}),
+            state.write_text(json.dumps({key: value for key, value in saved.items()
+                                         if key not in ("front", "admin_host")}),
                              encoding="utf-8")
             standard = self.run_install(*args, "--front", "standard")
             self.assertNotEqual(0, standard.returncode)
@@ -205,20 +331,21 @@ class InstallerCliTests(unittest.TestCase):
         source = INSTALL.read_text(encoding="utf-8")
         self.assertEqual(4, source.count('--front "$FRONT"'))
         self.assertEqual(2, source.count('${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"}'))
+        self.assertEqual(4, source.count('${ADMIN_HOST_ARGS[@]+"${ADMIN_HOST_ARGS[@]}"}'))
 
     def test_state_writer_embedded_in_installer_persists_only_mtproxyl_front(self):
         source = INSTALL.read_text(encoding="utf-8")
-        match = re.search(r'^python3 - [^\n]* "\$FRONT" <<\'PY\'\n(.*?)\nPY$', source,
+        match = re.search(r'^python3 - [^\n]* "\$FRONT" "\$ADMIN_HOST" <<\'PY\'\n(.*?)\nPY$', source,
                           re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(match)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / "install.json"
             enabled = root / "enabled-services.json"
-            for front in ("standard", "mtproxyl"):
+            for front, admin in (("standard", ""), ("mtproxyl", ""), ("mtproxyl", "admin.example.com")):
                 args = [sys.executable, "-", str(ROOT / "deploy/lib/state.py"), str(state),
                         "dns.example.com", "203.0.113.10", "admin@example.com", "1.0.0",
-                        "owner/repo", str(enabled), "chatgpt", "", "", "", front]
+                        "owner/repo", str(enabled), "chatgpt", "", "", "", front, admin]
                 result = subprocess.run(args, input=match.group(1), cwd=ROOT, text=True,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.assertEqual(0, result.returncode, result.stderr)
@@ -227,6 +354,10 @@ class InstallerCliTests(unittest.TestCase):
                     self.assertNotIn("front", data)
                 else:
                     self.assertEqual("mtproxyl", data["front"])
+                if admin:
+                    self.assertEqual(admin, data["admin_host"])
+                else:
+                    self.assertNotIn("admin_host", data)
 
     def test_dry_run_accepts_a_relay_exit_host_but_not_itself(self):
         base = ("--domain", "dns.example.com", "--public-ip", "203.0.113.10",

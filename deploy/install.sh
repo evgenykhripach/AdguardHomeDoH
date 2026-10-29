@@ -17,6 +17,9 @@ FRONT=standard
 FRONT_ARGUMENT=0
 SAVED_FRONT=standard
 DOMAIN=
+ADMIN_HOST=
+ADMIN_HOST_ARGUMENT=0
+ADMIN_HOST_ARGS=()
 PUBLIC_IP=
 RELAY=
 RELAY_ARGUMENT=0
@@ -64,6 +67,7 @@ usage: install.sh [options]
   --local-site H=A    serve an existing site behind the listener: HOST=IPV4:PORT,
                       repeatable; *=IPV4:PORT sets the target for unknown SNI
   --front MODE       listener front: standard or mtproxyl
+  --admin-host HOST  separate admin hostname (mtproxyl only)
   --repository REPO   GitHub repository for releases (owner/name)
   --email EMAIL       certificate contact (prompted when omitted)
   --services IDS      comma-separated stable service IDs
@@ -88,6 +92,9 @@ while (($#)); do
             (($# >= 2)) || adguardhome_doh_die "--front requires a value"
             case "$2" in standard|mtproxyl) FRONT="$2" ;; *) adguardhome_doh_die "invalid --front: $2" ;; esac
             FRONT_ARGUMENT=1; shift 2 ;;
+        --admin-host)
+            (($# >= 2)) || adguardhome_doh_die "--admin-host requires a value"
+            ADMIN_HOST="$2"; ADMIN_HOST_ARGUMENT=1; shift 2 ;;
         --relay)
             (($# >= 2)) || adguardhome_doh_die "--relay requires a value"
             RELAY="$2"; RELAY_ARGUMENT=1; shift 2 ;;
@@ -127,6 +134,7 @@ if ((UPDATE)) && [[ "${ADGUARDHOME_DOH_MANAGER_UPDATE:-0}" == 1 ]]; then
     POLICY_ARGUMENT=0
     SERVICES_ARGUMENT=0
     FRONT_ARGUMENT=0
+    ADMIN_HOST_ARGUMENT=0
     POLICY="$PROJECT_ROOT/config/policy.csv"
 fi
 
@@ -183,7 +191,8 @@ spec.loader.exec_module(module)
 try:
     state = module.load_install_state(Path(sys.argv[2]))
     fields = [state["repository"], state.get("relay", ""), state["public_ip"], state.get("policy", ""),
-              state["domain"], state["email"], state.get("front", "standard"), *state.get("local_sites", [])]
+              state["domain"], state["email"], state.get("front", "standard"), state.get("admin_host", ""),
+              *state.get("local_sites", [])]
     if any("\n" in item or "\r" in item for item in fields):
         raise ValueError("invalid newline in saved installation settings")
     print("\n".join(fields))
@@ -199,6 +208,7 @@ PY
     EXISTING_PUBLIC_IP="${saved[2]}"
     SAVED_FRONT="${saved[6]}"
     ((FRONT_ARGUMENT)) || FRONT="$SAVED_FRONT"
+    ((ADMIN_HOST_ARGUMENT)) || ADMIN_HOST="${saved[7]:-}"
     if [[ "${ADGUARDHOME_DOH_MANAGER_UPDATE:-0}" == 1 ]]; then
         DOMAIN="${saved[4]}"
         PUBLIC_IP="${saved[2]}"
@@ -210,7 +220,7 @@ PY
         POLICY_INHERITED=1
         SERVICES_ARGUMENT=0
     fi
-    ((LOCAL_SITE_ARGUMENT)) || LOCAL_SITES=("${saved[@]:7}")
+    ((LOCAL_SITE_ARGUMENT)) || LOCAL_SITES=("${saved[@]:8}")
 }
 
 EXISTING_PUBLIC_IP=
@@ -360,6 +370,7 @@ adguardhome_doh_confirm_install() {
     printf 'Домен: %s\nПубличный IPv4: %s\nEmail: %s\n' "$DOMAIN" "$PUBLIC_IP" "$EMAIL"
     printf 'Relay: %s\n' "${RELAY:-нет}"
     printf 'Front: %s\n' "$FRONT"
+    [[ -z "$ADMIN_HOST" ]] || printf 'Admin URL: https://%s/\n' "$ADMIN_HOST"
     printf 'Локальные сайты: %s\n' "${LOCAL_SITES_CSV:-нет}"
     if ((POLICY_LEGACY_RECOVERED)); then
         printf 'Политика: восстановлена из предыдущей установки\n'
@@ -425,7 +436,7 @@ adguardhome_doh_summary() {
     local log_path="$1" token="$2" password="$3" credentials="$4"
     printf '\nAdGuard Home DoH installation summary:\n'
     printf 'Front: %s\n' "$FRONT"
-    printf 'Admin URL: https://%s/\n' "$DOMAIN"
+    printf 'Admin URL: https://%s/\n' "${ADMIN_HOST:-$DOMAIN}"
     printf 'Login: admin\n'
     printf 'Password: %s\n' "$password"
     printf 'DoH URL: https://%s/doh/%s\n' "$DOMAIN" "$token"
@@ -438,6 +449,7 @@ adguardhome_doh_summary() {
 adguardhome_doh_update_summary() {
     local log_path="$1"
     printf '\nОбновление adguardhome-doh завершено.\n'
+    [[ -z "$ADMIN_HOST" ]] || printf 'Admin URL: https://%s/\n' "$ADMIN_HOST"
     printf 'Данные доступа: пункт 1 меню менеджера.\n'
     printf 'Install log: %s\n' "$log_path"
     printf 'Management: sudo adguardhome-doh\n'
@@ -455,13 +467,13 @@ adguardhome_doh_render_dry_run() {
     fi
     output="$(mktemp -d)"
     if ((POLICY_ARGUMENT)); then
-        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" ${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"} --front "$FRONT" --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
+        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" ${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"} --front "$FRONT" ${ADMIN_HOST_ARGS[@]+"${ADMIN_HOST_ARGS[@]}"} --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
         else
             status=$?
         fi
     else
-        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --config-dir "$PROJECT_ROOT/config" --services "$SERVICES" --front "$FRONT"             --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
+        if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --config-dir "$PROJECT_ROOT/config" --services "$SERVICES" --front "$FRONT" ${ADMIN_HOST_ARGS[@]+"${ADMIN_HOST_ARGS[@]}"}             --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
         else
             status=$?
@@ -476,6 +488,14 @@ adguardhome_doh_load_saved_services
 [[ -n "$REPOSITORY" && "$REPOSITORY" != *$'\n'* && "$REPOSITORY" != *$'\r'* ]] || \
     adguardhome_doh_die "invalid repository"
 adguardhome_doh_prompt_missing_values || exit $?
+if ((ADMIN_HOST_ARGUMENT)) || [[ -n "$ADMIN_HOST" ]]; then
+    ADMIN_HOST="$(printf '%s' "$ADMIN_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+    adguardhome_doh_validate_hostname "$ADMIN_HOST" || adguardhome_doh_die "invalid --admin-host"
+    [[ "$FRONT" == mtproxyl ]] || adguardhome_doh_die "--admin-host requires --front mtproxyl"
+    [[ "$ADMIN_HOST" != "$DOMAIN" && "$ADMIN_HOST" != "web.$DOMAIN" ]] || \
+        adguardhome_doh_die "--admin-host conflicts with an existing MTProxyL route"
+    ADMIN_HOST_ARGS=(--admin-host "$ADMIN_HOST" --admin-certificate-root "/etc/letsencrypt/live/$ADMIN_HOST")
+fi
 if [[ -n "$RELAY" ]]; then
     # The relay is an exit host that can reach the real sites; forwarding to
     # ourselves would loop every routed connection back into this listener.
@@ -689,10 +709,11 @@ HEALTHY_SERVICES="$(adguardhome_doh_healthy_services "$STATE_DIR/health-state.js
 healthy_args=()
 [[ -n "$HEALTHY_SERVICES" ]] && healthy_args=(--healthy-services "$HEALTHY_SERVICES")
 if ((POLICY_ARGUMENT)); then
-    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" ${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"} --front "$FRONT" ${healthy_args[@]+"${healthy_args[@]}"} --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"         --doh-token-file "$DOH_TOKEN_FILE" --password-hash-file "$stage/password-hash"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
+    adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"         --policy "$POLICY" ${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"} --front "$FRONT" ${ADMIN_HOST_ARGS[@]+"${ADMIN_HOST_ARGS[@]}"} ${healthy_args[@]+"${healthy_args[@]}"} --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"         --doh-token-file "$DOH_TOKEN_FILE" --password-hash-file "$stage/password-hash"         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 else
     adguardhome_doh_run_logged python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py" \
         --config-dir "$PROJECT_ROOT/config" --services "$SERVICES" --front "$FRONT" \
+        ${ADMIN_HOST_ARGS[@]+"${ADMIN_HOST_ARGS[@]}"} \
         ${healthy_args[@]+"${healthy_args[@]}"} \
         ${existing_args[@]+"${existing_args[@]}"} \
         --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} --doh-host "$DOMAIN" \
@@ -773,7 +794,7 @@ EOF
 chmod 600 /etc/adguardhome-doh/runtime.env
 
 if [[ ! -f "$CREDENTIALS_FILE" ]]; then
-    printf '%s' "$ADMIN_PASSWORD" | python3 "$SCRIPT_DIR/lib/credentials.py" --path "$CREDENTIALS_FILE"         --url "https://$DOMAIN/" --password-stdin >/dev/null
+    printf '%s' "$ADMIN_PASSWORD" | python3 "$SCRIPT_DIR/lib/credentials.py" --path "$CREDENTIALS_FILE"         --url "https://${ADMIN_HOST:-$DOMAIN}/" --password-stdin >/dev/null
 fi
 SAVED_POLICY=
 if ((POLICY_ARGUMENT)); then
@@ -784,19 +805,19 @@ if ((POLICY_ARGUMENT)); then
         chmod 600 "$SAVED_POLICY"
     fi
 fi
-python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" "$RELAY" "$LOCAL_SITES_CSV" "$SAVED_POLICY" "$FRONT" <<'PY'
+python3 - "$SCRIPT_DIR/lib/state.py" "$INSTALL_STATE_FILE" "$DOMAIN" "$PUBLIC_IP" "$EMAIL" "$PROJECT_VERSION" "$REPOSITORY" "$ENABLED_SERVICES_FILE" "$SERVICES" "$RELAY" "$LOCAL_SITES_CSV" "$SAVED_POLICY" "$FRONT" "$ADMIN_HOST" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
 
-module_path, install_path, domain, public_ip, email, version, repository, services_path, services, relay, local_sites, policy, front = sys.argv[1:]
+module_path, install_path, domain, public_ip, email, version, repository, services_path, services, relay, local_sites, policy, front, admin_host = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("adguardhome_doh_state", module_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.save_install_state(Path(install_path), domain=domain, public_ip=public_ip, email=email,
                           version=version, repository=repository, relay=relay or None,
                           local_sites=[item for item in local_sites.split(",") if item], policy=policy or None,
-                          front=front if front == "mtproxyl" else None)
+                          front=front if front == "mtproxyl" else None, admin_host=admin_host or None)
 module.save_enabled_services(Path(services_path), [item for item in services.split(",") if item])
 PY
 adguardhome_doh_progress 75 'состояние и профили сохранены'

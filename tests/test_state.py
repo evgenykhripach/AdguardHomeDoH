@@ -106,6 +106,54 @@ class StateTests(unittest.TestCase):
             self.assertEqual("mtproxyl", json.loads(path.read_text(encoding="utf-8"))["front"])
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
 
+    def test_optional_admin_host_round_trips_normalized_with_mtproxyl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "install.json"
+            common = dict(domain="DNS.Example.com", public_ip="203.0.113.10",
+                          email="admin@example.com", version="1.0.0", repository="repo")
+            written = save_install_state(path, **common, front="mtproxyl",
+                                         admin_host="Admin.Example.COM")
+            self.assertEqual("dns.example.com", written["domain"])
+            self.assertEqual("admin.example.com", written["admin_host"])
+            self.assertEqual(written, load_install_state(path))
+            self.assertEqual("admin.example.com", json.loads(path.read_text())["admin_host"])
+            save_install_state(path, **common, front="mtproxyl")
+            self.assertNotIn("admin_host", load_install_state(path))
+
+    def test_admin_host_rejects_invalid_or_conflicting_values_on_save_and_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "install.json"
+            common = dict(domain="dns.example.com", public_ip="203.0.113.10",
+                          email="admin@example.com", version="1.0.0", repository="repo")
+            save_install_state(path, **common, front="mtproxyl")
+            before = path.read_bytes()
+            invalid = ("", " admin.example.com", "admin.example.com.", "admin/example.com",
+                       "admin_.example.com", "admin.example.123", "admin.example.xn--x",
+                       "*.example.com", "dns.example.com", "DNS.EXAMPLE.COM",
+                       "web.dns.example.com", "WEB.DNS.EXAMPLE.COM", False, 0, [], {})
+            for value in invalid:
+                with self.subTest(value=value):
+                    with self.assertRaises(ValueError):
+                        save_install_state(path, **common, front="mtproxyl", admin_host=value)
+                    self.assertEqual(before, path.read_bytes())
+                    path.write_text(json.dumps({**common, "front": "mtproxyl", "admin_host": value}))
+                    with self.assertRaises(ValueError):
+                        load_install_state(path)
+                    path.write_bytes(before)
+            for front in (None, "standard"):
+                with self.subTest(front=front):
+                    with self.assertRaises(ValueError):
+                        save_install_state(path, **common, front=front, admin_host="admin.example.com")
+                    raw = {**common, "admin_host": "admin.example.com"}
+                    if front is not None:
+                        raw["front"] = front
+                    path.write_text(json.dumps(raw))
+                    with self.assertRaises(ValueError):
+                        load_install_state(path)
+            path.write_text(json.dumps({**common, "front": "mtproxyl", "admin_host": None}))
+            with self.assertRaises(ValueError):
+                load_install_state(path)
+
     def test_front_rejects_any_other_value_on_load_and_save(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "install.json"
