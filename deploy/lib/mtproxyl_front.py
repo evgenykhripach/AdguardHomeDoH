@@ -102,7 +102,7 @@ def _tokens(src):
 def _parse(src):
     tokens = _tokens(src)
     pos = 0
-    def parse_block(nested=False):
+    def parse_block(nested=False, map_entries=False):
         nonlocal pos
         nodes = []
         while pos < len(tokens):
@@ -116,11 +116,13 @@ def _parse(src):
             while pos < len(tokens) and tokens[pos][0] not in (';', '{', '}'):
                 args.append(tokens[pos][0])
                 pos += 1
-            if not args or not args[0] or pos == len(tokens) or tokens[pos][0] == '}':
+            if not args or pos == len(tokens) or tokens[pos][0] == '}':
                 raise ValueError('invalid directive')
             delimiter, opening, _ = tokens[pos]
+            if not args[0] and (not map_entries or len(args) != 2 or delimiter != ';'):
+                raise ValueError('invalid empty directive')
             pos += 1
-            children = parse_block(True) if delimiter == '{' else None
+            children = parse_block(True, args[0] == 'map') if delimiter == '{' else None
             nodes.append(Directive(args, start, opening if children is not None else None, children))
         if nested:
             raise ValueError('unclosed block')

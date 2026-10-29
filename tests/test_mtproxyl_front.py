@@ -69,6 +69,20 @@ class OverlayTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 patch(bad, DOMAIN)
 
+    def test_map_empty_key_allowed_only_as_map_entry(self):
+        mapping = "map $http_upgrade $connection_upgrade { default upgrade; '' close; }"
+        source = REALISTIC.replace('http {', 'http {\n    ' + mapping)
+        self.assertEqual(unpatch(patch(source, DOMAIN), DOMAIN), source)
+        bad = (
+            REALISTIC.replace('http {', "http { '' close;"),
+            REALISTIC.replace('http {', "http { map $http_upgrade $connection_upgrade { '' close extra; }"),
+            REALISTIC.replace('http {', "http { map $http_upgrade $connection_upgrade { '' close { } }"),
+            REALISTIC.replace('http {', "http { map $http_upgrade $connection_upgrade { ' close; }"),
+        )
+        for candidate in bad:
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                patch(candidate, DOMAIN)
+
     def test_six_server_template_is_preserved_and_idempotent(self):
         result = patch(REALISTIC, DOMAIN)
         self.assertEqual(unpatch(result, DOMAIN), REALISTIC)
