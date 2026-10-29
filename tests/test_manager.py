@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from deploy.lib.render_runtime import render_service_health_policy
 from tools.render_config import Catalog
 
 
@@ -1400,6 +1401,483 @@ class BackupSafetyTests(unittest.TestCase):
             manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True)
             for relative in manager.FRONT_SITE_FILES:
                 self.assertFalse(manager.under_root(root, relative).exists())
+
+
+class ServiceChangeMenuSafetyTests(unittest.TestCase):
+    def _state(self, root, services, relay=None):
+        state_dir = root / "var/lib/adguardhome-doh"
+        state_dir.mkdir(parents=True)
+        state = {"domain": "dns.example.com", "public_ip": "203.0.113.10"}
+        if relay is not None:
+            state["relay"] = relay
+        (state_dir / "install.json").write_text(json.dumps(state), encoding="utf-8")
+        (state_dir / "enabled-services.json").write_text(json.dumps(services), encoding="utf-8")
+        catalog = Catalog.load(ROOT / "config")
+        health_policy = root / "etc/adguardhome-doh/health-policy.json"
+        health_policy.parent.mkdir(parents=True)
+        health_policy.write_text(json.dumps(render_service_health_policy(
+            catalog, services, catalog.enabled_policy(services)
+        )), encoding="utf-8")
+        shutil.copytree(ROOT / "config", root / "etc/adguardhome-doh/catalog")
+        healthcheck = root / "usr/local/libexec/adguardhome-doh/healthcheck.py"
+        healthcheck.parent.mkdir(parents=True)
+        shutil.copy2(ROOT / "deploy/templates/healthcheck.py", healthcheck)
+        return state_dir
+
+    def _menu_patches(self, manager, catalog, selected):
+        return (
+            mock.patch.object(manager, "_load_catalog", return_value=catalog),
+            mock.patch.object(manager, "collect_menu_status", return_value={}),
+            mock.patch.object(manager, "select_services_interactive", return_value=selected),
+        )
+
+    def test_relay_removal_decline_or_eof_does_not_apply(self):
+        for response in ("n\n0\n", ""):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                state_dir = self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+                before = {path.name: path.read_bytes() for path in state_dir.iterdir()}
+                catalog = Catalog.load(ROOT / "config")
+                output = io.StringIO()
+                patches = self._menu_patches(manager, catalog, ["chatgpt"])
+                with patches[0], patches[1], patches[2], \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    result = manager.run_menu(root, io.StringIO("2\ny\n" + response), output)
+                self.assertEqual(0, result)
+                apply.assert_not_called()
+                self.assertEqual(before, {path.name: path.read_bytes() for path in state_dir.iterdir()})
+                text = re.sub(r"\s+", " ", output.getvalue())
+                self.assertIn("SNI", text)
+                self.assertIn("кеш", text.lower())
+                self.assertIn("потерять доступ", text.lower())
+                self.assertIn("Подтвердить риск", text)
+
+    def test_relay_removal_uses_separate_confirmation_without_input_locks(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+            catalog = Catalog.load(ROOT / "config")
+            lock_paths = [manager.under_root(root, name) for name in
+                          (manager.OPERATION_LOCK, manager.HEALTH_LOCK)]
+            for path in lock_paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            class LockCheckingInput(io.StringIO):
+                def readline(self, *args):
+                    for path in lock_paths:
+                        with path.open("a+") as stream:
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                    return super().readline(*args)
+
+            patches = self._menu_patches(manager, catalog, ["chatgpt"])
+            with patches[0], patches[1], patches[2], \
+                 mock.patch.object(manager, "_stop_adguard") as stop, \
+                 mock.patch.object(manager, "_apply_service_change_locked", return_value=root) as apply:
+                result = manager.run_menu(root, LockCheckingInput("2\ny\ny\n0\n"), io.StringIO())
+            self.assertEqual(0, result)
+            stop.assert_called_once_with(root)
+            apply.assert_called_once()
+            self.assertIs(catalog, apply.call_args.kwargs["catalog"])
+            self.assertEqual(["chatgpt"], apply.call_args.args[0])
+
+    def test_real_selector_decline_does_not_apply(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+            catalog = Catalog.load(ROOT / "config")
+            output = io.StringIO()
+            with mock.patch.object(manager, "_load_catalog", return_value=catalog), \
+                 mock.patch.object(manager, "collect_menu_status", return_value={}), \
+                 mock.patch.object(manager, "apply_service_change") as apply:
+                result = manager.run_menu(
+                    root, io.StringIO("2\n/claude\n1\nb\ny\ny\ny\nn\n0\n"), output
+                )
+            self.assertEqual(0, result)
+            apply.assert_not_called()
+            self.assertIn("Подтвердить риск", output.getvalue())
+
+    def test_single_host_addition_and_shared_domain_removal_need_no_extra_confirmation(self):
+        cases = (
+            (None, ["chatgpt", "claude"], ["chatgpt"]),
+            ("203.0.113.99", ["chatgpt"], ["chatgpt", "claude"]),
+            ("203.0.113.99", ["xbox", "xbox_shared"], ["xbox"]),
+        )
+        for relay, current, selected in cases:
+            with self.subTest(relay=relay, current=current, selected=selected), \
+                 tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                self._state(root, current, relay)
+                catalog = Catalog.load(ROOT / "config")
+                output = io.StringIO()
+                patches = self._menu_patches(manager, catalog, selected)
+                with patches[0], patches[1], patches[2], \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    result = manager.run_menu(root, io.StringIO("2\ny\n0\n"), output)
+                self.assertEqual(0, result)
+                apply.assert_called_once()
+                self.assertEqual(current, apply.call_args.kwargs["expected_services"])
+                self.assertEqual(relay, apply.call_args.kwargs["expected_relay"])
+                self.assertIs(catalog, apply.call_args.kwargs["catalog"])
+                self.assertNotIn("Подтвердить риск", output.getvalue())
+
+    def test_custom_relay_policy_warns_even_when_catalog_removes_no_domains(self):
+        for saved_path in (False, True):
+            for response, should_apply in (("n\n0\n", False), ("y\n0\n", True)):
+                with self.subTest(saved_path=saved_path, response=response), \
+                     tempfile.TemporaryDirectory() as directory:
+                    manager = load_manager()
+                    root = Path(directory)
+                    state_dir = self._state(root, ["xbox", "xbox_shared"], "203.0.113.99")
+                    if saved_path:
+                        install = state_dir / "install.json"
+                        state = json.loads(install.read_text())
+                        state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
+                        install.write_text(json.dumps(state))
+                    policy = root / "etc/adguardhome-doh/health-policy.json"
+                    policy.write_text(json.dumps({"services": {}, "domains": [
+                        {"domain": "old.example.org", "kind": "fqdn", "probe": "old.example.org"}
+                    ]}))
+                    catalog = Catalog.load(ROOT / "config")
+                    output = io.StringIO()
+                    patches = self._menu_patches(manager, catalog, ["xbox"])
+                    with patches[0], patches[1], patches[2], \
+                         mock.patch.object(manager, "apply_service_change") as apply:
+                        result = manager.run_menu(root, io.StringIO("2\ny\n" + response), output)
+                    self.assertEqual(0, result)
+                    self.assertEqual(should_apply, apply.called)
+                    text = re.sub(r"\s+", " ", output.getvalue()).lower()
+                    self.assertIn("индивидуальн", text)
+                    self.assertIn("sni", text)
+                    self.assertIn("кеш", text)
+                    self.assertIn("подтвердить риск", text)
+                    self.assertIn("не учитывает", text)
+
+    def test_unavailable_install_state_cannot_start_a_change(self):
+        for content in (None, "{broken", "[]", "{}"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                state_dir = self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+                install = state_dir / "install.json"
+                if content is None:
+                    install.unlink()
+                else:
+                    install.write_text(content, encoding="utf-8")
+                catalog = Catalog.load(ROOT / "config")
+                output = io.StringIO()
+                patches = self._menu_patches(manager, catalog, ["chatgpt"])
+                with patches[0], patches[1], patches[2] as selector, \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    result = manager.run_menu(root, io.StringIO("2\n0\n"), output)
+                self.assertEqual(0, result)
+                selector.assert_not_called()
+                apply.assert_not_called()
+                self.assertIn("данные установки не найдены", output.getvalue())
+
+    def test_incomplete_install_state_cannot_start_a_change(self):
+        invalid = (
+            {"domain": "dns.example.com"},
+            {"domain": 12, "public_ip": "203.0.113.10"},
+            {"domain": "dns.example.com", "public_ip": []},
+            {"domain": "dns.example.com", "public_ip": "203.0.113.10", "relay": False},
+            {"domain": "dns.example.com", "public_ip": "203.0.113.10", "policy": []},
+        )
+        for state in invalid:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                state_dir = self._state(root, ["chatgpt", "claude"])
+                (state_dir / "install.json").write_text(json.dumps(state))
+                catalog = Catalog.load(ROOT / "config")
+                patches = self._menu_patches(manager, catalog, ["chatgpt"])
+                with patches[0], patches[1], patches[2] as selector, \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    manager.run_menu(root, io.StringIO("2\n0\n"), io.StringIO())
+                selector.assert_not_called()
+                apply.assert_not_called()
+
+    def test_bad_enabled_state_is_rejected_but_empty_array_is_preserved(self):
+        for content in (None, "", "{broken", "{}", '["unknown"]', '["chatgpt", 1]',
+                        '["chatgpt", "chatgpt"]'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                state_dir = self._state(root, ["chatgpt"], "203.0.113.99")
+                enabled = state_dir / "enabled-services.json"
+                if content is None:
+                    enabled.unlink()
+                else:
+                    enabled.write_text(content, encoding="utf-8")
+                catalog = Catalog.load(ROOT / "config")
+                output = io.StringIO()
+                patches = self._menu_patches(manager, catalog, ["claude"])
+                with patches[0], patches[1], patches[2] as selector, \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    result = manager.run_menu(root, io.StringIO("2\n0\n"), output)
+                self.assertEqual(0, result)
+                selector.assert_not_called()
+                apply.assert_not_called()
+                self.assertIn("список активных сервисов", output.getvalue().lower())
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = load_manager()
+            root = Path(directory)
+            self._state(root, [], "203.0.113.99")
+            catalog = Catalog.load(ROOT / "config")
+            patches = self._menu_patches(manager, catalog, ["claude"])
+            with patches[0], patches[1], patches[2] as selector, \
+                 mock.patch.object(manager, "apply_service_change") as apply:
+                manager.run_menu(root, io.StringIO("2\ny\n0\n"), io.StringIO())
+            self.assertEqual([], selector.call_args.args[1])
+            self.assertEqual([], apply.call_args.kwargs["expected_services"])
+
+    def test_invalid_relay_health_policy_blocks_menu(self):
+        for content in (None, "{broken", "{}", '{"services":{},"domains":[{"domain":"bad"}]}'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+                policy = root / "etc/adguardhome-doh/health-policy.json"
+                if content is None:
+                    policy.unlink()
+                else:
+                    policy.write_text(content, encoding="utf-8")
+                catalog = Catalog.load(ROOT / "config")
+                output = io.StringIO()
+                patches = self._menu_patches(manager, catalog, ["chatgpt"])
+                with patches[0], patches[1], patches[2] as selector, \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    manager.run_menu(root, io.StringIO("2\n0\n"), output)
+                selector.assert_not_called()
+                apply.assert_not_called()
+                self.assertIn("политика", output.getvalue().lower())
+
+    def test_relay_policy_mismatch_blocks_preview_and_application(self):
+        for mismatch in ("missing_domain", "added_domain", "kind", "owners", "extra_service"):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+                health = root / "etc/adguardhome-doh/health-policy.json"
+                policy = json.loads(health.read_text())
+                rows = policy["domains"]
+                if mismatch == "missing_domain":
+                    rows.pop()
+                elif mismatch == "added_domain":
+                    rows.append({"domain": "unknown.example.org", "kind": "fqdn",
+                                 "probe": "unknown.example.org", "services": ["chatgpt"]})
+                elif mismatch == "kind":
+                    rows[0]["kind"] = "fqdn" if rows[0]["kind"] == "suffix" else "suffix"
+                elif mismatch == "owners":
+                    rows[0]["services"] = ["claude" if rows[0]["services"] == ["chatgpt"] else "chatgpt"]
+                else:
+                    policy["services"]["xbox"] = ["xbox.com"]
+                health.write_text(json.dumps(policy))
+                policy_hash = hashlib.sha256(health.read_bytes()).hexdigest()
+                catalog = Catalog.load(ROOT / "config")
+                output = io.StringIO()
+                patches = self._menu_patches(manager, catalog, ["chatgpt"])
+                with patches[0], patches[1], patches[2] as selector, \
+                     mock.patch.object(manager, "apply_service_change") as apply:
+                    manager.run_menu(root, io.StringIO("2\n0\n"), output)
+                selector.assert_not_called()
+                apply.assert_not_called()
+                self.assertIn("политика", output.getvalue().lower())
+
+                # Even if the incorrect policy is unchanged since preview, the
+                # guarded application must reject it before stopping AdGuard.
+                with mock.patch.object(manager, "_stop_adguard") as stop:
+                    with self.assertRaisesRegex(RuntimeError, "Повторите выбор"):
+                        manager.apply_service_change(
+                            ["chatgpt"], root=root, catalog=catalog,
+                            expected_services=["chatgpt", "claude"],
+                            expected_relay="203.0.113.99", expected_policy_hash=policy_hash,
+                        )
+                stop.assert_not_called()
+
+    def test_relay_policy_accepts_supported_alternate_service_and_owner_forms(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+            health = root / "etc/adguardhome-doh/health-policy.json"
+            policy = json.loads(health.read_text())
+            policy["services"] = [
+                {"id": service_id, "probes": probes}
+                for service_id, probes in policy["services"].items()
+            ]
+            for row in policy["domains"]:
+                owners = row.pop("services")
+                if len(owners) == 1:
+                    row["service_id"] = owners[0]
+                else:
+                    row["service_ids"] = owners
+            health.write_text(json.dumps(policy))
+            catalog = Catalog.load(ROOT / "config")
+            patches = self._menu_patches(manager, catalog, ["chatgpt", "claude"])
+            with patches[0], patches[1], patches[2], \
+                 mock.patch.object(manager, "apply_service_change") as apply:
+                manager.run_menu(root, io.StringIO("2\ny\n0\n"), io.StringIO())
+            apply.assert_called_once()
+
+    def test_parallel_service_or_relay_drift_stops_before_adguard(self):
+        for drift in ("services", "enabled_missing", "relay_added", "relay_removed", "catalog",
+                      "policy_added", "policy_removed", "health_changed", "health_invalid",
+                      "install_missing"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = Path(directory)
+                relay = None if drift == "relay_added" else "203.0.113.99"
+                state_dir = self._state(root, ["chatgpt", "claude"], relay)
+                policy_path = "/etc/adguardhome-doh/compat-policy.csv" if drift == "policy_removed" else None
+                install = state_dir / "install.json"
+                if policy_path:
+                    state = json.loads(install.read_text())
+                    state["policy"] = policy_path
+                    install.write_text(json.dumps(state))
+                health_policy = root / "etc/adguardhome-doh/health-policy.json"
+                policy_hash = hashlib.sha256(health_policy.read_bytes()).hexdigest() if relay else None
+                catalog = Catalog.load(ROOT / "config")
+                started = threading.Event()
+                errors = []
+
+                def worker():
+                    started.set()
+                    try:
+                        manager.apply_service_change(
+                            ["chatgpt"], root=root, catalog=catalog,
+                            expected_services=["chatgpt", "claude"], expected_relay=relay,
+                            expected_policy=policy_path, expected_policy_hash=policy_hash,
+                        )
+                    except Exception as exc:
+                        errors.append(exc)
+
+                with mock.patch.object(manager, "_stop_adguard") as stop, \
+                     mock.patch.object(manager, "_apply_service_change_locked") as apply:
+                    with manager.operation_lock(root):
+                        thread = threading.Thread(target=worker)
+                        thread.start()
+                        self.assertTrue(started.wait(1))
+                        if drift == "services":
+                            (state_dir / "enabled-services.json").write_text('["chatgpt"]')
+                        elif drift == "enabled_missing":
+                            (state_dir / "enabled-services.json").unlink()
+                        elif drift == "install_missing":
+                            install.unlink()
+                        elif drift == "health_changed":
+                            health_policy.write_text(health_policy.read_text() + "\n")
+                        elif drift == "health_invalid":
+                            health_policy.write_text("{}")
+                        elif drift == "catalog":
+                            domains = root / "etc/adguardhome-doh/catalog/domains.csv"
+                            old_catalog = domains.read_text()
+                            new_catalog = old_catalog.replace("chatgpt.com,suffix", "chatgpt.com,fqdn")
+                            self.assertNotEqual(old_catalog, new_catalog)
+                            domains.write_text(new_catalog)
+                        else:
+                            state = json.loads(install.read_text())
+                            if drift == "relay_added":
+                                state["relay"] = "203.0.113.99"
+                            elif drift == "relay_removed":
+                                state.pop("relay")
+                            elif drift == "policy_added":
+                                state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
+                            elif drift == "policy_removed":
+                                state.pop("policy")
+                            install.write_text(json.dumps(state))
+                    thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(1, len(errors))
+                self.assertIsInstance(errors[0], RuntimeError)
+                self.assertIn("Повторите выбор", str(errors[0]))
+                stop.assert_not_called()
+                apply.assert_not_called()
+
+    def test_service_order_does_not_count_as_drift(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root, ["claude", "chatgpt"], "203.0.113.99")
+            catalog = Catalog.load(ROOT / "config")
+            health_policy = root / "etc/adguardhome-doh/health-policy.json"
+            policy_hash = hashlib.sha256(health_policy.read_bytes()).hexdigest()
+            with mock.patch.object(manager, "_stop_adguard") as stop, \
+                 mock.patch.object(manager, "_apply_service_change_locked", return_value=root) as apply:
+                manager.apply_service_change(
+                    ["chatgpt"], root=root, catalog=catalog,
+                    expected_services=["chatgpt", "claude"], expected_relay="203.0.113.99",
+                    expected_policy_hash=policy_hash,
+                )
+            stop.assert_called_once_with(root)
+            apply.assert_called_once()
+
+    def test_menu_asks_to_retry_after_drift_on_narrow_terminal(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+            catalog = Catalog.load(ROOT / "config")
+            output = io.StringIO()
+
+            class DriftingInput(io.StringIO):
+                reads = 0
+
+                def readline(self, *args):
+                    self.reads += 1
+                    if self.reads == 3:
+                        with manager.operation_lock(root):
+                            (state_dir / "enabled-services.json").write_text('["chatgpt"]')
+                    return super().readline(*args)
+
+            patches = self._menu_patches(manager, catalog, ["chatgpt"])
+            with patches[0], patches[1], patches[2], \
+                 mock.patch.object(manager, "_terminal_width", return_value=40), \
+                 mock.patch.object(manager, "_stop_adguard") as stop:
+                result = manager.run_menu(root, DriftingInput("2\ny\ny\n0\n"), output)
+            self.assertEqual(0, result)
+            self.assertIn("Повторите выбор", output.getvalue())
+            stop.assert_not_called()
+
+    def test_menu_reloads_catalog_on_retry_after_concurrent_update(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root, ["chatgpt", "claude"], "203.0.113.99")
+            output = io.StringIO()
+
+            class DriftingInput(io.StringIO):
+                reads = 0
+
+                def readline(self, *args):
+                    self.reads += 1
+                    if self.reads == 3:
+                        with manager.operation_lock(root):
+                            domains = root / "etc/adguardhome-doh/catalog/domains.csv"
+                            domains.write_text(domains.read_text().replace(
+                                "chatgpt.com,suffix", "chatgpt.com,fqdn"
+                            ))
+                            health = root / "etc/adguardhome-doh/health-policy.json"
+                            policy = json.loads(health.read_text())
+                            next(row for row in policy["domains"]
+                                 if row["domain"] == "chatgpt.com")["kind"] = "fqdn"
+                            health.write_text(json.dumps(policy))
+                    return super().readline(*args)
+
+            with mock.patch.object(manager, "collect_menu_status", return_value={}), \
+                 mock.patch.object(manager, "select_services_interactive", return_value=["chatgpt"]), \
+                 mock.patch.object(manager, "_stop_adguard") as stop, \
+                 mock.patch.object(manager, "_apply_service_change_locked", return_value=root) as apply:
+                result = manager.run_menu(root, DriftingInput("2\ny\ny\n2\ny\ny\n0\n"), output)
+            self.assertEqual(0, result)
+            self.assertIn("Повторите выбор", output.getvalue())
+            stop.assert_called_once_with(root)
+            apply.assert_called_once()
 
 
 class ServiceChangeSeedingTests(unittest.TestCase):

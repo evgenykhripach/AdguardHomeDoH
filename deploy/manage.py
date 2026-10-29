@@ -1493,13 +1493,39 @@ def apply_service_change(
     catalog: Any = None,
     renderer: Optional[Callable[[Path, Sequence[str]], None]] = None,
     validator: Optional[Callable[[], None]] = None,
+    expected_services: Optional[Sequence[str]] = None,
+    expected_relay: Optional[str] = None,
+    expected_policy: Optional[str] = None,
+    expected_policy_hash: Optional[str] = None,
 ) -> Path:
     """Render selected services to staging, validate, then atomically activate."""
 
     root = Path(root)
     with operation_lock(root), health_lock(root):
         _check_incomplete_transactions(root)
-        state = _read_json(_runtime_paths(root)["install"], {})
+        paths = _runtime_paths(root)
+        if expected_services is not None:
+            try:
+                if catalog is None:
+                    catalog = _load_catalog(paths["catalog"])
+                state, individual_policy, policy_hash, policy = _service_change_install_snapshot(root)
+                current = _load_enabled(paths, catalog, strict=True)
+                _validate_relay_service_policy(state, individual_policy, policy, catalog, current)
+                current_catalog = _load_catalog(paths["catalog"])
+                for service_ids in (current, selected):
+                    shown = {(row.domain, row.kind) for row in catalog.enabled_policy(service_ids)}
+                    actual = {(row.domain, row.kind) for row in current_catalog.enabled_policy(service_ids)}
+                    if shown != actual:
+                        raise RuntimeError("catalog changed")
+            except Exception as exc:
+                raise RuntimeError("Повторите выбор: состояние изменилось.") from exc
+            if (set(current) != set(expected_services)
+                    or state.get("relay") != expected_relay
+                    or state.get("policy") != expected_policy
+                    or policy_hash != expected_policy_hash):
+                raise RuntimeError("Повторите выбор: состояние изменилось.")
+        else:
+            state = _read_json(paths["install"], {})
         domain = str(state.get("domain", "")) if isinstance(state, Mapping) else ""
         if isinstance(state, Mapping) and _front_mode(state) == "mtproxyl":
             _require_front_files(root)
@@ -2118,6 +2144,66 @@ def _current_install_state(root: Path) -> Mapping[str, Any]:
     return state
 
 
+def _service_change_install_snapshot(root: Path) -> Tuple[Mapping[str, Any], bool, Optional[str], Any]:
+    """Capture the relay and any individual policy shown by the menu."""
+
+    state = _current_install_state(root)
+    for field in ("domain", "public_ip"):
+        if not isinstance(state.get(field), str) or not state[field].strip():
+            raise RuntimeError("данные установки неполны или повреждены")
+    for field in ("relay", "policy"):
+        if field in state and (not isinstance(state[field], str) or not state[field].strip()):
+            raise RuntimeError("данные установки повреждены")
+    if not state.get("relay") and not state.get("policy"):
+        return state, False, None, None
+
+    path = _runtime_paths(root)["health_policy"]
+    try:
+        content = path.read_bytes()
+        policy = json.loads(content)
+        validated = _load_healthcheck(root).load_policy(path)
+        if policy != validated:
+            raise ValueError("policy changed during validation")
+    except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+        raise RuntimeError("политика доменов недоступна или повреждена") from exc
+    # Older compatibility installs may have no install.json policy field.
+    legacy = (isinstance(policy, Mapping) and policy.get("services", {}) in ({}, [])
+              and bool(policy.get("domains"))) or (isinstance(policy, list) and bool(policy))
+    return state, bool(state.get("policy") or legacy), hashlib.sha256(content).hexdigest(), policy
+
+
+def _validate_relay_service_policy(
+    state: Mapping[str, Any], individual_policy: bool, policy: Any,
+    catalog: Any, current: Sequence[str],
+) -> None:
+    """Do not preview catalog removals against a different active policy."""
+
+    if not state.get("relay") or individual_policy:
+        return
+    services = policy.get("services", {}) if isinstance(policy, Mapping) else {}
+    if isinstance(services, Mapping):
+        policy_services = set(services)
+    else:
+        policy_services = {item.get("id", item.get("service_id")) for item in services}
+    rows = policy.get("domains", []) if isinstance(policy, Mapping) else policy
+    actual = {}
+    for row in rows:
+        owners = row.get("services", row.get("service_ids"))
+        if owners is None and row.get("service_id") is not None:
+            owners = [row["service_id"]]
+        if isinstance(owners, str):
+            owners = [owners]
+        key = (row["domain"].lower(), row["kind"])
+        actual.setdefault(key, set()).update(owners or [])
+    selected = set(current)
+    expected = {
+        (row.domain, row.kind): set(catalog.associations[row.domain]) & selected
+        for row in catalog.enabled_policy(current)
+    }
+    if policy_services != selected or actual != expected:
+        raise RuntimeError("политика доменов не совпадает с активными сервисами")
+
+
 def _installed_project_version(root: Path, state: Mapping[str, Any]) -> Any:
     """Read the adguardhome-doh version, never the bundled AdGuard version."""
 
@@ -2318,8 +2404,15 @@ def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subproces
         return True
 
 
-def _load_enabled(paths: Mapping[str, Path], catalog: Any) -> list:
+def _load_enabled(paths: Mapping[str, Path], catalog: Any, *, strict: bool = False) -> list:
     value = _read_json(paths["enabled"], None)
+    if strict:
+        known = {service.id for service in catalog.services}
+        if (not isinstance(value, list)
+                or any(not isinstance(item, str) or item not in known for item in value)
+                or len(value) != len(set(value))):
+            raise RuntimeError("список активных сервисов недоступен или повреждён")
+        return value
     if isinstance(value, list) and value:
         return [str(item) for item in value]
     return list(catalog.default_service_ids)
@@ -2433,8 +2526,11 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                 print_access_data(root, output)
                 _pause(input_stream, output)
             elif choice == "2":
-                current = _load_enabled(paths, catalog)
                 try:
+                    catalog = _load_catalog(paths["catalog"])
+                    state, individual_policy, policy_hash, policy = _service_change_install_snapshot(Path(root))
+                    current = _load_enabled(paths, catalog, strict=True)
+                    _validate_relay_service_policy(state, individual_policy, policy, catalog, current)
                     selected = select_services_interactive(
                         catalog, current, input_stream, output
                     )
@@ -2444,15 +2540,43 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                     preview = preview_service_change(catalog, current, selected)
                     _clear_screen(output)
                     _print_service_change_preview(catalog, preview, output)
+                    relay_risk = bool(state.get("relay") and
+                                      (individual_policy or preview["removed_domains"]))
+                    if relay_risk:
+                        if individual_policy:
+                            _print_wrapped(
+                                "! ", "Предпросмотр не учитывает индивидуальную политику. "
+                                "Выбор из каталога заменит её и может удалить SNI-маршруты сразу.",
+                                output,
+                            )
+                        else:
+                            _print_wrapped(
+                                "! ", "SNI-маршруты удаляемых доменов на relay исчезнут сразу.",
+                                output,
+                            )
+                        _print_wrapped(
+                            "! ", "Клиенты с IP relay в DNS-кеше могут потерять доступ "
+                            "к этим доменам.", output,
+                        )
                     print("Во время применения AdGuard Home остановится; DoH временно недоступен.",
                           file=output)
                     print("Применить изменения? [y/N]: ", end="", file=output, flush=True)
                     if not _is_yes_answer(input_stream.readline()):
                         notice = "Изменения отменены."
                         continue
+                    if relay_risk:
+                        print("Подтвердить риск для клиентов relay? [y/N]: ",
+                              end="", file=output, flush=True)
+                        if not _is_yes_answer(input_stream.readline()):
+                            notice = "Изменения отменены."
+                            continue
                     print(_style("Применяем конфигурацию…", ANSI_CYAN, output),
                           file=output, flush=True)
-                    apply_service_change(selected, root=root, catalog=catalog)
+                    apply_service_change(
+                        selected, root=root, catalog=catalog, expected_services=current,
+                        expected_relay=state.get("relay"), expected_policy=state.get("policy"),
+                        expected_policy_hash=policy_hash,
+                    )
                     notice = "Сервисы активированы."
                 except Exception as exc:
                     detail = _process_error_detail(exc)
