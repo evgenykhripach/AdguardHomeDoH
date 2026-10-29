@@ -56,6 +56,8 @@ ADGUARDHOME_DOH_NGINX_TEMP=
 ADGUARDHOME_DOH_NEW_CERTBOT_LINEAGE=0
 ADGUARDHOME_DOH_HEALTH_PAUSED=0
 ADGUARDHOME_DOH_LEGACY_POLICY_TEMP=
+ADGUARDHOME_DOH_SHARED_UPDATE=0
+ADGUARDHOME_DOH_FRONT_LOCK_HELD=0
 trap adguardhome_doh_install_exit EXIT
 
 usage() {
@@ -250,7 +252,11 @@ PY
 )" || adguardhome_doh_die "cannot load existing installation settings"
 fi
 if ((DRY_RUN == 0)) && [[ "$FRONT" == mtproxyl || "$SAVED_FRONT" == mtproxyl ]]; then
-    adguardhome_doh_die "совместный front MTProxyL ещё не активирован; доступен только --dry-run"
+    if ((UPDATE)) && [[ "$FRONT" == mtproxyl && "$SAVED_FRONT" == mtproxyl ]]; then
+        ADGUARDHOME_DOH_SHARED_UPDATE=1
+    else
+        adguardhome_doh_die "переход на общий front MTProxyL через установщик не поддерживается"
+    fi
 fi
 
 POLICY_CATALOG_ARGS=()
@@ -472,6 +478,16 @@ adguardhome_doh_stage_shared_front() {
         --root /var/www/adguardhome-doh-acme --output "$stage/mtproxyl-admin-acme.conf"
 }
 
+adguardhome_doh_publish_shared_file() {
+    local source="$1" target="$2" mode="$3" temporary
+    [[ -f "$source" && ! -L "$source" && ! -L "$target" ]] || return 1
+    temporary="$(mktemp "$(dirname "$target")/.doh-update.XXXXXX")" || return 1
+    if ! install -m "$mode" -- "$source" "$temporary" || ! mv -f -- "$temporary" "$target"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
 # Integration boundary: maintenance prepare must stage and validate every file,
 # including the runtime overlay and both certificate paths, before its start
 # arms autonomous rollback. It must capture and restore system nginx state,
@@ -595,9 +611,16 @@ adguardhome_doh_capture_directory_permissions "$STATE_DIR" "$CONFIG_DIR" "$BACKU
 ADGUARDHOME_DOH_DIRECTORY_CAPTURED=1
 adguardhome_doh_init_log /
 LOG_PATH="$ADGUARDHOME_DOH_LOG_PATH"
-adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE" "${#LOCAL_SITES[@]}"
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    adguardhome_doh_run_logged adguardhome_doh_preflight_shared_update "$PROJECT_ROOT" "$DOMAIN" "$PUBLIC_IP" "$ADMIN_HOST"
+else
+    adguardhome_doh_run_logged adguardhome_doh_preflight / "$DOMAIN" "$PUBLIC_IP" "$UPDATE" "${#LOCAL_SITES[@]}"
+fi
 adguardhome_doh_progress 20 'предварительная проверка завершена'
 
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    adguardhome_doh_acquire_front_lock || adguardhome_doh_die "cannot acquire shared front lock"
+fi
 snapshot_args=()
 # A backup is eligible for manual update rollback only after activation succeeds.
 snapshot_args=(--snapshot-operation recovery)
@@ -613,6 +636,8 @@ ADGUARDHOME_DOH_RELEASE_SNAPSHOT="$snapshot_result"
 mapfile -t required_packages < <(adguardhome_doh_required_packages)
 mapfile -t missing_packages < <(adguardhome_doh_missing_packages "${required_packages[@]}")
 if ((${#missing_packages[@]})); then
+    ((ADGUARDHOME_DOH_SHARED_UPDATE == 0)) || \
+        adguardhome_doh_die "shared update requires the existing dependencies; install missing packages first"
     # Package scripts may start nginx; record that runtime may need restoring.
     ADGUARDHOME_DOH_RUNTIME_TOUCHED=1
     # A pre-apt snapshot must not remove files installed by the package manager.
@@ -673,13 +698,30 @@ nginx_user="$(awk '$1 == "user" {gsub(/;/, "", $2); print $2; exit}' /etc/nginx/
 nginx_group="$(awk '{sub(/#.*/, "")} $1 == "user" {gsub(/;/, "", $3); print $3; exit}' /etc/nginx/nginx.conf)"
 nginx_user="${nginx_user:-www-data}"
 [[ -n "$nginx_group" ]] || nginx_group="$(id -gn "$nginx_user")"
-chown "root:$nginx_group" "$WEBROOT"
-chmod 750 "$WEBROOT"
+profile_owner=root
+profile_mode=640
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    [[ -f "$WEBROOT/$DOMAIN.mobileconfig" && ! -L "$WEBROOT/$DOMAIN.mobileconfig" ]] || \
+        adguardhome_doh_die "shared profile is unavailable or unsafe"
+    nginx_group="$(stat -c '%g' "$WEBROOT/$DOMAIN.mobileconfig")"
+    profile_owner="$(stat -c '%u' "$WEBROOT/$DOMAIN.mobileconfig")"
+    profile_mode="$(stat -c '%a' "$WEBROOT/$DOMAIN.mobileconfig")"
+    [[ "$profile_mode" =~ ^[0-7]{3,4}$ ]] || adguardhome_doh_die "invalid shared profile permissions"
+fi
+if ((ADGUARDHOME_DOH_SHARED_UPDATE == 0)); then
+    chown "root:$nginx_group" "$WEBROOT"
+    chmod 750 "$WEBROOT"
+fi
 mkdir -p "$CONFIG_DIR/catalog"
 for catalog_file in services.csv domains.csv service-domains.csv service-probes.csv; do
     install -m 640 "$PROJECT_ROOT/config/$catalog_file" "$CONFIG_DIR/catalog/$catalog_file"
 done
-if adguardhome_doh_should_install_binary /opt/AdGuardHome/AdGuardHome "$UPDATE"; then
+adguard_binary_current=0
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)) && [[ -x /opt/AdGuardHome/AdGuardHome ]] && \
+   [[ "$(/opt/AdGuardHome/AdGuardHome --version 2>/dev/null || true)" == *"version v$ADGUARD_VERSION" ]]; then
+    adguard_binary_current=1
+fi
+if ((adguard_binary_current == 0)) && adguardhome_doh_should_install_binary /opt/AdGuardHome/AdGuardHome "$UPDATE"; then
     work="$(mktemp -d)"
     ADGUARDHOME_DOH_WORK_DIR="$work"
     arch="$(adguardhome_doh_arch)"
@@ -747,22 +789,37 @@ else
         --doh-token-file "$DOH_TOKEN_FILE" --password-hash-file "$stage/password-hash" \
         --certificate-root "$CERT_ROOT" --webroot "$WEBROOT" --output "$stage"
 fi
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    adguardhome_doh_stage_shared_front "$stage" "$DOMAIN" "$ADMIN_HOST" || \
+        adguardhome_doh_die "cannot prepare shared front files"
+fi
 adguardhome_doh_progress 65 'конфигурация подготовлена'
 
 install -m 640 "$stage/AdGuardHome.yaml" /opt/AdGuardHome/AdGuardHome.yaml
-install -m 644 "$stage/nginx-stream.conf" /etc/nginx/stream.d/adguardhome-doh.conf
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    adguardhome_doh_publish_shared_file "$stage/nginx-stream.conf" /etc/adguardhome-doh/mtproxyl-stream-site.conf 644
+    adguardhome_doh_publish_shared_file "$stage/nginx-http.conf" /etc/adguardhome-doh/mtproxyl-http-site.conf 600
+    adguardhome_doh_publish_shared_file "$stage/mtproxyl-sni.map" /etc/adguardhome-doh/mtproxyl-sni.map 644
+    adguardhome_doh_publish_shared_file "$stage/mtproxyl-nginx.conf" /etc/adguardhome-doh/mtproxyl-nginx.conf 644
+    adguardhome_doh_publish_shared_file "$stage/mtproxyl-http.conf" /etc/adguardhome-doh/mtproxyl-http.conf 644
+    adguardhome_doh_publish_shared_file "$stage/mtproxyl-admin-acme.conf" /etc/adguardhome-doh/mtproxyl-admin-acme.conf 644
+    adguardhome_doh_publish_shared_file "$stage/adguardhome-doh-nginx.service" /etc/systemd/system/adguardhome-doh-nginx.service 644
+else
+    install -m 644 "$stage/nginx-stream.conf" /etc/nginx/stream.d/adguardhome-doh.conf
+fi
 ADGUARDHOME_DOH_MOBILECONFIG_TEMP="$(mktemp "$WEBROOT/.mobileconfig.XXXXXX")"
-install -m 640 -o root -g "$nginx_group" "$stage/$DOMAIN.mobileconfig" "$ADGUARDHOME_DOH_MOBILECONFIG_TEMP"
+install -m "$profile_mode" -o "$profile_owner" -g "$nginx_group" "$stage/$DOMAIN.mobileconfig" "$ADGUARDHOME_DOH_MOBILECONFIG_TEMP"
 mv -f -- "$ADGUARDHOME_DOH_MOBILECONFIG_TEMP" "$WEBROOT/$DOMAIN.mobileconfig"
 ADGUARDHOME_DOH_MOBILECONFIG_TEMP=
-adguardhome_doh_ensure_nginx_stream_include
-# Capacity tuning must never block an activation: a warning is enough.
-adguardhome_doh_ensure_nginx_worker_limits || true
-adguardhome_doh_install_nginx_restart_dropin /
-ADGUARDHOME_DOH_DEFER_SYSCTL=1 adguardhome_doh_install_sysctl / || true
-adguardhome_doh_install_logrotate /
-ADGUARDHOME_DOH_NGINX_TEMP="$(mktemp /etc/nginx/sites-enabled/.adguardhome-doh.XXXXXX)"
-cat > "$ADGUARDHOME_DOH_NGINX_TEMP" <<EOF
+if ((ADGUARDHOME_DOH_SHARED_UPDATE == 0)); then
+    adguardhome_doh_ensure_nginx_stream_include
+    # Capacity tuning must never block an activation: a warning is enough.
+    adguardhome_doh_ensure_nginx_worker_limits || true
+    adguardhome_doh_install_nginx_restart_dropin /
+    ADGUARDHOME_DOH_DEFER_SYSCTL=1 adguardhome_doh_install_sysctl / || true
+    adguardhome_doh_install_logrotate /
+    ADGUARDHOME_DOH_NGINX_TEMP="$(mktemp /etc/nginx/sites-enabled/.adguardhome-doh.XXXXXX)"
+    cat > "$ADGUARDHOME_DOH_NGINX_TEMP" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -775,9 +832,10 @@ server {
     location / { return 404; }
 }
 EOF
-chmod 600 "$ADGUARDHOME_DOH_NGINX_TEMP"
-mv -f -- "$ADGUARDHOME_DOH_NGINX_TEMP" /etc/nginx/sites-enabled/adguardhome-doh
-ADGUARDHOME_DOH_NGINX_TEMP=
+    chmod 600 "$ADGUARDHOME_DOH_NGINX_TEMP"
+    mv -f -- "$ADGUARDHOME_DOH_NGINX_TEMP" /etc/nginx/sites-enabled/adguardhome-doh
+    ADGUARDHOME_DOH_NGINX_TEMP=
+fi
 
 cat > /etc/systemd/system/adguardhome-doh.service <<'UNIT'
 [Unit]
@@ -851,43 +909,69 @@ adguardhome_doh_progress 75 'состояние и профили сохране
 
 ADGUARDHOME_DOH_RUNTIME_TOUCHED=1
 adguardhome_doh_run_logged systemctl daemon-reload
-adguardhome_doh_run_logged nginx -t
-adguardhome_doh_run_logged systemctl enable adguardhome-doh nginx
-adguardhome_doh_run_logged systemctl restart adguardhome-doh
-adguardhome_doh_run_logged systemctl start nginx
-# A package-started or pre-existing nginx is still running its old
-# configuration: without this reload the ACME challenge below would be
-# answered by whatever served port 80 before, and a fronted site would keep
-# 443 while the stream listener waits to take it over.
-adguardhome_doh_run_logged systemctl reload nginx
-adguardhome_doh_progress 85 'службы запущены'
-if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
-    # HTTP-01 is answered from the webroot nginx already serves on port 80, so
-    # issuance and every later renewal keep DNS, the panel and SNI forwarding
-    # online instead of stopping nginx for the length of the ACME exchange.
-    renewal_profile="/etc/letsencrypt/renewal/$DOMAIN.conf"
-    if [[ ! -e "$renewal_profile" && ! -L "$renewal_profile" ]]; then
-        ADGUARDHOME_DOH_NEW_CERTBOT_LINEAGE=1
-    fi
-    mapfile -t certbot_contact_args < <(adguardhome_doh_certbot_contact_args "$EMAIL")
-    adguardhome_doh_run_logged certbot certonly --webroot --webroot-path "$WEBROOT" \
-        -d "$DOMAIN" "${certbot_contact_args[@]}" --deploy-hook 'systemctl reload nginx' \
-        --agree-tos --non-interactive --keep-until-expiring
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    adguardhome_doh_run_logged /usr/sbin/nginx -t -c /etc/adguardhome-doh/mtproxyl-nginx.conf
+    adguardhome_doh_run_logged systemctl restart adguardhome-doh
+    adguardhome_doh_run_logged systemctl reload adguardhome-doh-nginx
+    # The MTProxy ExecReload acquires this lock itself; all staged files are
+    # published before handing the lock back to that helper.
+    adguardhome_doh_release_front_lock || adguardhome_doh_die "cannot release shared front lock"
+    adguardhome_doh_run_logged systemctl reload mtproxyl-pq-nginx
+    python3 - "$PROJECT_ROOT/deploy/manage.py" "$DOMAIN" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('doh_shared_smoke', sys.argv[1])
+manager = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = manager
+spec.loader.exec_module(manager)
+manager.smoke_doh(Path('/'), sys.argv[2])
+PY
+    # The public front can rate-limit repeated loopback connections; the
+    # private listener verifies the panel and its certificate independently.
+    adguardhome_doh_run_logged adguardhome_doh_smoke_https_sni "$ADMIN_HOST" 3 2 4443
 else
-    adguardhome_doh_run_logged adguardhome_doh_migrate_certbot_renewal \
-        / "$DOMAIN" "$WEBROOT" "$PROJECT_ROOT"
+    adguardhome_doh_run_logged nginx -t
+    adguardhome_doh_run_logged systemctl enable adguardhome-doh nginx
+    adguardhome_doh_run_logged systemctl restart adguardhome-doh
+    adguardhome_doh_run_logged systemctl start nginx
+    # Reload before requesting a certificate so the ACME webroot is served.
+    adguardhome_doh_run_logged systemctl reload nginx
+    adguardhome_doh_progress 85 'службы запущены'
+    if [[ ! -f "$CERT_ROOT/fullchain.pem" ]]; then
+        # HTTP-01 is answered from the webroot nginx already serves on port 80.
+        renewal_profile="/etc/letsencrypt/renewal/$DOMAIN.conf"
+        if [[ ! -e "$renewal_profile" && ! -L "$renewal_profile" ]]; then
+            ADGUARDHOME_DOH_NEW_CERTBOT_LINEAGE=1
+        fi
+        mapfile -t certbot_contact_args < <(adguardhome_doh_certbot_contact_args "$EMAIL")
+        adguardhome_doh_run_logged certbot certonly --webroot --webroot-path "$WEBROOT" \
+            -d "$DOMAIN" "${certbot_contact_args[@]}" --deploy-hook 'systemctl reload nginx' \
+            --agree-tos --non-interactive --keep-until-expiring
+    else
+        adguardhome_doh_run_logged adguardhome_doh_migrate_certbot_renewal \
+            / "$DOMAIN" "$WEBROOT" "$PROJECT_ROOT"
+    fi
+    ADGUARDHOME_DOH_NGINX_TEMP="$(mktemp /etc/nginx/sites-enabled/.adguardhome-doh.XXXXXX)"
+    install -m 600 "$stage/nginx-http.conf" "$ADGUARDHOME_DOH_NGINX_TEMP"
+    mv -f -- "$ADGUARDHOME_DOH_NGINX_TEMP" /etc/nginx/sites-enabled/adguardhome-doh
+    ADGUARDHOME_DOH_NGINX_TEMP=
+    adguardhome_doh_run_logged nginx -t
+    adguardhome_doh_run_logged systemctl reload nginx
+    adguardhome_doh_run_logged adguardhome_doh_smoke_https_sni "$DOMAIN"
 fi
-ADGUARDHOME_DOH_NGINX_TEMP="$(mktemp /etc/nginx/sites-enabled/.adguardhome-doh.XXXXXX)"
-install -m 600 "$stage/nginx-http.conf" "$ADGUARDHOME_DOH_NGINX_TEMP"
-mv -f -- "$ADGUARDHOME_DOH_NGINX_TEMP" /etc/nginx/sites-enabled/adguardhome-doh
-ADGUARDHOME_DOH_NGINX_TEMP=
-adguardhome_doh_run_logged nginx -t
-adguardhome_doh_run_logged systemctl reload nginx
-adguardhome_doh_run_logged adguardhome_doh_smoke_https_sni "$DOMAIN"
 install -m 600 /dev/null "$INSTALL_COMPLETE_FILE"
 adguardhome_doh_release_health_lock
-adguardhome_doh_run_logged systemctl enable --now adguardhome-doh-health.timer
-adguardhome_doh_run_logged systemctl start adguardhome-doh-health.service
+if ((ADGUARDHOME_DOH_SHARED_UPDATE)); then
+    case "$ADGUARDHOME_DOH_TIMER_ACTIVE" in
+        active|activating|reloading)
+            adguardhome_doh_run_logged systemctl start adguardhome-doh-health.timer
+            adguardhome_doh_run_logged systemctl start adguardhome-doh-health.service ;;
+    esac
+else
+    adguardhome_doh_run_logged systemctl enable --now adguardhome-doh-health.timer
+    adguardhome_doh_run_logged systemctl start adguardhome-doh-health.service
+fi
 rm -rf -- "$stage"
 if ((UPDATE)); then
     adguardhome_doh_acquire_health_lock || adguardhome_doh_die "cannot reacquire health lock"
@@ -895,8 +979,10 @@ if ((UPDATE)); then
         --root "$ROOT" --domain "$DOMAIN"
     adguardhome_doh_release_health_lock
 fi
-sysctl -q -p /etc/sysctl.d/90-adguardhome-doh.conf >/dev/null 2>&1 || \
-    printf 'warning: kernel parameters could not be applied\n' >&2
+if ((ADGUARDHOME_DOH_SHARED_UPDATE == 0)); then
+    sysctl -q -p /etc/sysctl.d/90-adguardhome-doh.conf >/dev/null 2>&1 || \
+        printf 'warning: kernel parameters could not be applied\n' >&2
+fi
 adguardhome_doh_release_operation_lock
 adguardhome_doh_progress 95 'сертификат и DoH активированы'
 adguardhome_doh_progress 100 'установка завершена'

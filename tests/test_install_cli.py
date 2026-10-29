@@ -303,7 +303,7 @@ class InstallerCliTests(unittest.TestCase):
             self.assertIn("127.0.0.1:4443", (stage / "mtproxyl-http.conf").read_text())
             self.assertEqual(0o600, (stage / "mtproxyl-http.conf").stat().st_mode & 0o777)
 
-    def test_shared_front_real_install_is_rejected_before_system_changes(self):
+    def test_shared_front_transition_is_rejected_but_update_is_allowed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fresh = root / "fresh"
@@ -314,7 +314,7 @@ class InstallerCliTests(unittest.TestCase):
                 "--admin-host", "admin.example.com",
             )
             self.assertNotEqual(0, fresh_result.returncode)
-            self.assertIn("совместный front MTProxyL ещё не активирован", fresh_result.stderr)
+            self.assertIn("переход на общий front MTProxyL через установщик не поддерживается", fresh_result.stderr)
             self.assertEqual([], list(fresh.iterdir()))
             fresh.rmdir()
             state = root / "var/lib/adguardhome-doh/install.json"
@@ -327,24 +327,29 @@ class InstallerCliTests(unittest.TestCase):
             before = state.read_bytes()
             args = ("--root", directory, "--domain", saved["domain"], "--public-ip", saved["public_ip"],
                     "--email", saved["email"], "--yes")
-            for flags in (("--front", "mtproxyl"), ("--update",),
+            for flags in (("--front", "mtproxyl"),
                           ("--update", "--front", "standard"), ("--front", "standard")):
                 with self.subTest(flags=flags):
                     result = self.run_install(*args, *flags)
                     self.assertNotEqual(0, result.returncode)
-                    self.assertIn("совместный front MTProxyL ещё не активирован", result.stderr)
+                    self.assertIn("переход на общий front MTProxyL через установщик не поддерживается", result.stderr)
                     self.assertEqual(before, state.read_bytes())
                     self.assertEqual([state], [path for path in root.rglob("*") if path.is_file()])
+
+            update = self.run_install(*args, "--update")
+            self.assertNotEqual(0, update.returncode)
+            self.assertNotIn("переход на общий front MTProxyL", update.stderr)
+            self.assertEqual(before, state.read_bytes())
 
             state.write_text(json.dumps({key: value for key, value in saved.items()
                                          if key not in ("front", "admin_host")}),
                              encoding="utf-8")
             standard = self.run_install(*args, "--front", "standard")
             self.assertNotEqual(0, standard.returncode)
-            self.assertNotIn("совместный front MTProxyL ещё не активирован", standard.stderr)
+            self.assertNotIn("переход на общий front MTProxyL", standard.stderr)
 
         source = INSTALL.read_text(encoding="utf-8")
-        guard = source.index("совместный front MTProxyL ещё не активирован")
+        guard = source.index("переход на общий front MTProxyL через установщик не поддерживается")
         self.assertLess(guard, source.index("adguardhome_doh_acquire_operation_lock ||"))
         self.assertLess(guard, source.index("adguardhome_doh_init_log /"))
         self.assertLess(guard, source.index("apt-get"))

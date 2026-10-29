@@ -334,6 +334,22 @@ adguardhome_doh_release_operation_lock() {
     fi
 }
 
+adguardhome_doh_acquire_front_lock() {
+    local path=/run/adguardhome-doh/front.lock
+    [[ -d /run/adguardhome-doh && ! -L /run/adguardhome-doh && ! -L "$path" ]] || return 1
+    exec 7>>"$path" || return 1
+    if ! flock -x 7; then exec 7>&-; return 1; fi
+    ADGUARDHOME_DOH_FRONT_LOCK_HELD=1
+}
+
+adguardhome_doh_release_front_lock() {
+    if [[ "${ADGUARDHOME_DOH_FRONT_LOCK_HELD:-0}" == 1 ]]; then
+        flock -u 7 || return 1
+        exec 7>&-
+        ADGUARDHOME_DOH_FRONT_LOCK_HELD=0
+    fi
+}
+
 adguardhome_doh_acquire_health_lock() {
     local path="${ADGUARDHOME_DOH_LOCK_PATH:-/run/lock/adguardhome-doh-health.lock}"
     command -v flock >/dev/null 2>&1 || { printf 'flock is required for installation\n' >&2; return 1; }
@@ -402,8 +418,10 @@ PY
 }
 
 adguardhome_doh_capture_runtime() {
-    ADGUARDHOME_DOH_NGINX_ACTIVE="$(systemctl is-active nginx 2>/dev/null || true)"
-    ADGUARDHOME_DOH_NGINX_ENABLED="$(systemctl is-enabled nginx 2>/dev/null || true)"
+    ADGUARDHOME_DOH_NGINX_UNIT=nginx
+    [[ "${ADGUARDHOME_DOH_SHARED_UPDATE:-0}" == 1 ]] && ADGUARDHOME_DOH_NGINX_UNIT=adguardhome-doh-nginx
+    ADGUARDHOME_DOH_NGINX_ACTIVE="$(systemctl is-active "$ADGUARDHOME_DOH_NGINX_UNIT" 2>/dev/null || true)"
+    ADGUARDHOME_DOH_NGINX_ENABLED="$(systemctl is-enabled "$ADGUARDHOME_DOH_NGINX_UNIT" 2>/dev/null || true)"
     ADGUARDHOME_DOH_AGH_ACTIVE="$(systemctl is-active adguardhome-doh 2>/dev/null || true)"
     ADGUARDHOME_DOH_AGH_ENABLED="$(systemctl is-enabled adguardhome-doh 2>/dev/null || true)"
     ADGUARDHOME_DOH_TIMER_ACTIVE="$(systemctl is-active adguardhome-doh-health.timer 2>/dev/null || true)"
@@ -443,7 +461,7 @@ adguardhome_doh_restore_enablement() {
 }
 
 adguardhome_doh_restore_runtime() {
-    local failed=0 agh_was_running=0
+    local failed=0 agh_was_running=0 nginx_unit="${ADGUARDHOME_DOH_NGINX_UNIT:-nginx}"
     case "${ADGUARDHOME_DOH_AGH_ACTIVE:-}" in
         active|activating|reloading) agh_was_running=1 ;;
     esac
@@ -455,26 +473,32 @@ adguardhome_doh_restore_runtime() {
     if ((agh_was_running == 0)) && systemctl is-active --quiet adguardhome-doh; then
         systemctl stop adguardhome-doh >/dev/null 2>&1 || failed=1
     fi
-    if [[ "${ADGUARDHOME_DOH_NGINX_ACTIVE:-}" != active ]] && systemctl is-active --quiet nginx; then
-        systemctl stop nginx >/dev/null 2>&1 || failed=1
+    if [[ "${ADGUARDHOME_DOH_NGINX_ACTIVE:-}" != active ]] && systemctl is-active --quiet "$nginx_unit"; then
+        systemctl stop "$nginx_unit" >/dev/null 2>&1 || failed=1
     fi
     systemctl daemon-reload >/dev/null || failed=1
-    adguardhome_doh_restore_enablement nginx "${ADGUARDHOME_DOH_NGINX_ENABLED:-}" || failed=1
+    adguardhome_doh_restore_enablement "$nginx_unit" "${ADGUARDHOME_DOH_NGINX_ENABLED:-}" || failed=1
     adguardhome_doh_restore_enablement adguardhome-doh "${ADGUARDHOME_DOH_AGH_ENABLED:-}" || failed=1
     adguardhome_doh_restore_enablement adguardhome-doh-health.timer "${ADGUARDHOME_DOH_TIMER_ENABLED:-}" || failed=1
     if ((agh_was_running)); then
         systemctl start adguardhome-doh >/dev/null || failed=1
     fi
     if [[ "${ADGUARDHOME_DOH_NGINX_ACTIVE:-}" == active ]]; then
-        if nginx -t >/dev/null 2>&1; then
-            if systemctl is-active --quiet nginx; then
-                systemctl reload nginx >/dev/null || failed=1
+        local -a nginx_check=(nginx -t)
+        [[ "${ADGUARDHOME_DOH_SHARED_UPDATE:-0}" == 1 ]] && \
+            nginx_check=(/usr/sbin/nginx -t -c /etc/adguardhome-doh/mtproxyl-nginx.conf)
+        if "${nginx_check[@]}" >/dev/null 2>&1; then
+            if systemctl is-active --quiet "$nginx_unit"; then
+                systemctl reload "$nginx_unit" >/dev/null || failed=1
             else
-                systemctl start nginx >/dev/null || failed=1
+                systemctl start "$nginx_unit" >/dev/null || failed=1
             fi
         else
             failed=1
         fi
+    fi
+    if [[ "${ADGUARDHOME_DOH_SHARED_UPDATE:-0}" == 1 ]]; then
+        systemctl reload mtproxyl-pq-nginx >/dev/null || failed=1
     fi
     ((failed == 0))
 }
@@ -537,6 +561,9 @@ adguardhome_doh_install_exit() {
         if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_HEALTH_PAUSED:-0}" == 1 ]]; then
             adguardhome_doh_pause_health || restore_failed=1
         fi
+        if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_SHARED_UPDATE:-0}" == 1 && "${ADGUARDHOME_DOH_FRONT_LOCK_HELD:-0}" != 1 ]]; then
+            adguardhome_doh_acquire_front_lock || restore_failed=1
+        fi
         # AdGuard may save its live state on shutdown. Stop it before restoring
         # the YAML, otherwise a later restart can overwrite the restored file.
         if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 ]]; then
@@ -565,6 +592,7 @@ adguardhome_doh_install_exit() {
                 fi
             fi
         fi
+        adguardhome_doh_release_front_lock || restore_failed=1
         if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 ]]; then
             adguardhome_doh_restore_runtime || restore_failed=1
         fi
@@ -585,6 +613,7 @@ adguardhome_doh_install_exit() {
             fi
         fi
     elif ((status != 0)) && [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 ]]; then
+        adguardhome_doh_release_front_lock || restore_failed=1
         adguardhome_doh_restore_runtime || restore_failed=1
         printf 'package changes are not reverted; verify installed packages and services\n' >&2
     elif ((status != 0)) && [[ -f "${ADGUARDHOME_DOH_BINARY_BACKUP:-}" ]]; then
@@ -599,6 +628,7 @@ adguardhome_doh_install_exit() {
         adguardhome_doh_restore_directory_permissions || \
             printf 'failed to restore one or more directory permissions\n' >&2
     fi
+    adguardhome_doh_release_front_lock || printf 'failed to release front lock\n' >&2
     adguardhome_doh_release_health_lock || printf 'failed to release health lock\n' >&2
     if ((status != 0 && restore_failed == 0)) && \
        [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 || "${ADGUARDHOME_DOH_HEALTH_PAUSED:-0}" == 1 ]]; then
@@ -649,6 +679,14 @@ adguardhome_doh_install_health_templates() {
     install -m 755 "$project_root/deploy/lib/render_runtime.py" "$libexec/render_runtime.py"
     install -m 755 "$project_root/deploy/lib/releases.py" "$libexec/releases.py"
     install -m 755 "$project_root/deploy/lib/certbot_renewal.py" "$libexec/certbot_renewal.py"
+    if [[ "${ADGUARDHOME_DOH_SHARED_UPDATE:-0}" == 1 ]]; then
+        local helper
+        for helper in mtproxyl_front.py mtproxyl_runtime.py mtproxyl_controller.py mtproxyl_reload.py; do
+            [[ -f "$project_root/deploy/lib/$helper" && ! -L "$project_root/deploy/lib/$helper" ]] || \
+                adguardhome_doh_die "shared front helper is missing: $helper"
+            install -m 755 "$project_root/deploy/lib/$helper" "$libexec/$helper"
+        done
+    fi
     install -m 644 "$project_root/VERSION" "$libexec/VERSION"
 }
 
@@ -721,15 +759,18 @@ adguardhome_doh_run_logged() {
 }
 
 adguardhome_doh_smoke_https_sni() {
-    local host="$1" attempts="${2:-3}" delay="${3:-2}" attempt
+    local host="$1" attempts="${2:-3}" delay="${3:-2}" port="${4:-443}" attempt url
     adguardhome_doh_validate_hostname "$host" || return 1
     [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
     [[ "$delay" =~ ^[0-9]+$ ]] || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port <= 65535)) || return 1
+    url="https://$host/"
+    [[ "$port" != 443 ]] && url="https://$host:$port/"
     for ((attempt = 1; attempt <= attempts; attempt++)); do
         if curl --fail --silent --show-error --noproxy '*' \
-            --resolve "$host:443:127.0.0.1" \
+            --resolve "$host:$port:127.0.0.1" \
             --connect-timeout 3 --max-time 8 \
-            --output /dev/null "https://$host/"; then
+            --output /dev/null "$url"; then
             return 0
         fi
         (( attempt < attempts )) && sleep "$delay"
@@ -962,6 +1003,48 @@ adguardhome_doh_preflight() {
         resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
         grep -qx "$public_ip" <<< "$resolved" || adguardhome_doh_die "DNS A record does not match public IPv4"
     fi
+}
+
+# A shared update must keep the existing MTProxy-owned public listeners.  Do
+# not use the standard preflight, which expects system nginx to own them.
+adguardhome_doh_preflight_shared_update() {
+    local project_root="$1" domain="$2" public_ip="$3" admin_host="$4"
+    [[ -n "$admin_host" ]] || adguardhome_doh_die "shared update requires an admin host"
+    grep -qx 'RuntimeDirectoryPreserve=yes' "$project_root/deploy/templates/healthcheck.service" || \
+        adguardhome_doh_die "shared health unit must preserve the MTProxy runtime directory"
+    python3 - "$project_root" "$domain" "$public_ip" "$admin_host" <<'PY'
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+root, domain, public_ip, admin = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('doh_shared_update_manager', Path(root) / 'deploy/manage.py')
+manager = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = manager
+spec.loader.exec_module(manager)
+try:
+    state = manager._current_install_state(Path('/'))
+    if (manager._front_mode(state) != 'mtproxyl' or state.get('domain') != domain
+            or state.get('public_ip') != public_ip or state.get('admin_host') != admin):
+        raise ValueError('shared installation settings changed')
+    manager._require_front_files(Path('/'))
+    manager._verify_mtproxyl_active_config(Path('/'), subprocess.run, allow_private=True)
+    for relative in manager.FRONT_V5_FILES:
+        path = Path(relative)
+        if not path.is_file() or path.is_symlink():
+            raise ValueError('shared update file is unavailable')
+    for host in (domain, admin):
+        base = Path('/etc/letsencrypt/live') / host
+        if not (base / 'fullchain.pem').is_file() or not (base / 'privkey.pem').is_file():
+            raise ValueError('shared certificate is unavailable')
+    for unit in ('adguardhome-doh.service', 'adguardhome-doh-nginx.service'):
+        subprocess.run(['systemctl', 'is-active', '--quiet', unit], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+    print('shared update preflight failed', file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 adguardhome_doh_validate_services() {

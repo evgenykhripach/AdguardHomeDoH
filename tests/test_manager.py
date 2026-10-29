@@ -992,7 +992,7 @@ class BackupSafetyTests(unittest.TestCase):
             manifest.pop("status")
             manifest["files"] = [item for item in manifest["files"]
                                  if not item["path"].endswith(".conf.pre-webroot")
-                                 and item["path"] not in manager.FRONT_MANAGED_FILES]
+                                 and item["path"] not in manager.FRONT_MANAGED_FILES + manager.FRONT_V5_FILES]
             for item in manifest["files"]:
                 if item["present"]:
                     item["sha256"] = manager._path_digest(backup / item["backup"], include_owners=False)
@@ -1014,7 +1014,7 @@ class BackupSafetyTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = 3
             manifest["files"] = [item for item in manifest["files"]
-                                 if item["path"] not in manager.FRONT_MANAGED_FILES]
+                                 if item["path"] not in manager.FRONT_MANAGED_FILES + manager.FRONT_V5_FILES]
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             self.assertTrue(manager._validated_backup_manifest(backup))
             yaml.write_text("new", encoding="utf-8")
@@ -1028,8 +1028,9 @@ class BackupSafetyTests(unittest.TestCase):
             backup = manager.create_backup(root, root / "backup", operation="recovery", domain="dns.example.com")
             manifest_path = backup / "manifest.json"
             manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = 4
             manifest["files"] = [item for item in manifest["files"]
-                                 if item["path"] not in manager.FRONT_OVERLAY_FILES + manager.FRONT_SITE_FILES]
+                                 if item["path"] not in manager.FRONT_OVERLAY_FILES + manager.FRONT_SITE_FILES + manager.FRONT_V5_FILES]
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             self.assertTrue(manager._validated_backup_manifest(backup))
 
@@ -1040,8 +1041,9 @@ class BackupSafetyTests(unittest.TestCase):
             backup = manager.create_backup(root, root / "backup", operation="recovery", domain="dns.example.com")
             manifest_path = backup / "manifest.json"
             manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = 4
             manifest["files"] = [item for item in manifest["files"]
-                                 if item["path"] not in manager.FRONT_SITE_FILES]
+                                 if item["path"] not in manager.FRONT_SITE_FILES + manager.FRONT_V5_FILES]
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             self.assertTrue(manager._validated_backup_manifest(backup))
 
@@ -2753,23 +2755,51 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         self.assertEqual(2, install.count("--local-site"))
         self.assertIn("*=127.0.0.1:9443", install)
 
-    def test_shared_update_is_blocked_before_release_lookup_download_or_installer(self):
+    def test_shared_update_runs_verified_release_and_reports_installer_failure(self):
         manager = load_manager()
+        releases = manager._load_releases()
         with tempfile.TemporaryDirectory() as directory:
             root = self.build_root(directory)
             state_file = root / "var/lib/adguardhome-doh/install.json"
             state = json.loads(state_file.read_text())
-            state["front"] = "mtproxyl"
+            state.update({"front": "mtproxyl", "version": "1.0.0"})
             state_file.write_text(json.dumps(state))
-            for release in (None, object()):
-                with self.subTest(release=release), mock.patch.object(manager, "_load_releases") as loader:
-                    downloader = mock.Mock()
-                    runner = mock.Mock()
-                    with self.assertRaisesRegex(RuntimeError, "обновление с общим front MTProxyL временно отключено"):
-                        manager.install_update(root=root, release=release, downloader=downloader, runner=runner)
-                    loader.assert_not_called()
-                    downloader.assert_not_called()
-                    runner.assert_not_called()
+            fixture = Path(directory) / "fixture" / "adguardhome-doh-9.9.9"
+            for name in releases.REQUIRED_FILES:
+                target = fixture / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if (ROOT / name).is_file() and name != "VERSION":
+                    shutil.copy2(ROOT / name, target)
+                else:
+                    target.write_text("# fixture\n", encoding="utf-8")
+            (fixture / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+            archive = Path(directory) / "adguardhome-doh.tar.gz"
+            subprocess.run(["tar", "-czf", str(archive), fixture.name], cwd=fixture.parent, check=True)
+            checksum = Path(directory) / "adguardhome-doh.tar.gz.sha256"
+            checksum.write_text("%s  adguardhome-doh.tar.gz\n" % hashlib.sha256(archive.read_bytes()).hexdigest())
+            release = releases.parse_release({
+                "tag_name": "v9.9.9", "draft": False, "prerelease": False,
+                "assets": [
+                    {"name": "adguardhome-doh.tar.gz", "browser_download_url": "https://fixture/archive"},
+                    {"name": "adguardhome-doh.tar.gz.sha256", "browser_download_url": "https://fixture/checksum"},
+                ],
+            })
+
+            def downloader(url, path):
+                shutil.copy2(archive if url.endswith("archive") else checksum, path)
+
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
+            with mock.patch.object(releases, "verify_archive", wraps=releases.verify_archive) as verify, \
+                 mock.patch.object(manager, "_load_releases", return_value=releases):
+                self.assertTrue(manager.install_update(root=root, release=release, downloader=downloader, runner=runner))
+                verify.assert_called_once()
+                command = runner.call_args.args[0]
+                self.assertTrue(command[1].endswith("/deploy/install.sh"))
+                self.assertIn("--update", command)
+                self.assertEqual("mtproxyl", command[command.index("--front") + 1])
+                runner.return_value = subprocess.CompletedProcess([], 1)
+                with self.assertRaisesRegex(RuntimeError, "обновление не прошло активацию"):
+                    manager.install_update(root=root, release=release, downloader=downloader, runner=runner)
 
     def test_healthy_services_ignores_unselected_and_unproven_services(self):
         manager = load_manager()
@@ -2790,9 +2820,11 @@ class ServiceChangeSeedingTests(unittest.TestCase):
 class MTProxyFrontTests(unittest.TestCase):
     def build_root(self, directory):
         root = ServiceChangeSeedingTests.build_root(self, directory)
+        (root / "run/adguardhome-doh").mkdir(parents=True, mode=0o700)
         state_file = root / "var/lib/adguardhome-doh/install.json"
         state = json.loads(state_file.read_text())
         state["front"] = "mtproxyl"
+        state["admin_host"] = "admin.example.org"
         state_file.write_text(json.dumps(state), encoding="utf-8")
         for relative, content in (
             ("etc/adguardhome-doh/mtproxyl-sni.map", "old map"),
@@ -2802,6 +2834,10 @@ class MTProxyFrontTests(unittest.TestCase):
             ("etc/adguardhome-doh/mtproxyl-stream-site.conf", "old private stream"),
             ("opt/AdGuardHome/AdGuardHome", "binary"),
             ("usr/local/libexec/adguardhome-doh/mtproxyl_front.py", "front helper"),
+            ("usr/local/libexec/adguardhome-doh/mtproxyl_runtime.py", "runtime helper"),
+            ("usr/local/libexec/adguardhome-doh/mtproxyl_controller.py", "controller helper"),
+            ("usr/local/libexec/adguardhome-doh/mtproxyl_reload.py", "reload helper"),
+            ("etc/adguardhome-doh/mtproxyl-admin-acme.conf", "admin overlay"),
             ("etc/adguardhome-doh/mtproxyl-http.conf", "front http"),
             ("etc/systemd/system/mtproxyl-pq-nginx.service.d/adguardhome-doh.conf", "front dropin"),
             ("opt/mtproxyl/nginx-custom.conf", "user config"),
@@ -2858,6 +2894,10 @@ class MTProxyFrontTests(unittest.TestCase):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:
             root = self.build_root(directory)
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_file.read_text())
+            state.pop("admin_host", None)
+            state_file.write_text(json.dumps(state))
             map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
             commands = []
             real_run = subprocess.run
@@ -3078,7 +3118,7 @@ class MTProxyFrontTests(unittest.TestCase):
             with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
                 root = self.build_root(directory)
                 runtime = root / "run/adguardhome-doh/mtproxyl-nginx.conf"
-                runtime.parent.mkdir(parents=True)
+                runtime.parent.mkdir(parents=True, exist_ok=True)
                 runtime.write_text(content)
                 runtime.chmod(0o600)
                 backup = manager.create_backup(root, operation="update", domain=DOMAIN)
@@ -3276,8 +3316,11 @@ class MTProxyFrontTests(unittest.TestCase):
             backup = manager.create_backup(root, operation="update", domain="dns.example.com")
             manager.finalize_update_backup(backup, root, "dns.example.com")
             manifest = json.loads((backup / "manifest.json").read_text())
-            self.assertEqual(4, manifest["version"])
-            self.assertTrue(set(manager.FRONT_MANAGED_FILES).issubset({item["path"] for item in manifest["files"]}))
+            self.assertEqual(5, manifest["version"])
+            self.assertTrue(set(manager.FRONT_MANAGED_FILES + manager.FRONT_V5_FILES).issubset({item["path"] for item in manifest["files"]}))
+            saved_front = {path: manager.under_root(root, path).read_text() for path in manager.FRONT_V5_FILES}
+            for path in manager.FRONT_V5_FILES:
+                manager.under_root(root, path).write_text("changed")
             self.assertNotIn("/opt/mtproxyl/nginx-custom.conf", {item["path"] for item in manifest["files"]})
             self.assertNotIn("/opt/mtproxyl-nginx/conf/nginx.conf", {item["path"] for item in manifest["files"]})
             (root / "etc/adguardhome-doh/mtproxyl-sni.map").write_text("new map")
@@ -3290,6 +3333,8 @@ class MTProxyFrontTests(unittest.TestCase):
             system_site.write_text("user changed system site")
             system_stream.write_text("user changed system stream")
             self.assertTrue(manager.rollback_last(root))
+            for path, contents in saved_front.items():
+                self.assertEqual(contents, manager.under_root(root, path).read_text())
             self.assertEqual("old map", (root / "etc/adguardhome-doh/mtproxyl-sni.map").read_text())
             self.assertEqual("old dedicated config", (root / "etc/adguardhome-doh/mtproxyl-nginx.conf").read_text())
             self.assertEqual("old dedicated unit", (root / "etc/systemd/system/adguardhome-doh-nginx.service").read_text())
@@ -3571,6 +3616,79 @@ class MTProxyFrontTests(unittest.TestCase):
                 restore.assert_not_called()
                 self.assertEqual([], list((root / "var/backups/adguardhome-doh").glob(".restore-*")))
 
+    def test_manual_shared_rollback_locks_file_writes_and_releases_before_reload(self):
+        manager = load_manager()
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+                manager.finalize_update_backup(backup, root, "dns.example.com")
+                target = manager.under_root(root, manager.MT_PROXY_SNI_MAP)
+                target.write_text("current map")
+                lock_path = manager.under_root(root, manager.MTPROXY_FRONT_LOCK)
+                real_restore = manager._restore_backup
+                real_reverse = manager._restore_transaction_entries
+
+                def check_lock(held):
+                    with lock_path.open("a+") as stream:
+                        try:
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            self.assertTrue(held)
+                        else:
+                            self.assertFalse(held)
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+                def restore(*args, **kwargs):
+                    check_lock(True)
+                    if fail:
+                        target.write_text("partial")
+                        raise RuntimeError("restore failed")
+                    return real_restore(*args, **kwargs)
+
+                def reverse(entries):
+                    check_lock(True)
+                    return real_reverse(entries)
+
+                def reload(*args, **kwargs):
+                    check_lock(False)
+
+                with mock.patch.object(manager, "_restore_backup", side_effect=restore), \
+                     mock.patch.object(manager, "_restore_transaction_entries", side_effect=reverse), \
+                     mock.patch.object(manager, "_reload_restored_runtime", side_effect=reload):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "restore failed"):
+                            manager.rollback_last(root, selected=backup)
+                        self.assertEqual("current map", target.read_text())
+                    else:
+                        self.assertTrue(manager.rollback_last(root, selected=backup))
+                        self.assertEqual("old map", target.read_text())
+
+    def test_legacy_shared_snapshot_and_admin_mismatch_block_rollback(self):
+        manager = load_manager()
+        for problem in ("legacy", "admin"):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+                manager.finalize_update_backup(backup, root, "dns.example.com")
+                if problem == "legacy":
+                    manifest_path = backup / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text())
+                    manifest["version"] = 4
+                    manifest["files"] = [entry for entry in manifest["files"]
+                                         if entry["path"] not in manager.FRONT_V5_FILES]
+                    manifest_path.write_text(json.dumps(manifest))
+                    self.assertTrue(manager._validated_backup_manifest(backup))
+                else:
+                    state_path = root / "var/lib/adguardhome-doh/install.json"
+                    state = json.loads(state_path.read_text())
+                    state["admin_host"] = "other.example.org"
+                    state_path.write_text(json.dumps(state))
+                with mock.patch.object(manager, "_stop_adguard") as stop:
+                    with self.assertRaisesRegex(RuntimeError, "снимок не содержит|admin_host"):
+                        manager.rollback_last(root, selected=backup)
+                    stop.assert_not_called()
+
     def test_mtproxy_rollback_rejects_snapshot_without_shared_front_before_stop(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:
@@ -3615,8 +3733,9 @@ class MTProxyFrontTests(unittest.TestCase):
                 manifest_path = backup / "manifest.json"
                 manifest = json.loads(manifest_path.read_text())
                 if missing_style == "unrecorded":
+                    manifest["version"] = 4
                     manifest["files"] = [item for item in manifest["files"]
-                                         if item["path"] not in manager.FRONT_SITE_FILES]
+                                         if item["path"] not in manager.FRONT_SITE_FILES + manager.FRONT_V5_FILES]
                 else:
                     for item in manifest["files"]:
                         if item["path"] == manager.PRIVATE_NGINX_STREAM_SITE:

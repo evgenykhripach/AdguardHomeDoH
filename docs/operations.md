@@ -217,6 +217,11 @@ under `/var/backups/adguardhome-doh/<UTC timestamp>/`; packages and issued ACME
 certificates are not rolled back. The manager validates the selected update
 snapshot and restores the previous runtime, reporting any recovery failure.
 
+The manager updates from a verified stable GitHub Release, not a branch. For an
+existing shared front with MTProxy, the `--update` installer preserves the front
+and admin, the MTProxy binary, certificates and user settings. Initial MTProxy
+setup in this mode is not automated.
+
 An abrupt termination such as `SIGKILL` or an OOM kill can interrupt the
 operation after AdGuard was stopped and before a transaction marker is written.
 There is no automatic watchdog for this case; DNS/DoH can remain unavailable.

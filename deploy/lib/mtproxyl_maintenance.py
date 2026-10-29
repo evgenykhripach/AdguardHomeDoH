@@ -326,10 +326,12 @@ def validate(dest):
         raise RuntimeError('invalid snapshot manifest')
     _validate_state(data['units'])
     manifest = manager._read_json(dest / 'files' / 'manifest.json')
-    if not isinstance(manifest, dict) or manifest.get('domain') != data['domain'] or manifest.get('version') != manager.BACKUP_VERSION:
+    if (not isinstance(manifest, dict) or manifest.get('domain') != data['domain']
+            or manifest.get('version') not in (manager.BACKUP_FRONT_VERSION, manager.BACKUP_VERSION)):
         raise RuntimeError('invalid file snapshot')
     entries = manager._validated_backup_manifest(dest / 'files')
-    if {item[0] for item in entries} != set(manager._managed_paths(data['domain'])):
+    expected = manager._managed_paths(data['domain'], include_front_v5=manifest['version'] >= manager.BACKUP_VERSION)
+    if {item[0] for item in entries} != set(expected):
         raise RuntimeError('file snapshot is incomplete')
     if not isinstance(data['extra'], list) or len(data['extra']) != len(EXTRA):
         raise RuntimeError('invalid supplemental snapshot')
@@ -341,6 +343,11 @@ def validate(dest):
             raise RuntimeError('invalid supplemental snapshot')
         if entry['present'] and manager._path_digest(dest / entry['name']) != entry['sha256']:
             raise RuntimeError('supplemental snapshot checksum mismatch')
+        if entry['path'] in manager.FRONT_V5_FILES and manifest['version'] >= manager.BACKUP_VERSION:
+            match = next((item for item in entries if item[0] == entry['path']), None)
+            if (match is None or match[2] != entry['present'] or
+                    (entry['present'] and manager._path_digest(dest / 'files' / match[1]) != entry['sha256'])):
+                raise RuntimeError('duplicate supplemental snapshot differs')
     return data
 
 

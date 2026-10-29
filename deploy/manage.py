@@ -191,6 +191,7 @@ FRONT_OVERLAY_FILES = (
     "/etc/adguardhome-doh/mtproxyl-http.conf",
     "/etc/systemd/system/mtproxyl-pq-nginx.service.d/adguardhome-doh.conf",
 )
+FRONT_V5_FILES = MTPROXY_HELPERS[1:] + ("/etc/adguardhome-doh/mtproxyl-admin-acme.conf",)
 FRONT_MANAGED_FILES = (
     MT_PROXY_SNI_MAP,
     PRIVATE_NGINX_CONFIG,
@@ -228,10 +229,11 @@ MANAGED_FILES = tuple(
     "/etc/systemd/system/multi-user.target.wants/adguardhome-doh.service",
     "/etc/systemd/system/multi-user.target.wants/nginx.service",
     "/etc/systemd/system/timers.target.wants/adguardhome-doh-health.timer",
-) + FRONT_MANAGED_FILES
+) + FRONT_MANAGED_FILES + FRONT_V5_FILES
 HEALTH_LOCK = "/run/lock/adguardhome-doh-health.lock"
 OPERATION_LOCK = "/run/lock/adguardhome-doh-operations.lock"
-BACKUP_VERSION = 4
+BACKUP_VERSION = 5
+BACKUP_FRONT_VERSION = 4
 BACKUP_WITH_OWNERS_VERSION = 3
 BACKUP_WITHOUT_OWNERS_VERSION = 2
 BACKUP_OPERATIONS = {"update", "service-change", "recovery", "manual"}
@@ -275,6 +277,38 @@ def operation_lock(root: Path = Path("/")):
             yield
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def front_lock(root: Path):
+    """Serialize manual shared-front file changes with MTProxy reload."""
+    path = under_root(root, MTPROXY_FRONT_LOCK)
+    if Path(root) != Path("/"):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = None
+    try:
+        directory = os.fstat(parent)
+        if directory.st_uid != os.geteuid() or directory.st_mode & 0o022:
+            raise RuntimeError("unsafe front lock directory")
+        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        def check():
+            info = os.fstat(fd)
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            current = os.stat(path.parent, follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o077
+                    or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)
+                    or (directory.st_dev, directory.st_ino) != (current.st_dev, current.st_ino)):
+                raise RuntimeError("unsafe front lock")
+        check()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        check()
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
 
 
 def under_root(root: Path, path: str) -> Path:
@@ -349,10 +383,12 @@ def _valid_domain(domain: str) -> bool:
 
 
 def _managed_paths(domain: str = "", *, include_pre_webroot: bool = True,
-                   include_front_map: bool = True) -> Tuple[str, ...]:
+                   include_front_map: bool = True, include_front_v5: bool = True) -> Tuple[str, ...]:
     managed = MANAGED_FILES if include_front_map else tuple(
         path for path in MANAGED_FILES if path not in FRONT_MANAGED_FILES
     )
+    if not include_front_v5:
+        managed = tuple(path for path in managed if path not in FRONT_V5_FILES)
     if not domain:
         return managed
     if not _valid_domain(domain):
@@ -459,7 +495,7 @@ def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
         version = 0
     elif isinstance(manifest, Mapping):
         version = manifest.get("version")
-        if (version not in (BACKUP_VERSION, BACKUP_WITH_OWNERS_VERSION, BACKUP_WITHOUT_OWNERS_VERSION)
+        if (version not in (BACKUP_VERSION, BACKUP_FRONT_VERSION, BACKUP_WITH_OWNERS_VERSION, BACKUP_WITHOUT_OWNERS_VERSION)
                 or manifest.get("operation") not in BACKUP_OPERATIONS
                 or not isinstance(manifest.get("domain"), str)
                 or not isinstance(manifest.get("version_before"), str)
@@ -472,7 +508,8 @@ def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
                 raise RuntimeError("backup manifest is invalid")
         expected = set(_managed_paths(
             manifest["domain"], include_pre_webroot=version >= BACKUP_WITH_OWNERS_VERSION,
-            include_front_map=version >= BACKUP_VERSION,
+            include_front_map=version >= BACKUP_FRONT_VERSION,
+            include_front_v5=version >= BACKUP_VERSION,
         ))
         items = manifest.get("files")
     else:
@@ -524,7 +561,7 @@ def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
             raise RuntimeError("backup manifest is invalid")
         entries.append((relative, backup_name, present))
     known_legacy = (set(LEGACY_FULL_FILES), set(LEGACY_NO_BINARY_FILES))
-    previous_v4 = (version == BACKUP_VERSION and seen_paths in (
+    previous_v4 = (version == BACKUP_FRONT_VERSION and seen_paths in (
         expected - set(FRONT_SITE_FILES),
         expected - set(FRONT_SITE_FILES + FRONT_OVERLAY_FILES),
     ))
@@ -560,7 +597,7 @@ def _restore_targets(backup_dir: Path, root: Path) -> list[Tuple[Path, Path, boo
 def _require_saved_front_sites(saved_state: Any, by_path: Mapping[str, Tuple[Optional[Path], bool]]) -> None:
     if not isinstance(saved_state, Mapping) or _front_mode(saved_state) != "mtproxyl":
         return
-    for relative in FRONT_SITE_FILES:
+    for relative in FRONT_SITE_FILES + FRONT_V5_FILES:
         saved, present = by_path.get(relative, (None, False))
         if not present or saved is None or not saved.is_file() or saved.is_symlink():
             raise RuntimeError("снимок не содержит необходимые файлы DoH для MTProxy: %s" % relative)
@@ -988,7 +1025,7 @@ def _validate_shared_front_restore(
         nginx_config = under_root(root, MTPROXY_NGINX_CONFIG)
         if not nginx_binary.is_file() or not os.access(nginx_binary, os.X_OK) or not nginx_config.is_file():
             raise RuntimeError("проверка MTProxy недоступна; восстановление невозможно")
-        _verify_mtproxyl_active_config(root, runner)
+        _verify_mtproxyl_active_config(root, runner, allow_private=True)
 
 
 def restore_backup_runtime(
@@ -999,6 +1036,7 @@ def restore_backup_runtime(
     restart_on_failure: bool = True,
     reload_front_map: bool = False,
     reload_shared_front: bool = False,
+    lock_shared_front: bool = False,
 ) -> None:
     """Validate a snapshot before restoring, retaining an emergency reversal."""
 
@@ -1015,12 +1053,23 @@ def restore_backup_runtime(
     saved_install, saved_present = by_path.get("/var/lib/adguardhome-doh/install.json", (None, False))
     saved_state = _read_json(saved_install, None) if saved_present else None
     _require_saved_front_sites(saved_state, by_path)
+    if (isinstance(current_state, Mapping) and isinstance(saved_state, Mapping)
+            and _front_mode(current_state) == "mtproxyl" and _front_mode(saved_state) == "mtproxyl"):
+        admin = current_state.get("admin_host")
+        if not isinstance(admin, str) or not _valid_domain(admin) or saved_state.get("admin_host") != admin:
+            raise RuntimeError("admin_host снимка несовместим с текущим MTProxy front")
     if reload_shared_front:
         _validate_shared_front_restore(root, backup_dir, domain, current_state, saved_state, by_path, runner)
     if (preserve_system_nginx or
             (isinstance(current_state, Mapping) and isinstance(saved_state, Mapping)
              and _front_mode(current_state) == "mtproxyl" and _front_mode(saved_state) == "mtproxyl")):
         skipped.update(under_root(root, path) for path in SYSTEM_NGINX_FILES)
+    if (isinstance(current_state, Mapping) and isinstance(saved_state, Mapping)
+            and _front_mode(current_state) == "mtproxyl" and _front_mode(saved_state) == "mtproxyl"):
+        # The shared installer does not own Certbot's renewal profiles.  They
+        # may have changed independently while this snapshot was retained.
+        skipped.update(target for target, _saved, _present in _restore_targets(backup_dir, root)
+                       if str(target.relative_to(root)).startswith("etc/letsencrypt/"))
     if preserve_new_certbot_lineage:
         manifest = _read_json(backup_dir / "manifest.json", None)
         if not _valid_domain(domain) or not isinstance(manifest, Mapping) or manifest.get("domain") != domain:
@@ -1060,6 +1109,7 @@ def restore_backup_runtime(
     _transaction_marker(marker, "prepared", saved)
     runtime_may_be_running = False
     front_reload_attempted = False
+    files_reverted = False
 
     def reload_front_files() -> None:
         if reload_shared_front and root == Path("/"):
@@ -1072,10 +1122,29 @@ def restore_backup_runtime(
         reload_front_files()
 
     try:
-        if skipped:
-            _restore_backup(backup_dir, root, skip_targets=skipped)
-        else:
-            _restore_backup(backup_dir, root)
+        lock = front_lock(root) if lock_shared_front else contextlib.nullcontext()
+        with lock:
+            if lock_shared_front:
+                for target, prior, exists in saved:
+                    current_exists = target.exists() or target.is_symlink()
+                    if (current_exists != exists or
+                            (exists and _path_digest(target) != _path_digest(prior))):
+                        files_reverted = True  # No file was changed by this restore.
+                        raise RuntimeError("current file changed while preparing restore: %s" % target)
+            try:
+                if skipped:
+                    _restore_backup(backup_dir, root, skip_targets=skipped)
+                else:
+                    _restore_backup(backup_dir, root)
+            except BaseException as restore_error:
+                if lock_shared_front:
+                    try:
+                        _restore_transaction_entries(saved)
+                        files_reverted = True
+                    except BaseException as recovery_error:
+                        raise _FileRecoveryError("restore failed; returning to previous state also failed: %s"
+                                                 % recovery_error) from restore_error
+                raise
         if files_only and reload_shared_front:
             reload_front()
         if not files_only and yaml_present:
@@ -1095,8 +1164,13 @@ def restore_backup_runtime(
                     "restore failed; cannot stop AdGuard before restoring files: %s; "
                     "transaction remains pending at %s" % (stop_error, marker)
                 ) from original
+        if isinstance(original, _FileRecoveryError):
+            raise
         try:
-            _restore_transaction_entries(saved)
+            if not files_reverted:
+                lock = front_lock(root) if lock_shared_front else contextlib.nullcontext()
+                with lock:
+                    _restore_transaction_entries(saved)
         except BaseException as restore_error:
             raise _FileRecoveryError("restore failed; returning to previous state also failed: %s"
                                      % restore_error) from original
@@ -2413,8 +2487,6 @@ def install_update(
     paths = _runtime_paths(root)
     state = _current_install_state(root)
     front = _front_mode(state)
-    if front == "mtproxyl":
-        raise RuntimeError("обновление с общим front MTProxyL временно отключено: интеграция ещё не завершена")
     releases = _load_releases()
     release = release or releases.latest_release(str(state.get("repository", "evgenykhripach/AdguardHomeDoH")))
     if release is None:
@@ -2507,6 +2579,10 @@ def _rollback_front_map_changed(root: Path, backup_dir: Path,
         return False
     if saved_state.get("domain") != current.get("domain"):
         raise RuntimeError("домен снимка несовместим с текущим MTProxy front")
+    admin = current.get("admin_host")
+    if not isinstance(admin, str) or not _valid_domain(admin) or saved_state.get("admin_host") != admin:
+        raise RuntimeError("admin_host снимка несовместим с текущим MTProxy front")
+    _require_saved_front_sites(saved_state, by_path)
     _require_front_files(root)
     for relative in (PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT,
                      "/opt/AdGuardHome/AdGuardHome", "/opt/AdGuardHome/AdGuardHome.yaml",
@@ -2520,6 +2596,13 @@ def _rollback_front_map_changed(root: Path, backup_dir: Path,
             or not current_map.is_file() or current_map.is_symlink()):
         raise RuntimeError("снимок или текущая карта MTProxy отсутствует или небезопасна")
     changed = saved_map.read_bytes() != current_map.read_bytes()
+    for relative in FRONT_OVERLAY_FILES + FRONT_V5_FILES:
+        saved, present = by_path.get(relative, (None, False))
+        current_file = under_root(root, relative)
+        if (not present or saved is None or not saved.is_file() or saved.is_symlink()
+                or not current_file.is_file() or current_file.is_symlink()):
+            raise RuntimeError("файл общего front отсутствует или небезопасен: %s" % relative)
+        changed = changed or _path_digest(saved) != _path_digest(current_file)
     if Path(root) == Path("/"):
         _load_healthcheck(root)
         if changed:
@@ -2527,7 +2610,7 @@ def _rollback_front_map_changed(root: Path, backup_dir: Path,
             nginx_config = under_root(root, MTPROXY_NGINX_CONFIG)
             if not nginx_binary.is_file() or not os.access(nginx_binary, os.X_OK) or not nginx_config.is_file():
                 raise RuntimeError("проверка MTProxy недоступна; откат карты невозможен")
-        _verify_mtproxyl_active_config(root, runner)
+        _verify_mtproxyl_active_config(root, runner, allow_private=True)
     return changed
 
 
@@ -2548,8 +2631,11 @@ def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subproces
             domain = str(_current_install_state(root)["domain"])
         try:
             _stop_adguard(root, runner=runner)
+            current_state = _read_json(_runtime_paths(root)["install"], {})
+            shared_front = isinstance(current_state, Mapping) and _front_mode(current_state) == "mtproxyl"
             restore_backup_runtime(selected, root, domain, runner=runner,
-                                   restart_on_failure=False, reload_front_map=map_changed)
+                                   restart_on_failure=False, reload_front_map=map_changed,
+                                   lock_shared_front=shared_front)
         except BaseException as original:
             _recover_runtime_after_failure(root, domain, original, runner=runner)
             raise
