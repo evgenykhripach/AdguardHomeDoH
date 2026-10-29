@@ -14,6 +14,8 @@ nginx_id='' mtg_id=''
 cleanup() {
   if [[ -n "$mtg_id" ]]; then docker stop --timeout 2 "$mtg_id" >/dev/null 2>&1 || :; fi
   if [[ -n "$nginx_id" ]]; then docker stop --timeout 2 "$nginx_id" >/dev/null 2>&1 || :; fi
+  # Go module cache directories are read-only by default, including on Linux.
+  chmod -R u+w "$work" 2>/dev/null || :
   rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -25,7 +27,7 @@ for image in "$nginx_image" "$mtg_image" "$go_image" "$python_image"; do
 done
 cp "$repo"/tests/fixtures/faketls-client/{main.go,go.mod,go.sum} "$work/"
 mkdir "$work/cert"
-docker run --rm --pull never --user "$(id -u):$(id -g)" -e HOME=/work -e GOCACHE=/work/.go-build -e GOPATH=/work/.go -v "$work:/work" -w /work "$go_image" \
+docker run --rm --pull never --user "$(id -u):$(id -g)" -e HOME=/work -e GOCACHE=/work/.go-build -e GOPATH=/work/.go -e GOFLAGS=-modcacherw -v "$work:/work" -w /work "$go_image" \
   sh -c 'CGO_ENABLED=0 go build -mod=readonly -o client main.go'
 docker run --rm --pull never --network none --user "$(id -u):$(id -g)" -v "$work:/work" -w /work "$go_image" \
   openssl req -x509 -newkey rsa:2048 -nodes -keyout cert/privkey.pem -out cert/fullchain.pem \
