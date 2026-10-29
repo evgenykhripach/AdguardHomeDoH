@@ -143,6 +143,137 @@ def _has_include(nodes):
     return any(n.args[0] == 'include' or (n.children is not None and _has_include(n.children)) for n in nodes)
 
 
+def _canonical_sni_name(value, *, allow_single=False):
+    """Normalize DNS case and one final dot, without accepting non-ASCII names."""
+    if not isinstance(value, str) or not value.isascii():
+        raise ValueError('invalid SNI hostname')
+    value = value.lower().removesuffix('.')
+    if allow_single and '.' not in value:
+        if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', value):
+            raise ValueError('invalid SNI hostname')
+        return value
+    return _domain(value)
+
+
+def _sni_key_matches(kind, name, host):
+    return ((kind == 'exact' and name == host)
+            or (kind == 'dot' and (name == host or host.endswith('.' + name)))
+            or (kind == 'prefix' and host.endswith('.' + name))
+            or (kind == 'suffix' and host.startswith(name + '.')))
+
+
+def check_admin_sni(source, domain, admin_host):
+    """Check an unexpanded vendor config for admin SNI conflicts, without I/O.
+
+    Raise ValueError on a conflict or a map whose behavior cannot be proven.
+    Regex maps and external stream/top-level includes are deliberately rejected.
+    This check does not validate or activate the complete nginx configuration.
+    """
+    domain = _canonical_sni_name(domain)
+    admin_host = _canonical_sni_name(admin_host)
+    web_host = 'web.' + domain
+    if admin_host in (domain, web_host):
+        raise ValueError('admin host is reserved for an existing MTProxyL route')
+    if not isinstance(source, str):
+        raise ValueError('invalid nginx source')
+
+    nodes = _parse(source)
+    stream = _one(nodes, 'stream', ['stream'], True)
+    if len(_named(nodes, 'stream')) != 1:
+        raise ValueError('duplicate stream context')
+    if _named(nodes, 'include') or _has_include(stream.children):
+        raise ValueError('external include makes SNI routing ambiguous')
+    snimap = _one(stream.children, 'map',
+                  ['map', '$ssl_preread_server_name', '$mtproxyl_upstream'], True)
+    if len(_named(stream.children, 'map')) != 1:
+        raise ValueError('competing SNI map')
+
+    # The inspected map must be the one actually used by the 443 listener.
+    server = _one(stream.children, 'server', ['server'], True)
+    if len(_named(stream.children, 'server')) != 1:
+        raise ValueError('competing stream server')
+    for name, args in (('listen', ['listen', '443']),
+                       ('proxy_pass', ['proxy_pass', '$mtproxyl_upstream']),
+                       ('ssl_preread', ['ssl_preread', 'on']),
+                       ('proxy_protocol', ['proxy_protocol', 'on'])):
+        _one(server.children, name, args, False)
+        if len(_named(server.children, name)) != 1:
+            raise ValueError('competing stream ' + name)
+
+    hostnames = False
+    volatile = False
+    seen_value = False
+    seen_default = False
+    seen_web = False
+    keys = set()
+    for entry in snimap.children:
+        args = entry.args
+        if entry.children is not None:
+            raise ValueError('unsupported SNI map entry')
+        if args[0] == 'hostnames':
+            if len(args) != 1 or hostnames or seen_value:
+                raise ValueError('invalid SNI map hostnames directive')
+            hostnames = True
+            continue
+        if args[0] == 'volatile':
+            if len(args) != 1 or volatile:
+                raise ValueError('invalid SNI map volatile directive')
+            volatile = True
+            continue
+        if len(args) != 2:
+            raise ValueError('unsupported SNI map entry')
+        seen_value = True
+        key, destination = args
+        if key == 'default':
+            if seen_default:
+                raise ValueError('duplicate SNI map default')
+            if destination != 'mtproxyl_faketls':
+                raise ValueError('unexpected SNI map default')
+            seen_default = True
+            continue
+        if key.startswith('~'):
+            raise ValueError('SNI map regex cannot be proven safe')
+
+        # nginx masks require hostnames; the leading-dot form represents both
+        # the exact name and its prefix mask. Reject all other mask syntax.
+        mask = key.startswith('.') or '*' in key
+        if mask and not hostnames:
+            raise ValueError('SNI map mask requires hostnames')
+        if key.startswith('*.') and key.count('*') == 1:
+            kind, name = 'prefix', key[2:]
+        elif key.endswith('.*') and key.count('*') == 1:
+            kind, name = 'suffix', key[:-2]
+        elif key.startswith('.') and '*' not in key:
+            kind, name = 'dot', key[1:]
+        elif mask:
+            raise ValueError('unsupported SNI map mask')
+        else:
+            kind, name = 'exact', key
+        if name:
+            name = _canonical_sni_name(name, allow_single=True)
+        elif kind != 'exact':
+            raise ValueError('invalid SNI map mask')
+
+        identities = (('exact', name), ('prefix', name)) if kind == 'dot' else ((kind, name),)
+        if any(identity in keys for identity in identities):
+            raise ValueError('duplicate SNI map entry')
+        keys.update(identities)
+        if kind == 'exact' and name == web_host:
+            if destination != 'mtproxyl_web':
+                raise ValueError('unexpected WEB route')
+            # nginx strips a trailing dot from the lookup, not the map key.
+            seen_web = key.lower() == web_host
+        if _sni_key_matches(kind, name, admin_host):
+            raise ValueError('admin host conflicts with existing SNI route')
+        if _sni_key_matches(kind, name, domain):
+            raise ValueError('default host conflicts with existing SNI route')
+
+    if not seen_default:
+        raise ValueError('missing SNI map default')
+    if not seen_web:
+        raise ValueError('missing WEB route')
+
+
 def _validate(src, domain):
     nodes = _parse(src)
     stream = _one(nodes, 'stream', ['stream'], True)

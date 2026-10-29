@@ -2,10 +2,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
-from deploy.lib.mtproxyl_front import patch, unpatch, render_http
+from deploy.lib.mtproxyl_front import check_admin_sni, patch, unpatch, render_http
 
 DOMAIN = 'dns.example.com'
+ADMIN = 'admin.dns.example.com'
 SOURCE = '''worker_processes 1;
 events { worker_connections 1024; }
 stream {
@@ -40,6 +42,128 @@ REALISTIC = SOURCE.replace('http {\n', """http {
 """).replace('        location / { try_files', r'''        error_page 404 /404.html;
         location ~* "(wget|curl|chmod|/tmp/|eval\\(|base64)" { return 403; }
         location / { try_files''')
+
+
+class AdminSniPreflightTest(unittest.TestCase):
+    @staticmethod
+    def with_entries(entries, *, hostnames=False):
+        extra = ('hostnames;\n        ' if hostnames else '') + entries
+        return SOURCE.replace('web.dns.example.com mtproxyl_web;',
+                              extra + '\n        web.dns.example.com mtproxyl_web;')
+
+    def test_typical_vendor_maps_and_unrelated_routes_are_safe(self):
+        candidates = (
+            SOURCE,
+            REALISTIC,
+            self.with_entries('other.example.com mtproxyl_web;\n        "" mtproxyl_faketls;'),
+            self.with_entries('*.other.example.com mtproxyl_web;\n'
+                              '        .another.example.com mtproxyl_web;\n'
+                              '        mail.* mtproxyl_faketls;', hostnames=True),
+            self.with_entries('volatile; other.example.com mtproxyl_web;', hostnames=True),
+            self.with_entries('"*.other.example.com" mtproxyl_web; # benign mask\n'
+                              '        \'MAIL.*\' mtproxyl_faketls; # benign suffix', hostnames=True)
+            .replace('web.dns.example.com mtproxyl_web;',
+                     '"WEB.DNS.EXAMPLE.COM" "mtproxyl_web"; # web route'),
+        )
+        for source in candidates:
+            with self.subTest(source=source):
+                self.assertIsNone(check_admin_sni(source, DOMAIN, ADMIN))
+
+    def test_reserved_hosts_and_exact_matches_ignore_case_and_final_dot(self):
+        for admin in (DOMAIN, DOMAIN.upper() + '.', 'web.' + DOMAIN,
+                      'WEB.' + DOMAIN.upper() + '.'):
+            with self.subTest(admin=admin), self.assertRaisesRegex(ValueError, 'reserved'):
+                check_admin_sni(SOURCE, DOMAIN, admin)
+        for key in (ADMIN, ADMIN.upper(), ADMIN + '.', '"' + ADMIN.upper() + '."'):
+            source = self.with_entries(key + ' mtproxyl_web;')
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'existing SNI route'):
+                check_admin_sni(source, DOMAIN.upper() + '.', ADMIN.upper() + '.')
+
+    def test_applicable_hostname_masks_are_rejected(self):
+        for key in ('*.dns.example.com', '*.EXAMPLE.COM.', '.dns.example.com',
+                    '.admin.dns.example.com', 'admin.*', 'ADMIN.DNS.*'):
+            source = self.with_entries(key + ' mtproxyl_web;', hostnames=True)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'existing SNI route'):
+                check_admin_sni(source, DOMAIN, ADMIN)
+
+    def test_existing_root_faketls_and_web_routes_remain_unambiguous(self):
+        cases = (
+            self.with_entries('dns.example.com mtproxyl_web;'),
+            self.with_entries('dns.* mtproxyl_web;', hostnames=True),
+            SOURCE.replace('web.dns.example.com mtproxyl_web;',
+                           'web.dns.example.com. mtproxyl_web;'),
+            self.with_entries('hostnames;').replace('web.dns.example.com mtproxyl_web;',
+                                                   'web.dns.example.com. mtproxyl_web;'),
+        )
+        for source in cases:
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                check_admin_sni(source, DOMAIN, ADMIN)
+
+    def test_regex_is_rejected_even_when_it_looks_harmless(self):
+        for key in ('~^admin',
+                    '"~*^other\\.example\\.com$"', '"~^(?P<name>.*)$"'):
+            source = self.with_entries(key + ' mtproxyl_web;')
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'regex'):
+                check_admin_sni(source, DOMAIN, ADMIN)
+
+    def test_duplicate_exact_and_mask_entries_are_rejected(self):
+        cases = (
+            'WEB.DNS.EXAMPLE.COM mtproxyl_web;',
+            'other.example.com mtproxyl_web; OTHER.EXAMPLE.COM. mtproxyl_web;',
+            '.other.example.com mtproxyl_web; other.example.com mtproxyl_web;',
+            '.other.example.com mtproxyl_web; *.other.example.com mtproxyl_web;',
+            'mail.* mtproxyl_web; MAIL.* mtproxyl_web;',
+            '"" mtproxyl_web; \'\' mtproxyl_web;',
+        )
+        for entries in cases:
+            source = self.with_entries(entries, hostnames=True)
+            with self.subTest(entries=entries), self.assertRaisesRegex(ValueError, 'duplicate'):
+                check_admin_sni(source, DOMAIN, ADMIN)
+
+    def test_unknown_or_invalid_map_forms_fail_closed(self):
+        cases = (
+            self.with_entries('hostnames; hostnames;'),
+            self.with_entries('other.example.com mtproxyl_web; hostnames;'),
+            self.with_entries('volatile; volatile;'),
+            self.with_entries('include /tmp/unknown;'),
+            self.with_entries('other.example.com;'),
+            self.with_entries('other.example.com mtproxyl_web extra;'),
+            self.with_entries('other.example.com { }'),
+            self.with_entries('*.other.example.com mtproxyl_web;'),
+            self.with_entries('bad.*.example.com mtproxyl_web;', hostnames=True),
+            self.with_entries('*.* mtproxyl_web;', hostnames=True),
+            self.with_entries('"other\\.example.com" mtproxyl_web;'),
+            SOURCE.replace('default mtproxyl_faketls;', 'default mtproxyl_web;'),
+            SOURCE.replace('default mtproxyl_faketls;', 'default mtproxyl_faketls; default mtproxyl_faketls;'),
+            SOURCE.replace('default mtproxyl_faketls;', ''),
+            SOURCE.replace('web.dns.example.com mtproxyl_web;', 'web.dns.example.com mtproxyl_faketls;'),
+            SOURCE.replace('web.dns.example.com mtproxyl_web;', ''),
+            SOURCE.replace('stream {', 'include /tmp/unknown;\nstream {'),
+            SOURCE.replace('stream {', 'stream { include /tmp/unknown;'),
+            SOURCE.replace('stream {', 'stream { map $other $other_result { default no; }'),
+            SOURCE.replace('stream {', 'stream { server extra { listen 443; }'),
+            SOURCE.replace('proxy_pass $mtproxyl_upstream;', 'proxy_pass $other;'),
+            SOURCE.replace('ssl_preread on;', 'ssl_preread off;'),
+            SOURCE.replace('listen 443;', 'listen 443; listen 8443;'),
+            SOURCE + 'stream { }',
+            SOURCE.replace('map $ssl_preread_server_name $mtproxyl_upstream',
+                           'map $other $mtproxyl_upstream'),
+        )
+        for source in cases:
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                check_admin_sni(source, DOMAIN, ADMIN)
+
+    def test_invalid_domain_inputs_fail_closed(self):
+        for name in ('', 'default', 'admin..example.com', '*.example.com',
+                     'admin.dns.example.com..', None):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                check_admin_sni(SOURCE, DOMAIN, name)
+
+    def test_preflight_has_no_io_or_process_side_effects(self):
+        with mock.patch('builtins.open', side_effect=AssertionError('unexpected file access')), \
+             mock.patch('os.open', side_effect=AssertionError('unexpected file access')), \
+             mock.patch('subprocess.run', side_effect=AssertionError('unexpected subprocess')):
+            self.assertIsNone(check_admin_sni(SOURCE, DOMAIN, ADMIN))
 
 
 class OverlayTest(unittest.TestCase):
