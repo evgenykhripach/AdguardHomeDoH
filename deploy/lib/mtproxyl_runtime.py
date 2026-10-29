@@ -111,7 +111,7 @@ def _generation_args(socket_path, generation):
     return path
 
 
-def patch_with_generation(source, domain, socket_path, generation):
+def patch_with_generation(source, domain, socket_path, generation, *, admin_host=None):
     """Render overlay and private local generation endpoint, without activation.
 
     The response identifies one worker. Caller must independently verify that
@@ -120,7 +120,7 @@ def patch_with_generation(source, domain, socket_path, generation):
     path = _generation_args(socket_path, generation)
     if _GENERATION_BEGIN in source or _GENERATION_END in source:
         raise ValueError('generation marker already exists')
-    result = front.patch(source, domain)
+    result = front.patch(source, domain, admin_host=admin_host)
     nodes = front._parse(result)
     http = front._one(nodes, 'http', ['http'], True)
     def socket_in_use(entries):
@@ -227,11 +227,13 @@ class StagedRuntime:
 
 
 def stage(source, runtime, domain, nginx_bin, *, allow_fallback=False,
-          marker_socket=None, generation=None):
+          marker_socket=None, generation=None, admin_host=None):
     """Create and validate a durable private candidate without publishing it.
 
     Caller must retain the open object, journal candidate_identity and
     candidate_path before calling publish, and coordinate any nginx reload.
+    With admin_host set, validation failures cannot fall back to the vendor
+    configuration because that would drop the requested admin route.
     """
     front._domain(domain)
     if (marker_socket is None) != (generation is None):
@@ -297,10 +299,12 @@ def stage(source, runtime, domain, nginx_bin, *, allow_fallback=False,
                 raise
 
         try:
-            overlay = (patch_with_generation(original, domain, marker_socket, generation)
-                       if marker_socket is not None else front.patch(original, domain))
+            overlay = (patch_with_generation(original, domain, marker_socket, generation,
+                                              admin_host=admin_host)
+                       if marker_socket is not None else front.patch(original, domain, admin_host=admin_host))
         except ValueError:
-            if not allow_fallback:
+            # An admin route must never disappear because its validation failed.
+            if not allow_fallback or admin_host is not None:
                 raise
             overlay = None
         if overlay is not None:
@@ -308,7 +312,7 @@ def stage(source, runtime, domain, nginx_bin, *, allow_fallback=False,
                 candidate_name, candidate_fd, candidate_created, candidate_identity, candidate_exact = verified_candidate(overlay)
                 status = 'overlay'
             except CandidateInvalid:
-                if not allow_fallback:
+                if not allow_fallback or admin_host is not None:
                     raise
                 overlay = None
         if overlay is None:
@@ -382,10 +386,10 @@ def publish(staged):
 
 
 def prepare(source, runtime, domain, nginx_bin, *, allow_fallback=False,
-            marker_socket=None, generation=None):
+            marker_socket=None, generation=None, admin_host=None):
     """Backward-compatible atomic preparation; caller coordinates reload."""
     with stage(source, runtime, domain, nginx_bin, allow_fallback=allow_fallback,
-               marker_socket=marker_socket, generation=generation) as candidate:
+               marker_socket=marker_socket, generation=generation, admin_host=admin_host) as candidate:
         return publish(candidate)
 
 def _unlink_own(parent, name, info):
@@ -418,11 +422,12 @@ def main():
     parser.add_argument('--allow-fallback', action='store_true')
     parser.add_argument('--marker-socket', type=Path)
     parser.add_argument('--generation')
+    parser.add_argument('--admin-host')
     args = parser.parse_args()
     try:
         status = prepare(args.source, args.runtime, args.domain, args.nginx_bin,
                          allow_fallback=args.allow_fallback, marker_socket=args.marker_socket,
-                         generation=args.generation)
+                         generation=args.generation, admin_host=args.admin_host)
     except (OSError, ValueError, RuntimeError, UnicodeError):
         print('error: runtime preparation failed', file=sys.stderr)
         return 1

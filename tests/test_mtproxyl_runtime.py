@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import signal
 import stat
 import sys
@@ -16,7 +17,7 @@ from unittest import mock
 
 from deploy.lib import mtproxyl_front as front
 from deploy.lib import mtproxyl_runtime as runtime
-from tests.test_mtproxyl_front import DOMAIN, REALISTIC
+from tests.test_mtproxyl_front import ADMIN, DOMAIN, REALISTIC
 
 
 class RuntimeTest(unittest.TestCase):
@@ -70,6 +71,78 @@ class RuntimeTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256(self.target.read_bytes()).digest(), candidate.candidate_identity[-2])
             self.assertFalse(staged.exists())
         self.assertEqual(self.source.read_text(), REALISTIC)
+
+    def test_admin_stage_matches_candidate_with_and_without_generation(self):
+        marker = self.folder / 'generation.sock'
+        generation = 'a' * 32
+        for use_generation in (False, True):
+            with self.subTest(generation=use_generation):
+                self.target.write_text('previous runtime')
+                generation_args = ({'marker_socket': marker, 'generation': generation}
+                                   if use_generation else {})
+                expected = (runtime.patch_with_generation(REALISTIC, DOMAIN, marker, generation,
+                                                          admin_host=ADMIN)
+                            if use_generation else front.patch(REALISTIC, DOMAIN, ADMIN))
+                with runtime.stage(self.source, self.target, DOMAIN, self.nginx,
+                                   admin_host=ADMIN, **generation_args) as candidate:
+                    self.assertEqual(self.target.read_text(), 'previous runtime')
+                    self.assertEqual(candidate.status, 'overlay')
+                    self.assertEqual(candidate.candidate_identity[-1], expected.encode())
+                    self.assertEqual(candidate.candidate_identity[-2], hashlib.sha256(expected.encode()).digest())
+                    self.assertEqual(Path(candidate.candidate_path).read_text(), expected)
+                    self.assertEqual(candidate.candidate_identity[1], Path(candidate.candidate_path).stat().st_ino)
+                    self.assertEqual(expected.count('include ' + front.ADMIN_HTTP_PATH + ';'), 1)
+                    self.assertIn(front.MAP_PATH, expected)
+                    self.assertIn(front.HTTP_PATH, expected)
+                    if use_generation:
+                        self.assertEqual(expected.count(runtime._GENERATION_BEGIN), 1)
+                        self.assertIn('return 200 "' + generation + ' $pid";', expected)
+                    else:
+                        self.assertNotIn(runtime._GENERATION_BEGIN, expected)
+                    self.assertEqual(runtime.publish(candidate), 'overlay')
+                    self.assertEqual(self.target.read_text(), expected)
+                    self.assertEqual(self.target.stat().st_ino, candidate.candidate_identity[1])
+                self.assertEqual(self.source.read_text(), REALISTIC)
+                self.assertFalse(list(self.folder.glob('.*.doh-*')))
+
+    def test_generation_requires_explicit_admin_for_existing_admin_overlay(self):
+        marker = self.folder / 'generation.sock'
+        generation = 'a' * 32
+        admin_overlay = front.patch(REALISTIC, DOMAIN, ADMIN)
+        with self.assertRaisesRegex(ValueError, 'admin host required'):
+            runtime.patch_with_generation(admin_overlay, DOMAIN, marker, generation)
+        self.assertEqual(runtime.patch_with_generation(admin_overlay, DOMAIN, marker, generation,
+                                                       admin_host=ADMIN),
+                         runtime.patch_with_generation(REALISTIC, DOMAIN, marker, generation,
+                                                       admin_host=ADMIN))
+        self.assertEqual(runtime.patch_with_generation(REALISTIC, DOMAIN, marker, generation),
+                         runtime.patch_with_generation(REALISTIC, DOMAIN, marker, generation,
+                                                       admin_host=None))
+
+    def test_strip_contract_and_vendor_overlays_are_never_dropped(self):
+        ordinary = front.patch(REALISTIC, DOMAIN)
+        admin = front.patch(REALISTIC, DOMAIN, ADMIN)
+        self.assertEqual(front._strip(ordinary), (REALISTIC, True))
+        with self.assertRaisesRegex(ValueError, 'explicit handling'):
+            front._strip(admin)
+        malformed_admin = admin.replace(front.ADMIN_HTTP_PATH, '/tmp/foreign-admin.conf')
+        for name, source in (('ordinary', ordinary), ('admin', admin), ('malformed', malformed_admin),
+                             ('foreign include', REALISTIC.replace(
+                                 'http {', 'http { include ' + front.ADMIN_HTTP_PATH + ';'))):
+            for host in (None, ADMIN):
+                for use_generation in (False, True):
+                    for allow_fallback in (False, True):
+                        with self.subTest(source=name, host=host, generation=use_generation,
+                                          allow_fallback=allow_fallback):
+                            self.source.write_text(source)
+                            generation_args = ({'marker_socket': self.folder / 'generation.sock',
+                                                'generation': 'a' * 32} if use_generation else {})
+                            with self.assertRaises(ValueError):
+                                self.prepare(admin_host=host, allow_fallback=allow_fallback,
+                                             **generation_args)
+                            self.assertEqual(self.target.read_text(), 'previous runtime')
+                            self.assertEqual(self.source.read_text(), source)
+                            self.assertFalse(list(self.folder.glob('.*.doh-*')))
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux rename ctime check')
     def test_linux_rename_allows_ctime_change_but_preserves_inode_and_mtime(self):
@@ -199,6 +272,51 @@ os.kill(os.getpid(), signal.SIGKILL)
             self.prepare(allow_fallback=True)
         self.assertEqual(self.target.read_text(), 'previous runtime')
         self.assertFalse(list(self.folder.glob('.*.doh-*')))
+
+    def test_admin_conflicts_and_external_includes_never_fallback(self):
+        collision_sni = REALISTIC.replace('web.dns.example.com mtproxyl_web;',
+                                           ADMIN + ' mtproxyl_web;\n        web.dns.example.com mtproxyl_web;')
+        collision_http = REALISTIC.replace('server_name dns.example.com; return 301',
+                                            'server_name ' + ADMIN + '; return 301')
+        external_include = REALISTIC.replace('stream {', 'stream { include /tmp/unverified-admin.conf;')
+        cases = (('empty', REALISTIC, ''), ('spaces', REALISTIC, 'bad host'),
+                 ('uppercase', REALISTIC, 'ADMIN.example.com'),
+                 ('injection', REALISTIC, 'admin.example.com;return 200'),
+                 ('domain reserved', REALISTIC, DOMAIN), ('web reserved', REALISTIC, 'web.' + DOMAIN),
+                 ('SNI collision', collision_sni, ADMIN), ('HTTP collision', collision_http, ADMIN),
+                 ('external include', external_include, ADMIN), ('missing sections', 'events {}\n', ADMIN))
+        for name, source, host in cases:
+            for use_generation in (False, True):
+                for allow_fallback in (False, True):
+                    with self.subTest(source=name, host=host, generation=use_generation,
+                                      allow_fallback=allow_fallback):
+                        self.source.write_text(source)
+                        generation_args = ({'marker_socket': self.folder / 'generation.sock',
+                                            'generation': 'a' * 32} if use_generation else {})
+                        with self.assertRaises(ValueError):
+                            self.prepare(admin_host=host, allow_fallback=allow_fallback,
+                                         **generation_args)
+                        self.assertEqual(self.target.read_text(), 'previous runtime')
+                        self.assertEqual(self.source.read_text(), source)
+                        self.assertFalse(list(self.folder.glob('.*.doh-*')))
+
+    def test_admin_nginx_rejection_never_publishes_fallback(self):
+        log = self.folder / 'nginx-calls'
+        self.stub('printf "called\\n" >> ' + shlex.quote(str(log)) + '\n'
+                  'if grep -q "BEGIN DOHDNS MTPROXYL ADMIN HTTP" "$3"; then exit 1; fi\nexit 0')
+        for use_generation in (False, True):
+            for allow_fallback in (False, True):
+                with self.subTest(generation=use_generation, allow_fallback=allow_fallback):
+                    log.write_text('')
+                    generation_args = ({'marker_socket': self.folder / 'generation.sock',
+                                        'generation': 'a' * 32} if use_generation else {})
+                    with self.assertRaises(runtime.CandidateInvalid):
+                        self.prepare(admin_host=ADMIN, allow_fallback=allow_fallback,
+                                     **generation_args)
+                    self.assertEqual(log.read_text().splitlines(), ['called'])
+                    self.assertEqual(self.target.read_text(), 'previous runtime')
+                    self.assertEqual(self.source.read_text(), REALISTIC)
+                    self.assertFalse(list(self.folder.glob('.*.doh-*')))
 
     def test_source_change_during_nginx_test_aborts(self):
         self.stub("printf 'changed' > " + str(self.source) + '\nexit 0')
@@ -335,6 +453,32 @@ os.kill(os.getpid(), signal.SIGKILL)
         self.assertEqual(result.stderr, 'error: generation probe failed\n')
         with self.assertRaises(ValueError):
             runtime.prepare(self.source, self.target, DOMAIN, self.nginx, marker_socket=marker)
+
+    def test_cli_optional_admin_preserves_legacy_and_supports_generation(self):
+        script = Path(__file__).resolve().parents[1] / 'deploy/lib/mtproxyl_runtime.py'
+        marker = self.folder / 'generation.sock'
+        generation = 'a' * 32
+        command = [sys.executable, str(script), '--source', str(self.source),
+                   '--runtime', str(self.target), '--domain', DOMAIN, '--nginx-bin', str(self.nginx)]
+        for host in (None, ADMIN):
+            for use_generation in (False, True):
+                with self.subTest(host=host, generation=use_generation):
+                    args = command + (['--admin-host', host] if host is not None else [])
+                    if use_generation:
+                        args += ['--marker-socket', str(marker), '--generation', generation]
+                    result = subprocess.run(args, capture_output=True, text=True)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, 'overlay\n', ''))
+                    expected = (runtime.patch_with_generation(REALISTIC, DOMAIN, marker, generation,
+                                                               admin_host=host)
+                                if use_generation else front.patch(REALISTIC, DOMAIN, host))
+                    self.assertEqual(self.target.read_text(), expected)
+                    self.assertEqual(front.ADMIN_HTTP_PATH in expected, host is not None)
+        prior = self.target.read_bytes()
+        result = subprocess.run(command + ['--admin-host', 'bad host', '--allow-fallback'],
+                                capture_output=True, text=True)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (1, '', 'error: runtime preparation failed\n'))
+        self.assertEqual(self.target.read_bytes(), prior)
 
     def test_cli_only_status_and_generic_errors(self):
         script = Path(__file__).resolve().parents[1] / 'deploy/lib/mtproxyl_runtime.py'
