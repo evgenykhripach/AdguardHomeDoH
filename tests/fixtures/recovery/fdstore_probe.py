@@ -20,6 +20,7 @@ from unittest import mock
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from deploy.lib import mtproxyl_controller as controller
+from deploy.lib import fdstore_guard
 
 ROLES = ("operation", "health", "front")
 MODES = {"operation": 0o644, "health": 0o644, "front": 0o600}
@@ -272,6 +273,12 @@ def supervisor(directory, suffix):
         # missing/extra/wrong-inode paths while flock calls are forbidden.
         with mock.patch.object(fcntl, "flock", side_effect=AssertionError("unexpected reacquisition")):
             descriptors = inherited_fds(state, os.environ, os.getpid())
+            checked = fdstore_guard.receive_inherited_locks(
+                {role: directory / state["locks"][role]["file"] for role in ROLES},
+                {role: state["locks"][role]["name"] for role in ROLES},
+            )
+            if checked != descriptors:
+                raise RuntimeError("inherited lock guard returned different descriptors")
             check_descriptor_set(descriptors, directory, state)
             inject_invalid_receipts(state, directory, descriptors, os.environ, os.getpid())
             for role in ROLES:
@@ -531,6 +538,7 @@ def selftest():
 
                 with mock.patch.dict(os.environ, environment), \
                         mock.patch.object(current, "inherited_fds", side_effect=simulated_receipt), \
+                        mock.patch.object(fdstore_guard, "receive_inherited_locks", return_value=copies), \
                         mock.patch.object(current, "verify_locked_descriptor"), \
                         mock.patch.object(current, "proc_starttime", return_value=123), \
                         mock.patch.object(current, "invocation", side_effect=["1" * 32, "2" * 32]), \
