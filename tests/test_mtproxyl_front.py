@@ -239,7 +239,8 @@ class OverlayTest(unittest.TestCase):
         self.assertIn(r'^/[a-f0-9]{32,64}\.mobileconfig$', result)
         for expected in ('access_log off;', 'proxy_pass https://127.0.0.1:4443;',
                          'proxy_ssl_server_name on;', 'proxy_ssl_name dns.example.com;',
-                         'proxy_ssl_verify on;', 'proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;',
+                         'proxy_ssl_verify on;', 'proxy_ssl_verify_depth 3;',
+                         'proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;',
                          'proxy_set_header Host dns.example.com;'):
             self.assertEqual(result.count(expected), 2)
         self.assertNotIn('a' * 48, result)

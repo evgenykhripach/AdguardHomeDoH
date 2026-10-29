@@ -530,6 +530,7 @@ def render_http(domain):
     proxy_ssl_server_name on;
     proxy_ssl_name {domain};
     proxy_ssl_verify on;
+    proxy_ssl_verify_depth 3;
     proxy_intercept_errors off;
     proxy_ssl_trusted_certificate {CA_PATH};
     proxy_set_header Host {domain};
