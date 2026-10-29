@@ -27,6 +27,15 @@ def yes(*args):
     return True
 
 
+def valid_runtime(runtime):
+    return (isinstance(runtime, dict) and set(runtime) == {"adguard_active"}
+            and type(runtime["adguard_active"]) is bool)
+
+
+def committed_confirmed(data):
+    return data["phase"] == "COMMITTED"
+
+
 def strict_validator(path):
     entries = manager._validated_backup_manifest(path)
     manifest = json.loads((path / "manifest.json").read_text())
@@ -61,25 +70,36 @@ class JournalTests(unittest.TestCase):
     def phase(self):
         return json.loads((self.state / "intent.json").read_text())["phase"]
 
-    def begin(self, **override):
+    def begin(self, runtime_before=None, **override):
         options = {"locks_held": yes, "writer_confirmed": yes, "markers_clear": yes,
-                   "job_barrier_held": yes}
+                   "job_barrier_held": yes, "validate_runtime": valid_runtime}
         options.update(override)
-        self.journal.begin("service-change", self.writer, {"adguard_active": True}, **options)
+        if runtime_before is None:
+            runtime_before = {"adguard_active": True}
+        self.journal.begin("service-change", self.writer, runtime_before, **options)
 
     def seal(self, **override):
         options = {"locks_held": yes, "writer_confirmed": yes, "stopped": yes, "markers_clear": yes,
                    "job_barrier_held": yes,
-                   "validate_snapshot": strict_validator}
+                   "validate_snapshot": strict_validator, "validate_runtime": valid_runtime}
         options.update(override)
         self.journal.seal(self.snapshot, **options)
 
     def recover(self, **override):
         options = {"locks_held": yes, "writer_gone": yes, "stopped": yes, "job_barrier_held": yes,
                    "markers_clear": yes, "validate_snapshot": strict_validator,
-                   "restore": lambda path, data: None}
+                   "validate_runtime": valid_runtime, "restore": lambda path, data: None,
+                   "restore_runtime": yes, "runtime_restored": yes,
+                   "committed_confirmed": committed_confirmed}
         options.update(override)
         return self.journal.recover(**options)
+
+    def retire(self, **override):
+        options = {"locks_held": yes, "writer_gone": yes, "job_barrier_held": yes,
+                   "markers_clear": yes, "validate_runtime": valid_runtime,
+                   "runtime_restored": yes, "committed_confirmed": committed_confirmed}
+        options.update(override)
+        return self.journal.retire(**options)
 
     def test_begin_requires_locks_writer_and_clear_legacy_markers(self):
         for key in ("locks_held", "writer_confirmed", "markers_clear", "job_barrier_held"):
@@ -90,6 +110,30 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(self.phase(), "PREPARED")
         with self.assertRaises(recovery.RecoveryError):
             self.begin()
+
+    def test_runtime_callbacks_cannot_be_omitted(self):
+        with self.assertRaises(TypeError):
+            self.journal.begin("service-change", self.writer, {"adguard_active": True},
+                               locks_held=yes, writer_confirmed=yes, job_barrier_held=yes, markers_clear=yes)
+        self.assertFalse((self.state / "intent.json").exists())
+        self.begin()
+        options = {"locks_held": yes, "writer_gone": yes, "stopped": yes, "job_barrier_held": yes,
+                   "markers_clear": yes, "validate_snapshot": strict_validator, "validate_runtime": valid_runtime,
+                   "restore": lambda *args: None, "restore_runtime": yes, "runtime_restored": yes,
+                   "committed_confirmed": committed_confirmed}
+        for missing in ("validate_runtime", "restore_runtime", "runtime_restored", "committed_confirmed"):
+            with self.subTest(missing=missing), self.assertRaises(TypeError):
+                self.journal.recover(**{key: value for key, value in options.items() if key != missing})
+        self.assertEqual(self.phase(), "PREPARED")
+        self.recover()
+        options.pop("stopped")
+        options.pop("validate_snapshot")
+        options.pop("restore")
+        options.pop("restore_runtime")
+        for missing in ("validate_runtime", "runtime_restored", "committed_confirmed"):
+            with self.subTest(missing=missing), self.assertRaises(TypeError):
+                self.journal.retire(**{key: value for key, value in options.items() if key != missing})
+        self.assertEqual(self.phase(), "RESTORED")
 
     def test_seal_requires_stopped_and_full_verified_manager_snapshot(self):
         self.begin()
@@ -170,7 +214,7 @@ class JournalTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             self.recover(writer_gone=lambda writer: next(checks),
                          restore=lambda *args: self.fail("restore must not run"))
-        self.assertEqual(self.phase(), "RESTORING")
+        self.assertEqual(self.phase(), "SNAPSHOT_READY")
 
     def test_identity_requires_writer_incarnation_and_dedicated_unit(self):
         originals = dict(self.writer)
@@ -229,7 +273,7 @@ class JournalTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             self.recover(job_barrier_held=lambda: next(calls),
                          restore=lambda *args: self.fail("job barrier lost"))
-        self.assertEqual(self.phase(), "RESTORING")
+        self.assertEqual(self.phase(), "SNAPSHOT_READY")
 
     def test_compatibility_manifest_missing_current_path_is_rejected(self):
         self.begin()
@@ -268,12 +312,293 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(self.recover(restore=restore), "RESTORED")
         self.assertEqual(self.recover(restore=restore), "RESTORED")
         self.assertEqual(len(calls), 2)
-        self.journal.retire(locks_held=yes, writer_gone=yes, job_barrier_held=yes, markers_clear=yes)
+        self.retire()
         self.assertFalse((self.state / "intent.json").exists())
 
-    def test_prepared_recovery_does_not_restore_files(self):
+    def test_prepared_recovery_restores_and_confirms_runtime_without_snapshot(self):
         self.begin()
-        self.assertEqual(self.recover(restore=lambda *args: self.fail("no snapshot")), "RESTORED")
+        runtime = {"adguard_active": False}
+        calls = []
+
+        def restore_runtime(recorded):
+            calls.append(("restore", dict(recorded)))
+            runtime.update(recorded)
+            return True
+
+        def confirm_runtime(recorded):
+            calls.append(("confirm", dict(recorded)))
+            return runtime == recorded
+
+        self.assertEqual(self.recover(
+            stopped=lambda: not runtime["adguard_active"],
+            restore=lambda *args: self.fail("no snapshot"),
+            restore_runtime=restore_runtime, runtime_restored=confirm_runtime), "RESTORED")
+        self.assertEqual(runtime, {"adguard_active": True})
+        self.assertEqual(calls, [("restore", {"adguard_active": True}),
+                                 ("confirm", {"adguard_active": True})])
+
+    def test_prepared_with_already_active_runtime_still_runs_callback_and_guards(self):
+        self.begin()
+        calls = []
+
+        def restore_runtime(expected):
+            calls.append(dict(expected))
+            return True
+
+        self.assertEqual(self.recover(stopped=lambda: False, restore_runtime=restore_runtime,
+                                      restore=lambda *args: self.fail("no snapshot")), "RESTORED")
+        self.assertEqual(calls, [{"adguard_active": True}])
+
+    def test_crash_after_runtime_restore_retries_exact_callback_without_restoring_files_again(self):
+        self.begin()
+        self.seal()
+        runtime = {"adguard_active": False}
+        calls = []
+
+        def restore(path, data):
+            self.assertEqual(path, self.snapshot)
+            self.assertEqual(data["snapshot"]["path"], str(self.snapshot))
+            self.assertFalse(runtime["adguard_active"])
+            calls.append("files")
+
+        def restore_runtime(recorded):
+            calls.append("runtime")
+            runtime.update(recorded)
+            return True
+
+        def runtime_restored(recorded):
+            calls.append("confirm")
+            return runtime == recorded
+
+        original_write = self.journal._write
+
+        def crash_before_restored(data):
+            if data["phase"] == "RESTORED":
+                raise OSError("simulated crash before RESTORED")
+            return original_write(data)
+
+        options = dict(stopped=lambda: not runtime["adguard_active"], restore=restore,
+                       restore_runtime=restore_runtime, runtime_restored=runtime_restored)
+        with patch.object(self.journal, "_write", side_effect=crash_before_restored):
+            with self.assertRaisesRegex(OSError, "simulated crash"):
+                self.recover(**options)
+        self.assertEqual(self.phase(), "RUNTIME_RESTORING")
+        self.assertTrue(runtime["adguard_active"])
+
+        self.journal = recovery.Journal(self.state, self.backups)
+        self.assertEqual(self.recover(**options), "RESTORED")
+        self.assertEqual(calls, ["files", "runtime", "confirm", "runtime", "confirm"])
+        self.assertEqual(self.recover(**options), "RESTORED")
+        self.assertEqual(calls, ["files", "runtime", "confirm", "runtime", "confirm", "confirm"])
+
+    def test_runtime_failure_or_failed_confirmation_retains_retryable_journal(self):
+        self.begin()
+        calls = []
+
+        def restore_runtime(recorded):
+            calls.append(dict(recorded))
+            return True
+
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(restore_runtime=lambda expected: False)
+        self.assertEqual(self.phase(), "RUNTIME_RESTORING")
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(restore_runtime=lambda expected: None)
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(restore_runtime=restore_runtime, runtime_restored=lambda expected: False)
+        self.assertEqual(self.phase(), "RUNTIME_RESTORING")
+        self.assertEqual(self.recover(restore_runtime=restore_runtime), "RESTORED")
+        self.assertEqual(calls, [{"adguard_active": True}, {"adguard_active": True}])
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(runtime_restored=lambda expected: False)
+        self.assertEqual(self.phase(), "RESTORED")
+
+    def test_crash_during_runtime_restore_is_retried_for_prepared_without_snapshot(self):
+        self.begin()
+        runtime = {"adguard_active": False}
+        calls = []
+
+        def restore_runtime(expected):
+            calls.append(dict(expected))
+            runtime.update(expected)
+            if len(calls) == 1:
+                raise OSError("runtime callback interrupted")
+            return True
+
+        options = dict(stopped=lambda: not runtime["adguard_active"],
+                       restore=lambda *args: self.fail("no snapshot"),
+                       restore_runtime=restore_runtime,
+                       runtime_restored=lambda expected: runtime == expected)
+        with self.assertRaisesRegex(OSError, "runtime callback interrupted"):
+            self.recover(**options)
+        self.assertEqual(self.phase(), "RUNTIME_RESTORING")
+        self.assertTrue(runtime["adguard_active"])
+        self.journal = recovery.Journal(self.state, self.backups)
+        self.assertEqual(self.recover(**options), "RESTORED")
+        self.assertEqual(calls, [{"adguard_active": True}, {"adguard_active": True}])
+
+    def test_existing_restoring_snapshot_with_live_service_is_not_assumed_restored(self):
+        self.begin()
+        self.seal()
+        with self.assertRaises(OSError):
+            self.recover(restore=lambda *args: (_ for _ in ()).throw(OSError("interrupted")))
+        self.assertEqual(self.phase(), "RESTORING")
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(stopped=lambda: False,
+                         restore_runtime=lambda *args: self.fail("files may not have been restored"))
+        self.assertEqual(self.phase(), "RESTORING")
+
+    def test_runtime_validator_is_required_and_invalid_runtime_is_fail_closed(self):
+        with self.assertRaises(recovery.RecoveryError):
+            self.begin(runtime_before={"adguard_active": "yes"})
+        self.assertFalse((self.state / "intent.json").exists())
+        self.begin()
+        intent = self.state / "intent.json"
+        document = json.loads(intent.read_text())
+        document["runtime_before"] = {"unexpected": True}
+        intent.write_text(json.dumps(document))
+        with self.assertRaises(recovery.RecoveryError):
+            self.seal()
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover()
+        self.assertEqual(self.phase(), "PREPARED")
+
+    def test_runtime_state_requires_exact_json_types_even_with_permissive_validator(self):
+        for invalid in ({"items": (True,)}, {"items": {1: True}}, {"items": float("nan")}):
+            with self.subTest(invalid=invalid), self.assertRaises(recovery.RecoveryError):
+                self.begin(runtime_before=invalid, validate_runtime=yes)
+            self.assertFalse((self.state / "intent.json").exists())
+        self.begin()
+        intent = self.state / "intent.json"
+        document = json.loads(intent.read_text())
+        document["runtime_before"] = {"invalid": float("inf")}
+        intent.write_text(json.dumps(document))
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(validate_runtime=yes)
+        self.assertEqual(self.phase(), "PREPARED")
+
+    def test_invalid_runtime_cannot_retire_restored_or_committed_intent(self):
+        for terminal in ("RESTORED", "COMMITTED"):
+            with self.subTest(terminal=terminal):
+                self.begin()
+                if terminal == "RESTORED":
+                    self.recover()
+                else:
+                    self.seal()
+                    self.journal.commit(locks_held=yes, writer_confirmed=yes, job_barrier_held=yes,
+                                        markers_clear=yes, validated=yes, validate_snapshot=strict_validator,
+                                        validate_runtime=valid_runtime)
+                intent = self.state / "intent.json"
+                document = json.loads(intent.read_text())
+                document["runtime_before"] = {"adguard_active": "invalid"}
+                intent.write_text(json.dumps(document))
+                with self.assertRaises(recovery.RecoveryError):
+                    self.retire()
+                self.assertEqual(self.phase(), terminal)
+                intent.unlink()
+
+    def test_callbacks_cannot_change_the_recorded_writer_or_runtime(self):
+        self.begin()
+        self.seal()
+        received = []
+
+        def restore(path, data):
+            data["writer"]["unit"] = "tampered"
+            data["runtime_before"]["adguard_active"] = False
+
+        def restore_runtime(expected):
+            received.append(dict(expected))
+            expected["adguard_active"] = False
+            return True
+
+        def confirm(expected):
+            received.append(dict(expected))
+            return expected == {"adguard_active": True}
+
+        self.assertEqual(self.recover(restore=restore, restore_runtime=restore_runtime,
+                                      runtime_restored=confirm,
+                                      writer_gone=lambda writer: writer == self.writer), "RESTORED")
+        self.assertEqual(received, [{"adguard_active": True}, {"adguard_active": True}])
+        document = json.loads((self.state / "intent.json").read_text())
+        self.assertEqual(document["writer"], self.writer)
+        self.assertEqual(document["runtime_before"], {"adguard_active": True})
+
+    def test_recovery_rechecks_guards_after_runtime_and_confirmation_callbacks(self):
+        for callback in ("restore_runtime", "runtime_restored"):
+            for guard in ("locks_held", "job_barrier_held", "writer_gone", "markers_clear"):
+                with self.subTest(callback=callback, guard=guard):
+                    self.begin()
+                    current = {"safe": True}
+
+                    def lose_guard(*args):
+                        current["safe"] = False
+                        return True
+
+                    options = {guard: lambda *args: current["safe"], callback: lose_guard}
+                    with self.assertRaises(recovery.RecoveryError):
+                        self.recover(**options)
+                    self.assertEqual(self.phase(), "RUNTIME_RESTORING")
+                    (self.state / "intent.json").unlink()
+
+    def test_recovery_rechecks_guards_after_file_restore_before_starting_runtime(self):
+        self.begin()
+        self.seal()
+        current = {"safe": True}
+
+        def restore(*args):
+            current["safe"] = False
+
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(restore=restore, markers_clear=lambda: current["safe"],
+                         restore_runtime=lambda *args: self.fail("unsafe to start runtime"))
+        self.assertEqual(self.phase(), "RESTORING")
+
+    def test_file_restore_requires_service_to_remain_stopped(self):
+        self.begin()
+        self.seal()
+        runtime = {"stopped": True}
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(stopped=lambda: runtime["stopped"],
+                         restore=lambda *args: runtime.update(stopped=False),
+                         restore_runtime=lambda *args: self.fail("service started during file restore"))
+        self.assertEqual(self.phase(), "RESTORING")
+
+    def test_retire_requires_fresh_runtime_and_rechecks_guards(self):
+        self.begin()
+        self.recover()
+        with self.assertRaises(recovery.RecoveryError):
+            self.retire(runtime_restored=lambda expected: False)
+        self.assertEqual(self.phase(), "RESTORED")
+        current = {"safe": True}
+
+        def confirm_runtime(expected):
+            self.assertEqual(expected, {"adguard_active": True})
+            current["safe"] = False
+            return True
+
+        with self.assertRaises(recovery.RecoveryError):
+            self.retire(runtime_restored=confirm_runtime, job_barrier_held=lambda: current["safe"])
+        self.assertEqual(self.phase(), "RESTORED")
+        self.retire()
+        with self.assertRaises(recovery.RecoveryError):
+            self.retire()
+        self.assertFalse((self.state / "intent.json").exists())
+
+    def test_retire_rechecks_all_guards_after_terminal_callback(self):
+        for guard in ("locks_held", "job_barrier_held", "writer_gone", "markers_clear"):
+            with self.subTest(guard=guard):
+                self.begin()
+                self.recover()
+                current = {"safe": True}
+
+                def confirm(expected):
+                    current["safe"] = False
+                    return True
+
+                with self.assertRaises(recovery.RecoveryError):
+                    self.retire(runtime_restored=confirm, **{guard: lambda *args: current["safe"]})
+                self.assertEqual(self.phase(), "RESTORED")
+                (self.state / "intent.json").unlink()
 
     def test_snapshot_checked_again_at_recovery_and_commit(self):
         self.begin()
@@ -284,7 +609,7 @@ class JournalTests(unittest.TestCase):
             self.recover()
         with self.assertRaises(recovery.RecoveryError):
             self.journal.commit(locks_held=yes, writer_confirmed=yes, job_barrier_held=yes, markers_clear=yes, validated=yes,
-                                validate_snapshot=strict_validator)
+                                validate_snapshot=strict_validator, validate_runtime=valid_runtime)
         self.assertEqual(self.phase(), "SNAPSHOT_READY")
 
     def test_commit_requires_external_validation_and_cannot_recover_afterwards(self):
@@ -292,10 +617,57 @@ class JournalTests(unittest.TestCase):
         self.seal()
         with self.assertRaises(recovery.RecoveryError):
             self.journal.commit(locks_held=yes, writer_confirmed=yes, job_barrier_held=yes, markers_clear=yes, validated=lambda: False,
-                                validate_snapshot=strict_validator)
+                                validate_snapshot=strict_validator, validate_runtime=valid_runtime)
         self.journal.commit(locks_held=yes, writer_confirmed=yes, job_barrier_held=yes, markers_clear=yes, validated=yes,
-                            validate_snapshot=strict_validator)
-        self.assertEqual(self.recover(restore=lambda *args: self.fail("committed")), "COMMITTED")
+                            validate_snapshot=strict_validator, validate_runtime=valid_runtime)
+        calls = []
+
+        def confirm_commit(data):
+            calls.append(data["phase"])
+            return data["phase"] == "COMMITTED"
+
+        def no_rollback(*args):
+            self.fail("committed state must not be rolled back")
+
+        with self.assertRaises(recovery.RecoveryError):
+            self.recover(restore=no_rollback, restore_runtime=no_rollback,
+                         committed_confirmed=lambda data: False)
+        self.assertEqual(self.recover(restore=no_rollback, restore_runtime=no_rollback,
+                                      committed_confirmed=confirm_commit), "COMMITTED")
+        with self.assertRaises(recovery.RecoveryError):
+            self.retire(committed_confirmed=lambda data: False, runtime_restored=no_rollback)
+        self.assertEqual(self.phase(), "COMMITTED")
+        current = {"safe": True}
+
+        def lose_guard(data):
+            current["safe"] = False
+            return True
+
+        with self.assertRaises(recovery.RecoveryError):
+            self.retire(committed_confirmed=lose_guard, runtime_restored=no_rollback,
+                        writer_gone=lambda writer: current["safe"])
+        self.assertEqual(self.phase(), "COMMITTED")
+        self.retire(committed_confirmed=confirm_commit, runtime_restored=no_rollback)
+        self.assertEqual(calls, ["COMMITTED", "COMMITTED"])
+        with self.assertRaises(recovery.RecoveryError):
+            self.retire()
+
+    def test_commit_rechecks_guards_after_final_validation(self):
+        self.begin()
+        self.seal()
+        state = {"safe": True, "checks": 0}
+
+        def validated():
+            state["checks"] += 1
+            if state["checks"] == 2:
+                state["safe"] = False
+            return True
+
+        with self.assertRaises(recovery.RecoveryError):
+            self.journal.commit(locks_held=lambda: state["safe"], writer_confirmed=yes,
+                                job_barrier_held=yes, markers_clear=yes, validated=validated,
+                                validate_snapshot=strict_validator, validate_runtime=valid_runtime)
+        self.assertEqual(self.phase(), "SNAPSHOT_READY")
 
     def test_revalidates_full_snapshot_after_fsync_and_detects_data_replacement(self):
         self.begin()
@@ -376,7 +748,8 @@ class JournalTests(unittest.TestCase):
         self.begin()
         with self.assertRaises(recovery.RecoveryError):
             self.journal.seal(snapshot_link, locks_held=yes, writer_confirmed=yes,
-                              stopped=yes, job_barrier_held=yes, markers_clear=yes, validate_snapshot=strict_validator)
+                              stopped=yes, job_barrier_held=yes, markers_clear=yes,
+                              validate_snapshot=strict_validator, validate_runtime=valid_runtime)
 
     def test_rejects_unsafe_intent_and_manifest_links_and_modes(self):
         self.begin()

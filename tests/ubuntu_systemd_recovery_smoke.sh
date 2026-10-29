@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disposable real-PID1 experiment. No application services are involved.
-# Locks and the systemd job barrier are fakes; this does not prove OOM/boot.
+# Locks, job barrier and runtime are fakes; this does not prove OOM/boot.
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -73,5 +73,5 @@ sudo -n systemctl kill --kill-who=main --signal=SIGKILL "$unit"
 wait_gone
 probe finish
 
-printf 'PASS: real systemd drained both writer cgroups; PREPARED recovery is idempotent.\n'
-printf 'Locks and job barrier were fakes; application restore, OOM and boot were not tested.\n'
+printf 'PASS: real systemd drained both writer cgroups; mock PREPARED runtime was restored and rechecked.\n'
+printf 'Locks, job barrier and runtime were fakes; application restore, OOM and boot were not tested.\n'

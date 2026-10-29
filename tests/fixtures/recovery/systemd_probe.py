@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Disposable systemd experiment; locks and job barrier are test doubles.
+"""Disposable systemd experiment; locks, job barrier and runtime are test doubles.
 
 This tests PID1/cgroup cleanup and a PREPARED journal only. It does not test
-the application's restore callback, service gate, OOM, or a reboot.
+the application's restore callback, real service runtime or gate, OOM, or boot.
 """
 
 import importlib.util
@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -127,6 +128,11 @@ def yes(*args):
     return True
 
 
+def valid_runtime(runtime):
+    return (isinstance(runtime, dict) and set(runtime) == {"adguard_active"}
+            and type(runtime["adguard_active"]) is bool)
+
+
 def writer(recovery, directory, unit):
     deadline = time.monotonic() + 20
     while True:
@@ -141,8 +147,9 @@ def writer(recovery, directory, unit):
         time.sleep(0.1)
     instance = journal(recovery, directory)
     if not instance.path.exists():
-        instance.begin("systemd-smoke", identity, {"test_only": True}, locks_held=yes,
-                       writer_confirmed=identity_matches, job_barrier_held=yes, markers_clear=yes)
+        instance.begin("systemd-smoke", identity, {"adguard_active": True}, locks_held=yes,
+                       writer_confirmed=identity_matches, job_barrier_held=yes, markers_clear=yes,
+                       validate_runtime=valid_runtime)
     child = subprocess.Popen(["/bin/sleep", "300"], close_fds=True)
     _, child_start = read_stat(child.pid)
     atomic_json(directory / "ready.json", {"writer": identity, "child_pid": child.pid,
@@ -184,7 +191,10 @@ def assert_rejected(recovery, directory, unit):
     try:
         instance.recover(locks_held=yes, job_barrier_held=yes, writer_gone=gone,
                          stopped=yes, markers_clear=yes, validate_snapshot=lambda path: [],
-                         restore=lambda *args: (_ for _ in ()).throw(AssertionError("unexpected restore")))
+                         validate_runtime=valid_runtime,
+                         restore=lambda *args: (_ for _ in ()).throw(AssertionError("unexpected restore")),
+                         restore_runtime=lambda *args: (_ for _ in ()).throw(AssertionError("unexpected runtime")),
+                         runtime_restored=yes, committed_confirmed=yes)
     except recovery.RecoveryError:
         if observed != [False]:
             raise AssertionError("writer guard did not reject the live cgroup")
@@ -206,8 +216,8 @@ def assert_stale_rejected(recovery, directory, unit):
         return result
 
     try:
-        instance.begin("stale", stale, {}, locks_held=yes, writer_confirmed=confirm,
-                       job_barrier_held=yes, markers_clear=yes)
+        instance.begin("stale", stale, {"adguard_active": True}, locks_held=yes, writer_confirmed=confirm,
+                       job_barrier_held=yes, markers_clear=yes, validate_runtime=valid_runtime)
     except recovery.RecoveryError:
         if observed != [False] or instance.path.exists():
             raise AssertionError("stale invocation was not rejected by its identity check")
@@ -231,11 +241,29 @@ def finish(recovery, directory):
     instance = journal(recovery, directory)
     if instance._load()["phase"] != "PREPARED":
         raise AssertionError("expected the original PREPARED journal")
-    kwargs = dict(locks_held=yes, job_barrier_held=yes, writer_gone=writer_gone, stopped=yes,
-                  markers_clear=yes, validate_snapshot=lambda path: [],
-                  restore=lambda *args: (_ for _ in ()).throw(AssertionError("unexpected restore")))
+    # Simulated runtime only; no application service is touched or observed.
+    runtime = {"adguard_active": False}
+    calls = []
+
+    def restore_runtime(recorded):
+        calls.append("restore")
+        runtime.update(recorded)
+        return True
+
+    def runtime_restored(recorded):
+        calls.append("confirm")
+        return runtime == recorded
+
+    kwargs = dict(locks_held=yes, job_barrier_held=yes, writer_gone=writer_gone,
+                  stopped=lambda: not runtime["adguard_active"], markers_clear=yes,
+                  validate_snapshot=lambda path: [], validate_runtime=valid_runtime,
+                  restore=lambda *args: (_ for _ in ()).throw(AssertionError("unexpected restore")),
+                  restore_runtime=restore_runtime, runtime_restored=runtime_restored,
+                  committed_confirmed=yes)
     if instance.recover(**kwargs) != "RESTORED" or instance.recover(**kwargs) != "RESTORED":
         raise AssertionError("PREPARED recovery was not idempotent")
+    if calls != ["restore", "confirm", "confirm"] or runtime != {"adguard_active": True}:
+        raise AssertionError("mock runtime was not restored and freshly confirmed")
 
 
 class FixtureTests(unittest.TestCase):
@@ -267,6 +295,24 @@ class FixtureTests(unittest.TestCase):
              patch.object(Path, "read_text", return_value="boot"), \
              patch(__name__ + ".read_stat", return_value=("S", 777)):
             self.assertFalse(writer_gone(record))
+
+    def test_finish_uses_the_updated_contract_with_simulated_runtime(self):
+        recovery = module(Path(__file__).resolve().parents[3] / "deploy/lib/recovery.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            (directory / "journal").mkdir()
+            (directory / "snapshots").mkdir()
+            unit = "adguardhome-doh-writer-" + "a" * 32 + ".service"
+            identity = {"boot_id": "12345678-1234-1234-1234-123456789abc", "unit": unit,
+                        "cgroup": "/system.slice/" + unit, "invocation_id": "b" * 32,
+                        "main_pid": 1234, "proc_starttime": 5678}
+            instance = journal(recovery, directory)
+            instance.begin("systemd-smoke", identity, {"adguard_active": True}, locks_held=yes,
+                           writer_confirmed=yes, job_barrier_held=yes, markers_clear=yes,
+                           validate_runtime=valid_runtime)
+            with patch(__name__ + ".writer_gone", return_value=True):
+                finish(recovery, directory)
+            self.assertEqual(instance._load()["phase"], "RESTORED")
 
 
 def main():

@@ -8,8 +8,10 @@ The journal directory and snapshot root must already exist and be durable.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -25,6 +27,22 @@ class RecoveryError(RuntimeError):
 def _confirmed(check: Callable[..., bool], *args: object) -> None:
     if check(*args) is not True:
         raise RecoveryError("orchestration precondition was not confirmed")
+
+
+def _json_value(value: object) -> bool:
+    """Require values whose JSON round trip does not change their types."""
+    try:
+        if value is None or type(value) in {bool, int, str}:
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if type(value) is list:
+            return all(_json_value(item) for item in value)
+        if type(value) is dict:
+            return all(type(key) is str and _json_value(item) for key, item in value.items())
+        return False
+    except RecursionError:
+        return False
 
 
 def _identity(info: os.stat_result) -> tuple:
@@ -105,7 +123,7 @@ def _sync_regular(path: Path) -> None:
 
 
 class Journal:
-    """One operation journal. All callbacks must remain true until return.
+    """One operation journal. Safety conditions must remain true until return.
 
     ``validate_snapshot`` must wrap the manager's version-aware
     ``_validated_backup_manifest`` and additionally require the complete
@@ -119,6 +137,18 @@ class Journal:
     merely report that no job was queued at one instant. Callbacks must check
     the complete writer incarnation against PID1 and procfs, not just a unit
     name or a reused cgroup path. They must also exclude other active writers.
+    The caller must capture ``runtime_before`` from a fresh, complete runtime
+    observation before changing it. ``validate_runtime`` must validate the
+    complete supported schema; it cannot prove the original observation was
+    accurate. ``restore_runtime`` must idempotently restore the recorded state
+    and return True on success. ``runtime_restored`` must obtain a fresh
+    observation and confirm an exact match; a cached result is unsafe.
+    ``committed_confirmed`` must freshly check the operation's committed state,
+    including its runtime, rather than compare it with the pre-operation state.
+    The caller must prevent runtime changes while holding the recovery barriers.
+    RESTORING with a snapshot requires a stopped service, even on retry. A
+    durable RUNTIME_RESTORING phase proves the file callback returned before
+    runtime restoration can start; retries there never reapply snapshot files.
     These checks are external; this module does not implement systemd control.
     """
 
@@ -143,12 +173,13 @@ class Journal:
         if not isinstance(data, dict) or set(data) != {
             "version", "phase", "operation", "writer", "runtime_before", "snapshot"
         } or type(data["version"]) is not int or data["version"] != 2 or data["phase"] not in {
-            "PREPARED", "SNAPSHOT_READY", "RESTORING", "RESTORED", "COMMITTED"
+            "PREPARED", "SNAPSHOT_READY", "RESTORING", "RUNTIME_RESTORING", "RESTORED", "COMMITTED"
         }:
             raise RecoveryError("unknown intent format or phase")
         writer = data["writer"]
         if (not isinstance(data["operation"], str) or not data["operation"]
                 or not isinstance(data["runtime_before"], dict)
+                or not _json_value(data["runtime_before"])
                 or not self._valid_writer(writer)):
             raise RecoveryError("invalid intent fields")
         snapshot = data["snapshot"]
@@ -285,39 +316,52 @@ class Journal:
 
     def begin(self, operation: str, writer: Mapping, runtime_before: Mapping,
               *, locks_held: Callable[[], bool], writer_confirmed: Callable[[Mapping], bool],
-              job_barrier_held: Callable[[], bool], markers_clear: Callable[[], bool]) -> None:
+              job_barrier_held: Callable[[], bool], markers_clear: Callable[[], bool],
+              validate_runtime: Callable[[Mapping], bool]) -> None:
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
         self._check_roots()
-        _confirmed(writer_confirmed, writer)
+        _confirmed(writer_confirmed, copy.deepcopy(writer))
         _confirmed(markers_clear)
         if os.path.lexists(self.path):
             raise RecoveryError("an intent already exists")
         self._intent_identity = None
         data = {"version": 2, "phase": "PREPARED", "operation": operation,
-                "writer": dict(writer), "runtime_before": dict(runtime_before), "snapshot": None}
+                "writer": dict(writer), "runtime_before": copy.deepcopy(dict(runtime_before)), "snapshot": None}
         if (not isinstance(operation, str) or not operation
-                or not self._valid_writer(data["writer"])):
-            raise RecoveryError("invalid operation or writer identity")
+                or not self._valid_writer(data["writer"])
+                or not _json_value(data["runtime_before"])):
+            raise RecoveryError("invalid operation, writer identity, or runtime state")
+        _confirmed(validate_runtime, copy.deepcopy(data["runtime_before"]))
+        _confirmed(locks_held)
+        _confirmed(job_barrier_held)
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
+        _confirmed(markers_clear)
         self._write(data)
 
     def seal(self, snapshot: Path, *, locks_held: Callable[[], bool],
              writer_confirmed: Callable[[Mapping], bool], stopped: Callable[[], bool],
              job_barrier_held: Callable[[], bool], markers_clear: Callable[[], bool],
-             validate_snapshot: Callable) -> None:
+             validate_snapshot: Callable, validate_runtime: Callable[[Mapping], bool]) -> None:
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
         data = self._load()
-        _confirmed(writer_confirmed, data["writer"])
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
         _confirmed(stopped)
         _confirmed(markers_clear)
+        _confirmed(validate_runtime, copy.deepcopy(data["runtime_before"]))
         if data["phase"] != "PREPARED":
             raise RecoveryError("intent is not prepared")
+        _confirmed(locks_held)
+        _confirmed(job_barrier_held)
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
+        _confirmed(stopped)
+        _confirmed(markers_clear)
         path = self._snapshot_path(snapshot)
         digest = self._validate_snapshot(path, validate_snapshot)
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
-        _confirmed(writer_confirmed, data["writer"])
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
         _confirmed(stopped)
         _confirmed(markers_clear)
         data["phase"] = "SNAPSHOT_READY"
@@ -326,66 +370,117 @@ class Journal:
 
     def commit(self, *, locks_held: Callable[[], bool], writer_confirmed: Callable[[Mapping], bool],
                job_barrier_held: Callable[[], bool], markers_clear: Callable[[], bool], validated: Callable[[], bool],
-               validate_snapshot: Callable) -> None:
+               validate_snapshot: Callable, validate_runtime: Callable[[Mapping], bool]) -> None:
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
         data = self._load()
-        _confirmed(writer_confirmed, data["writer"])
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
         _confirmed(markers_clear)
+        _confirmed(validate_runtime, copy.deepcopy(data["runtime_before"]))
         _confirmed(validated)
         if data["phase"] != "SNAPSHOT_READY":
             raise RecoveryError("snapshot is not ready")
+        _confirmed(locks_held)
+        _confirmed(job_barrier_held)
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
+        _confirmed(markers_clear)
         snapshot = data["snapshot"]
         self._validate_snapshot(self._snapshot_path(snapshot["path"]), validate_snapshot,
                                 snapshot["manifest_sha256"])
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
-        _confirmed(writer_confirmed, data["writer"])
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
         _confirmed(markers_clear)
         _confirmed(validated)
+        _confirmed(locks_held)
+        _confirmed(job_barrier_held)
+        _confirmed(writer_confirmed, copy.deepcopy(data["writer"]))
+        _confirmed(markers_clear)
         data["phase"] = "COMMITTED"
         self._write(data)
+
+    @staticmethod
+    def _recovery_guards(data: Mapping, *, locks_held: Callable[[], bool],
+                         job_barrier_held: Callable[[], bool], writer_gone: Callable[[Mapping], bool],
+                         markers_clear: Callable[[], bool]) -> None:
+        _confirmed(locks_held)
+        _confirmed(job_barrier_held)
+        _confirmed(writer_gone, copy.deepcopy(data["writer"]))
+        _confirmed(markers_clear)
 
     def recover(self, *, locks_held: Callable[[], bool], writer_gone: Callable[[Mapping], bool],
                 stopped: Callable[[], bool], job_barrier_held: Callable[[], bool],
                 markers_clear: Callable[[], bool], validate_snapshot: Callable,
-                restore: Callable[[Path, Mapping], None]) -> str:
+                validate_runtime: Callable[[Mapping], bool], restore: Callable[[Path, Mapping], None],
+                restore_runtime: Callable[[Mapping], bool], runtime_restored: Callable[[Mapping], bool],
+                committed_confirmed: Callable[[Mapping], bool]) -> str:
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
         data = self._load()
-        _confirmed(writer_gone, data["writer"])
-        _confirmed(markers_clear)
-        if data["phase"] in {"RESTORED", "COMMITTED"}:
-            return data["phase"]
-        _confirmed(stopped)
+        guards = {"locks_held": locks_held, "job_barrier_held": job_barrier_held,
+                  "writer_gone": writer_gone, "markers_clear": markers_clear}
+        self._recovery_guards(data, **guards)
+        _confirmed(validate_runtime, copy.deepcopy(data["runtime_before"]))
+        self._recovery_guards(data, **guards)
+        if data["phase"] == "RESTORED":
+            _confirmed(runtime_restored, copy.deepcopy(data["runtime_before"]))
+            self._recovery_guards(data, **guards)
+            return "RESTORED"
+        if data["phase"] == "COMMITTED":
+            _confirmed(committed_confirmed, copy.deepcopy(data))
+            self._recovery_guards(data, **guards)
+            return "COMMITTED"
         snapshot = data["snapshot"]
         path = None
         if snapshot is not None:
             path = self._snapshot_path(snapshot["path"])
             self._validate_snapshot(path, validate_snapshot, snapshot["manifest_sha256"])
-        if data["phase"] != "RESTORING":
+        self._recovery_guards(data, **guards)
+        if data["phase"] in {"PREPARED", "SNAPSHOT_READY"}:
+            if path is not None:
+                _confirmed(stopped)
+                self._recovery_guards(data, **guards)
             data["phase"] = "RESTORING"
             self._write(data)
-        _confirmed(locks_held)
-        _confirmed(job_barrier_held)
-        _confirmed(writer_gone, data["writer"])
-        _confirmed(stopped)
-        if path is not None:
-            restore(path, data)
+        if data["phase"] == "RESTORING":
+            self._recovery_guards(data, **guards)
+            if path is not None:
+                _confirmed(stopped)
+                self._recovery_guards(data, **guards)
+                restore(path, copy.deepcopy(data))
+                _confirmed(stopped)
+            self._recovery_guards(data, **guards)
+            data["phase"] = "RUNTIME_RESTORING"
+            self._write(data)
+        self._recovery_guards(data, **guards)
+        _confirmed(restore_runtime, copy.deepcopy(data["runtime_before"]))
+        self._recovery_guards(data, **guards)
+        _confirmed(runtime_restored, copy.deepcopy(data["runtime_before"]))
+        self._recovery_guards(data, **guards)
         data["phase"] = "RESTORED"
         self._write(data)
         return "RESTORED"
 
     def retire(self, *, locks_held: Callable[[], bool], writer_gone: Callable[[Mapping], bool],
-               job_barrier_held: Callable[[], bool], markers_clear: Callable[[], bool]) -> None:
-        """Remove a terminal intent only after external runtime handling."""
+               job_barrier_held: Callable[[], bool], markers_clear: Callable[[], bool],
+               validate_runtime: Callable[[Mapping], bool], runtime_restored: Callable[[Mapping], bool],
+               committed_confirmed: Callable[[Mapping], bool]) -> None:
+        """Remove a terminal intent only after fresh external confirmation."""
         _confirmed(locks_held)
         _confirmed(job_barrier_held)
         data = self._load()
-        _confirmed(writer_gone, data["writer"])
-        _confirmed(markers_clear)
+        guards = {"locks_held": locks_held, "job_barrier_held": job_barrier_held,
+                  "writer_gone": writer_gone, "markers_clear": markers_clear}
+        self._recovery_guards(data, **guards)
         if data["phase"] not in {"RESTORED", "COMMITTED"}:
             raise RecoveryError("intent is not terminal")
+        _confirmed(validate_runtime, copy.deepcopy(data["runtime_before"]))
+        self._recovery_guards(data, **guards)
+        if data["phase"] == "RESTORED":
+            _confirmed(runtime_restored, copy.deepcopy(data["runtime_before"]))
+        else:
+            _confirmed(committed_confirmed, copy.deepcopy(data))
+        self._recovery_guards(data, **guards)
         self._check_roots()
         if _read_regular(self.path)[1] != self._intent_identity:
             raise RecoveryError("intent changed before retiring")
