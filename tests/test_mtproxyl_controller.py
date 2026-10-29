@@ -536,6 +536,10 @@ class LockFdInfoTest(unittest.TestCase):
                     raise AssertionError('unexpected metadata path')
                 with mock.patch.object(controller, '_read_bounded', side_effect=metadata):
                     controller._assert_lock_held(fd, path)
+                    global_line = ('1: FLOCK ADVISORY WRITE 999999 %s 0 EOF\n' % device).encode()
+                    with self.assertRaises(controller.IdentityError):
+                        controller._assert_lock_held(fd, path)
+                    global_line = (line + '\n').encode()
                     for bad in (b'', lock_line.replace(b'WRITE', b'READ'),
                                 lock_line.replace(b'FLOCK', b'POSIX'), lock_line * 2):
                         lock_line = bad
@@ -543,6 +547,43 @@ class LockFdInfoTest(unittest.TestCase):
                             controller._assert_lock_held(fd, path)
             finally:
                 os.close(fd)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux fdinfo')
+    def test_inherited_description_keeps_original_owner_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp).resolve() / 'front.lock'
+            first = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(first, fcntl.LOCK_EX)
+            read_fd, write_fd = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(read_fd)
+                try:
+                    controller._assert_lock_held(first, path)
+                    other = os.open(path, os.O_RDWR)
+                    try:
+                        try:
+                            controller._assert_lock_held(other, path)
+                        except controller.IdentityError:
+                            os.write(write_fd, b'ok')
+                        else:
+                            os.write(write_fd, b'other description accepted')
+                    finally:
+                        os.close(other)
+                except BaseException as exc:
+                    os.write(write_fd, ('error: ' + type(exc).__name__).encode())
+                finally:
+                    os.close(write_fd)
+                    os._exit(0)
+            os.close(write_fd)
+            try:
+                result = os.read(read_fd, 128)
+                _, status = os.waitpid(pid, 0)
+                self.assertEqual(0, status)
+                self.assertEqual(b'ok', result)
+            finally:
+                os.close(read_fd)
+                os.close(first)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux fdinfo')
     def test_independent_fd_is_rejected_and_duplicate_retains_lock(self):

@@ -15,6 +15,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from deploy.lib import mtproxyl_controller as controller
+
 
 def write_once(path, value):
     """Publish a complete test record without replacing an earlier record."""
@@ -134,6 +137,9 @@ def supervisor(directory, name):
         phase = 1 if not (directory / "phase-1.json").exists() else 2
         if (directory / ("phase-%d.json" % phase)).exists():
             raise RuntimeError("unexpected extra supervisor restart")
+    # Also exercise the application guard after PID1 hands back the same OFD.
+    # Linux still reports the PID that acquired the lock before the restart.
+    controller._assert_lock_held(fd, directory / "lock")
     write_once(directory / ("phase-%d.json" % phase), {
         "phase": phase, "pid": os.getpid(), "starttime": proc_starttime(os.getpid()),
         "invocation": invocation(), "fd": fd, "name": state["name"],

@@ -328,7 +328,7 @@ def _path_snapshot(path):
 
 
 def _assert_lock_held(lock_fd, lock_path):
-    """Require this process to own an exclusive Linux flock on a private file."""
+    """Require this descriptor's open-file description to hold an exclusive flock."""
     if isinstance(lock_fd, bool) or not isinstance(lock_fd, int) or lock_fd < 0:
         raise IdentityError('front lock required')
     try:
@@ -350,7 +350,7 @@ def _assert_lock_held(lock_fd, lock_path):
         # held through a *different* open-file description. fdinfo is scoped
         # to this specific descriptor (and any descriptors duplicated from it).
         fdinfo = _read_bounded(Path('/proc/self/fdinfo') / str(lock_fd)).decode('ascii').splitlines()
-        matches = 0
+        owners = []
         for line in fdinfo:
             fields = line.split()
             if len(fields) != 9 or fields[0] != 'lock:' or fields[2:5] != ['FLOCK', 'ADVISORY', 'WRITE']:
@@ -361,14 +361,17 @@ def _assert_lock_held(lock_fd, lock_path):
                 found = (int(major, 16), int(minor, 16), int(inode))
             except ValueError:
                 continue
-            if owner == os.getpid() and found == target and fields[7:] == ['0', 'EOF']:
-                matches += 1
-        if matches != 1:
+            # The kernel records the acquiring PID, which can differ after a
+            # fork or a systemd FDSTORE restart. fdinfo binds the lock to this
+            # particular open-file description; an independent open has none.
+            if owner >= 0 and found == target and fields[7:] == ['0', 'EOF']:
+                owners.append(owner)
+        if len(owners) != 1:
             raise IdentityError('front lock is not held through this descriptor')
         lines = _read_bounded(Path('/proc/locks'), 1048576).decode('ascii').splitlines()
         for line in lines:
             fields = line.split()
-            if len(fields) < 6 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
+            if len(fields) < 8 or fields[1:4] != ['FLOCK', 'ADVISORY', 'WRITE']:
                 continue
             try:
                 owner = int(fields[4])
@@ -376,11 +379,11 @@ def _assert_lock_held(lock_fd, lock_path):
                 found = (int(major, 16), int(minor, 16), int(inode))
             except ValueError:
                 continue
-            if owner == os.getpid() and found == target:
+            if owner == owners[0] and found == target and fields[6:8] == ['0', 'EOF']:
                 return
     except (OSError, UnicodeError, ValueError) as exc:
         raise IdentityError('front lock not verifiable') from exc
-    raise IdentityError('exclusive front lock is not held by this process')
+    raise IdentityError('exclusive front lock is not held through this descriptor')
 
 
 def _marker_fragment(socket_path, generation):
