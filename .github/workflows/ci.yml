@@ -20,3 +20,8 @@ jobs:
         run: sudo -n bash tests/ubuntu_systemd_fdstore_smoke.sh
       - name: Exercise independent rollback timer on disposable files
         run: sudo -n bash tests/ubuntu_systemd_maintenance_smoke.sh
+      - name: Verify maintenance snapshot and restore using disposable units
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS" CI="$CI"
+          RUNNER_OS="$RUNNER_OS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          bash tests/ubuntu_systemd_maintenance_transaction_smoke.sh "$PWD"
