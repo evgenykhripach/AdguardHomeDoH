@@ -314,6 +314,8 @@ def main(argv=None):
     parser.add_argument("--local-site", action="append", default=[],
                         help="HOST=IPV4:PORT served behind the stream listener; * sets the default")
     parser.add_argument("--doh-host", required=True)
+    parser.add_argument("--admin-host")
+    parser.add_argument("--admin-certificate-root")
     token_args = parser.add_mutually_exclusive_group(required=True)
     token_args.add_argument("--doh-token")
     token_args.add_argument("--doh-token-file", type=Path)
@@ -334,6 +336,10 @@ def main(argv=None):
         parser.error("--policy and --config-dir are mutually exclusive")
     if args.front == "mtproxyl" and args.config_dir is None:
         parser.error("--front mtproxyl requires --config-dir for the complete SNI map")
+    if (args.admin_host is None) != (args.admin_certificate_root is None):
+        parser.error("--admin-host and --admin-certificate-root must be provided together")
+    if args.admin_host is not None and args.front != "mtproxyl":
+        parser.error("--admin-host requires --front mtproxyl")
     if args.policy is not None and args.services is not None:
         parser.error("--services cannot be combined with --policy")
     if args.health_state is not None and args.existing_config is not None and args.existing_policy is None:
@@ -421,9 +427,15 @@ def main(argv=None):
         front_map = render_mtproxyl_sni_map(
             [*full_catalog.full_policy(), *(rows if args.policy is not None else [])],
             args.doh_host,
+            admin_host=args.admin_host,
         )
     stream_config = render_nginx_stream(
-        rows, args.doh_host, relay=args.relay, local_sites=args.local_site, front=args.front
+        rows, args.doh_host, relay=args.relay, local_sites=args.local_site, front=args.front,
+        admin_host=args.admin_host,
+    )
+    http_config = render_nginx_http(
+        args.doh_host, doh_token, args.certificate_root, args.webroot, front=args.front,
+        admin_host=args.admin_host, admin_certificate_root=args.admin_certificate_root,
     )
     adguard_config = render_adguard_yaml(rows, password_hash, rewrites=seeded_rewrites)
     if existing is not None:
@@ -437,10 +449,7 @@ def main(argv=None):
         )
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     (args.output / "AdGuardHome.yaml").write_text(adguard_config, encoding="utf-8")
-    (args.output / "nginx-http.conf").write_text(
-        render_nginx_http(args.doh_host, doh_token,
-                          args.certificate_root, args.webroot, front=args.front), encoding="utf-8"
-    )
+    (args.output / "nginx-http.conf").write_text(http_config, encoding="utf-8")
     # The profile scopes DoH to the whole catalog rather than to the selected
     # services, so changing the selection never requires reinstalling it.
     if catalog is not None:

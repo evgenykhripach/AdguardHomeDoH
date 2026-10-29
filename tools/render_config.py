@@ -5,6 +5,7 @@ import argparse
 import csv
 import ipaddress
 import json
+import os
 import re
 import subprocess
 import uuid
@@ -310,6 +311,27 @@ def _hostname(value: str, field: str, allow_empty: bool = False) -> str:
                 label.encode("ascii").decode("idna")
             except UnicodeError as exc:
                 raise ValueError("%s contains an invalid IDNA label: %r" % (field, value)) from exc
+    return value
+
+
+def _admin_hostname(value: Optional[str], doh_host: str, rows: Iterable[PolicyRow] = ()) -> Optional[str]:
+    if value is None:
+        return None
+    admin_host = _hostname(value, "admin-host")
+    if admin_host in (doh_host, "web." + doh_host):
+        raise ValueError("admin-host conflicts with an existing MTProxyL route")
+    if any(row.domain == admin_host or
+           (row.kind == "suffix" and admin_host.endswith("." + row.domain)) for row in rows):
+        raise ValueError("admin-host conflicts with a routed domain")
+    return admin_host
+
+
+def _nginx_path(value: str, field: str) -> str:
+    # Match the conservative absolute, normalized path rule used for nginx
+    # generation paths; unquoted nginx directives cannot safely contain more.
+    if (not isinstance(value, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", value)
+            or os.path.normpath(value) != value):
+        raise ValueError("%s must be a safe absolute path" % field)
     return value
 
 
@@ -664,12 +686,23 @@ def render_nginx_http(
     *,
     http2_directive: Optional[bool] = None,
     front: str = "standard",
+    admin_host: Optional[str] = None,
+    admin_certificate_root: Optional[str] = None,
 ) -> str:
     if front not in ("standard", "mtproxyl"):
         raise ValueError("unknown front: %s" % front)
     doh_host = _hostname(doh_host, "doh-host")
     if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
         raise ValueError("doh-token must be lowercase hexadecimal")
+    if (admin_host is None) != (admin_certificate_root is None):
+        raise ValueError("admin-host and admin-certificate-root must be provided together")
+    if admin_host is not None:
+        if front != "mtproxyl":
+            raise ValueError("admin-host requires mtproxyl front")
+        admin_host = _admin_hostname(admin_host, doh_host)
+        _nginx_path(certificate_root, "certificate-root")
+        _nginx_path(webroot, "webroot")
+        _nginx_path(admin_certificate_root, "admin-certificate-root")
     if http2_directive is None:
         http2_directive = use_http2_directive()
     listen_tls = "    listen 127.0.0.1:4443 ssl%s;" % ("" if http2_directive else " http2")
@@ -680,6 +713,16 @@ def render_nginx_http(
         # brute force cannot flood AdGuard Home's login endpoint.
         "limit_req_zone $binary_remote_addr zone=adguardhome_doh_login:1m rate=30r/m;",
     ]
+    if admin_host is not None:
+        # Map string keys are case-insensitive, as are DNS and SNI routing.
+        # Host can select another HTTP server after the TLS handshake, so
+        # both servers must enforce which SNI was used for that connection.
+        lines.extend([
+            "map $ssl_server_name $adguardhome_doh_admin_sni {",
+            "        default 0;",
+            "        %s 1;" % admin_host,
+            "}",
+        ])
     if front == "standard":
         lines.extend([
             "server {",
@@ -699,8 +742,10 @@ def render_nginx_http(
     ])
     if http2_directive:
         lines.append("    http2 on;")
+    lines.append("    server_name %s;" % doh_host)
+    if admin_host is not None:
+        lines.append("    if ($adguardhome_doh_admin_sni) { return 421; }")
     lines.extend([
-        "    server_name %s;" % doh_host,
         "    ssl_certificate %s/fullchain.pem;" % certificate_root,
         "    ssl_certificate_key %s/privkey.pem;" % certificate_root,
         "    ssl_protocols TLSv1.2 TLSv1.3;",
@@ -736,6 +781,8 @@ def render_nginx_http(
         "        proxy_read_timeout 30s;",
         "        access_log off;",
         "    }",
+    ])
+    panel_locations = [
         "    location = /control/login {",
         "        limit_req zone=adguardhome_doh_login burst=5 nodelay;",
         "        limit_req_status 429;",
@@ -756,7 +803,29 @@ def render_nginx_http(
         "        proxy_buffering off;",
         "        proxy_read_timeout 30s;",
         "    }",
-        "}",
+    ]
+    lines.extend(panel_locations)
+    lines.append("}")
+    if admin_host is not None:
+        lines.extend(["server {", listen_tls])
+        if http2_directive:
+            lines.append("    http2 on;")
+        lines.extend([
+            "    server_name %s;" % admin_host,
+            "    if ($adguardhome_doh_admin_sni = 0) { return 421; }",
+            "    ssl_certificate %s/fullchain.pem;" % admin_certificate_root,
+            "    ssl_certificate_key %s/privkey.pem;" % admin_certificate_root,
+            "    ssl_protocols TLSv1.2 TLSv1.3;",
+            "    ssl_session_cache shared:adguardhome_doh:10m;",
+            "    ssl_session_timeout 1d;",
+            "    add_header Strict-Transport-Security \"max-age=31536000\" always;",
+            "    client_max_body_size 2m;",
+            "    location ^~ /dns-query { return 404; }",
+            "    location ^~ /doh { return 404; }",
+        ])
+        lines.extend(panel_locations)
+        lines.append("}")
+    lines.extend([
         "",
     ])
     return "\n".join(lines)
@@ -817,16 +886,20 @@ def render_nginx_stream(
     relay: Optional[str] = None,
     local_sites: Optional[Iterable[Any]] = None,
     front: str = "standard",
+    admin_host: Optional[str] = None,
 ) -> str:
     if front not in ("standard", "mtproxyl"):
         raise ValueError("unknown front: %s" % front)
     doh_host = _hostname(doh_host, "doh-host")
+    if admin_host is not None and front != "mtproxyl":
+        raise ValueError("admin-host requires mtproxyl front")
     if front == "mtproxyl":
         if local_sites:
             raise ValueError("local sites are not supported with mtproxyl front")
         rows = _map_policy(rows)
         if any(row.domain == doh_host and row.kind == "suffix" for row in rows):
             raise ValueError("DoH host conflicts with a routed suffix")
+        admin_host = _admin_hostname(admin_host, doh_host, rows)
         rows = [row for row in rows if row.domain != doh_host]
     default_target, sites = _local_sites(local_sites, doh_host, rows)
     # A relay host sits where clients can reach it and hands every routed
@@ -849,6 +922,8 @@ def render_nginx_stream(
         "        default %s;" % (default_target or "127.0.0.1:9"),
         "        %s 127.0.0.1:4443;" % doh_host,
     ]
+    if admin_host is not None:
+        lines.append("        %s 127.0.0.1:4443;" % admin_host)
     for host, site_target in sites:
         lines.append("        %s %s;" % (host, site_target))
     for row in _ordered_rows(rows):
@@ -917,17 +992,23 @@ def _map_policy(rows: Iterable[PolicyRow]) -> List[PolicyRow]:
     return _ordered_rows(domains.values())
 
 
-def render_mtproxyl_sni_map(rows: Iterable[PolicyRow], doh_host: str) -> str:
+def render_mtproxyl_sni_map(
+    rows: Iterable[PolicyRow], doh_host: str, admin_host: Optional[str] = None,
+) -> str:
     """Render entries for inclusion inside MTProxyL's existing stream map."""
     doh_host = _hostname(doh_host, "doh-host")
     entries = _map_policy(rows)
+    admin_host = _admin_hostname(admin_host, doh_host, entries)
     if any(row.kind == "suffix" and
            (row.domain == doh_host or doh_host.endswith("." + row.domain)) for row in entries):
         raise ValueError("routed suffix covers the DoH host used by MTProxyL")
-    return "".join(
+    mapping = "".join(
         "%s%s adguardhome_doh;\n" % ("." if row.kind == "suffix" else "", row.domain)
         for row in entries if row.domain != doh_host
     )
+    if admin_host is not None:
+        mapping += "%s adguardhome_doh;\n" % admin_host
+    return mapping
 
 
 def render_health_policy(rows: Iterable[PolicyRow]) -> str:
