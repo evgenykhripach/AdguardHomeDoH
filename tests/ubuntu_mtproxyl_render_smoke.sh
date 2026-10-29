@@ -131,6 +131,7 @@ python3 - "$PROJECT_ROOT" <<'PY'
 import fcntl
 import json
 import os
+import re
 import signal
 import socket
 import ssl
@@ -155,16 +156,133 @@ assert runtime.prepare(source, target, 'dns.example.com', '/usr/sbin/nginx',
                        marker_socket=marker, generation=first) == 'overlay'
 master = subprocess.Popen(['/usr/sbin/nginx', '-c', str(target), '-g', 'daemon off;'],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+original = None
+proc_root = Path('/proc')
+
+def worker_keys(workers):
+    return {(worker.pid, worker.start_ticks) for worker in workers}
+
+def capture_baseline():
+    deadline = time.monotonic() + 10
+    while True:
+        identity._recheck_master(original, proc_root)
+        before = set(identity._children(original, proc_root))
+        try:
+            return identity.capture_workers(original, proc_root=proc_root)
+        except identity.IdentityError:
+            identity._recheck_master(original, proc_root)
+            after = set(identity._children(original, proc_root))
+            # Retry only when an already observed child disappeared while the
+            # snapshot was taken. Other identity ambiguities remain failures.
+            if not after < before or time.monotonic() >= deadline:
+                raise
+
+def present_workers(expected):
+    # nginx changes a worker's argv while shutting it down; /proc stat retains
+    # the incarnation even for a zombie awaiting the unchanged master to reap it.
+    identity._recheck_master(original, proc_root)
+    children = set(identity._children(original, proc_root))
+    present = set()
+    for pid, expected_start in expected:
+        if pid not in children:
+            continue
+        try:
+            data = identity._read_bounded(proc_root / str(pid) / 'stat')
+        except FileNotFoundError as exc:
+            # A disappearing child is normal; a child still listed without stat
+            # is ambiguous and must not be accepted as drained.
+            if pid in identity._children(original, proc_root):
+                raise identity.IdentityError('listed child stat unavailable') from exc
+            continue
+        try:
+            text = data.decode('ascii').strip()
+            end = text.rindex(')')
+            if not text.startswith(str(pid) + ' ('):
+                raise ValueError('PID mismatch')
+            fields = text[end + 1:].split()
+            parent, start = int(fields[1]), int(fields[19])
+            if len(fields[0]) != 1 or not fields[0].isalpha() or parent < 0 or start <= 0:
+                raise ValueError('invalid child stat')
+        except (UnicodeError, ValueError, IndexError) as exc:
+            raise identity.IdentityError('invalid child stat during drain') from exc
+        if parent != original.pid:
+            if pid in identity._children(original, proc_root):
+                raise identity.IdentityError('listed child has another parent')
+            continue
+        if start == expected_start:
+            present.add((pid, start))
+    identity._recheck_master(original, proc_root)
+    return present
+
+def diagnose_generation(phase, expected_generation, expected_workers=()):
+    expected = set(expected_workers)
+    try:
+        present = sorted(present_workers(expected)) if original is not None else 'master not inspected'
+    except (identity.IdentityError, OSError) as exc:
+        present = 'unavailable (%s: %s)' % (type(exc).__name__, exc)
+    print('generation diagnostic: phase=%s expected=%s expected_pid_start=%s still_present=%s' %
+          (phase, expected_generation, sorted(expected), present), file=sys.stderr)
+    # This endpoint exists only in the disposable test. Print only a valid
+    # synthetic marker body and status, never arbitrary response headers/body.
+    for sample in range(3):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.5)
+                connection.connect(str(marker))
+                connection.sendall(b'GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+                response = bytearray()
+                while len(response) <= 2048:
+                    chunk = connection.recv(min(1024, 2049 - len(response)))
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+            head, separator, body = bytes(response).partition(b'\r\n\r\n')
+            status = re.match(rb'HTTP/1\.[01] ([0-9]{3})(?: |\r\n|$)', head)
+            matched = re.fullmatch(rb'([a-f0-9]{32}) ([1-9][0-9]*)', body)
+            if len(response) > 2048:
+                description = 'oversized response'
+            elif not separator or status is None or matched is None:
+                description = 'invalid response status=%s bytes=%d' % (
+                    status.group(1).decode('ascii') if status else 'unknown', len(response))
+            else:
+                description = 'status=%s marker_generation=%s marker_pid=%s' % (
+                    status.group(1).decode('ascii'), matched.group(1).decode('ascii'),
+                    matched.group(2).decode('ascii'))
+        except OSError as exc:
+            description = 'unavailable (%s)' % type(exc).__name__
+        print('generation diagnostic: sample=%d %s' % (sample + 1, description), file=sys.stderr)
+
+def wait_drained(workers, phase, expected_generation):
+    expected = worker_keys(workers)
+    if not expected:
+        raise identity.IdentityError('empty worker drain baseline')
+    deadline = time.monotonic() + 10
+    try:
+        while True:
+            present = present_workers(expected)
+            if not present:
+                return
+            if time.monotonic() >= deadline:
+                raise identity.IdentityError('worker drain timed out: %s' % sorted(present))
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    except (identity.IdentityError, OSError):
+        diagnose_generation(phase, expected_generation, expected)
+        raise
 
 def wait_generation(expected):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if master.poll() is not None:
+            diagnose_generation('initial master stopped', expected)
             raise RuntimeError('disposable nginx stopped')
         try:
             return runtime.probe_generation(marker, expected, timeout=0.5)
-        except (OSError, ValueError):
+        except (FileNotFoundError, ConnectionRefusedError):
             time.sleep(0.05)
+        except (OSError, ValueError, RuntimeError):
+            diagnose_generation('initial generation', expected)
+            raise
+    diagnose_generation('initial generation timeout', expected)
     raise RuntimeError('generation probe timed out')
 
 try:
@@ -173,20 +291,46 @@ try:
     original = identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup)
     assert runtime.prepare(source, target, 'dns.example.com', '/usr/sbin/nginx',
                            marker_socket=marker, generation=second) == 'overlay'
-    assert runtime.probe_generation(marker, first) == old_worker
-    baseline = identity.capture_workers(original)
+    baseline = capture_baseline()
+    try:
+        if runtime.probe_generation(marker, first) != old_worker:
+            raise identity.IdentityError('unexpected first generation worker')
+    except (identity.IdentityError, OSError, ValueError, RuntimeError):
+        diagnose_generation('first generation before HUP', first, worker_keys(baseline.workers))
+        raise
     os.kill(master.pid, signal.SIGHUP)
     deadline = time.monotonic() + 10
     while True:
         try:
             new_worker = identity.confirm_generation(original, baseline, marker, second)
             break
-        except identity.IdentityError:
-            if master.poll() is not None or time.monotonic() >= deadline:
+        except identity.IdentityError as exc:
+            cause = exc.__cause__
+            retryable = (str(exc) == 'generation probe failed' and
+                         (isinstance(cause, (FileNotFoundError, ConnectionRefusedError)) or
+                          (isinstance(cause, ValueError) and str(cause) == 'generation mismatch')))
+            if not retryable or master.poll() is not None or time.monotonic() >= deadline:
+                diagnose_generation('second generation confirmation', second,
+                                    worker_keys(baseline.workers))
                 raise
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
     assert new_worker.pid != old_worker
     assert identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original
+    wait_drained(baseline.workers, 'second generation drain', second)
+    generation_workers = {second: new_worker}
+
+    def check_current_generation(expected, worker, phase):
+        try:
+            pid = runtime.probe_generation(marker, expected, timeout=0.5)
+            if (pid != worker.pid or
+                    identity._child_identity(pid, original, proc_root, require_worker=True) != worker or
+                    pid not in identity._children(original, proc_root)):
+                raise identity.IdentityError('unexpected current generation worker')
+            identity._recheck_master(original, proc_root)
+        except (identity.IdentityError, OSError, ValueError, RuntimeError):
+            diagnose_generation(phase, expected, worker_keys({worker}))
+            raise
+
     def selfmask(_record, _worker):
         context = ssl.create_default_context()
         with socket.create_connection(('127.0.0.1', 8444), timeout=3) as raw:
@@ -205,15 +349,15 @@ try:
                 identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original)
 
     def terminal_business(record, generation):
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                worker_pid = runtime.probe_generation(marker, generation, timeout=0.5)
-                worker = identity._child_identity(worker_pid, original, Path('/proc'), require_worker=True)
-                return master_check(record) and selfmask(record, worker)
-            except (OSError, ValueError, identity.IdentityError):
-                time.sleep(0.05)
-        return False
+        try:
+            worker_pid = runtime.probe_generation(marker, generation, timeout=0.5)
+            worker = identity._child_identity(worker_pid, original, proc_root, require_worker=True)
+            return master_check(record) and selfmask(record, worker)
+        except (OSError, ValueError, RuntimeError):
+            expected_worker = generation_workers.get(generation)
+            expected = worker_keys({expected_worker}) if expected_worker else set()
+            diagnose_generation('terminal business', generation, expected)
+            raise
 
     # TEST STUB ONLY: no non-cooperating vendor-writer barrier is implemented.
     def barrier_stub():
@@ -229,32 +373,85 @@ try:
         return journal_module.Journal(journal_dir, lock_fd=fd, lock_path=lock_path,
                                       barrier=barrier_stub, master=master_check)
 
-    def strict(journal, fd, previous_generation, verify_business, record_callback=None):
+    def strict(journal, fd, previous_generation, verify_business, record_callback=None,
+               expect_failure=False):
         captured = []
+        baselines = []
+        candidates = []
+        before_strict = capture_baseline()
         def record(item):
             captured.append(item)
             if record_callback is not None:
                 return record_callback(journal, item)
             return journal.record_before_publish(item)
+        def observe_candidate(item, worker):
+            candidates.append(worker)
+            generation_workers[item.next_generation] = worker
+            return verify_business(item, worker)
+        def observe_previous(item, worker):
+            generation_workers[item.previous_generation] = worker
+            return selfmask(item, worker)
+        signal_checked = identity._signal_checked
+        def observe_signal(signal_master, signal_fd, signal_path, *, proc_root=Path('/proc')):
+            if signal_master != original:
+                raise identity.IdentityError('unexpected master before HUP')
+            baselines.append(capture_baseline())
+            return signal_checked(signal_master, signal_fd, signal_path, proc_root=proc_root)
         args = dict(source=source, runtime_path=target, domain='dns.example.com',
                     nginx_bin='/usr/sbin/nginx', marker_socket=marker, master=original,
                     lock_fd=fd, lock_path=lock_path, record_before_publish=record,
-                    restore_previous=journal.restore_previous, verify_previous=selfmask, timeout=10)
+                    restore_previous=journal.restore_previous, verify_previous=observe_previous, timeout=10)
         try:
-            result = identity.strict_reload(previous_generation=previous_generation,
-                                            verify_business=verify_business, **args)
-            return result, captured[0]
-        except identity.ReloadFailed:
+            identity._signal_checked = observe_signal
+            try:
+                result = identity.strict_reload(previous_generation=previous_generation,
+                                                verify_business=observe_candidate, **args)
+            finally:
+                identity._signal_checked = signal_checked
+        except identity.ReloadFailed as exc:
+            if (not expect_failure or not isinstance(exc.__cause__, identity.IdentityError) or
+                    str(exc.__cause__) != 'business verification failed'):
+                diagnose_generation('unexpected strict reload failure', previous_generation,
+                                    worker_keys(before_strict.workers))
+                raise
+            if len(captured) != 1 or len(baselines) != 2 or len(candidates) != 1:
+                diagnose_generation('incomplete strict rollback observation', previous_generation,
+                                    worker_keys(before_strict.workers))
+                raise identity.IdentityError('missing rollback baseline or candidate') from exc
+            workers = set(candidates)
+            for baseline in baselines:
+                workers.update(baseline.workers)
+            wait_drained(workers, 'strict rollback drain', previous_generation)
             return None, captured[0]
+        except (identity.IdentityError, OSError, ValueError, RuntimeError):
+            expected = previous_generation
+            if len(captured) == 1 and len(baselines) == 1:
+                expected = captured[0].next_generation
+            workers = set(before_strict.workers)
+            for baseline in baselines:
+                workers.update(baseline.workers)
+            workers.update(candidates)
+            diagnose_generation('strict reload failed', expected, worker_keys(workers))
+            raise
+        if expect_failure or len(captured) != 1 or len(baselines) != 1 or len(candidates) != 1:
+            raise identity.IdentityError('unexpected successful strict reload observation')
+        wait_drained(baselines[0].workers, 'strict reload drain', result)
+        return result, captured[0]
 
     def confirm_restored(journal, record, fd):
         assert journal.restore_previous(record) == record.previous_generation
         assert journal.restore_previous(record) == record.previous_generation  # idempotent
-        baseline = identity._capture_stable_workers(original, fd, lock_path,
-                                                    proc_root=Path('/proc'), timeout=10)
-        identity._signal_checked(original, fd, lock_path)
-        worker = identity._wait_generation(original, baseline, marker, record.previous_generation,
-                                           fd, lock_path, proc_root=Path('/proc'), timeout=10)
+        baseline = capture_baseline()
+        try:
+            identity._signal_checked(original, fd, lock_path)
+            worker = identity._wait_generation(original, baseline, marker, record.previous_generation,
+                                               fd, lock_path, proc_root=proc_root, timeout=10)
+        except (identity.IdentityError, OSError, ValueError, RuntimeError):
+            diagnose_generation('restored generation confirmation', record.previous_generation,
+                                worker_keys(baseline.workers))
+            raise
+        wait_drained(baseline.workers, 'restored generation drain', record.previous_generation)
+        generation_workers[record.previous_generation] = worker
         assert selfmask(record, worker)
         journal.confirm_rollback(record, business=terminal_business)
         journal.retire(record, business=terminal_business)
@@ -262,13 +459,15 @@ try:
 
     try:
         journal = create_journal(lock_fd)
+        check_current_generation(second, new_worker, 'before first strict reload')
         next_generation, first_record = strict(journal, lock_fd, second, selfmask)
         assert next_generation == first_record.next_generation
         journal.commit(first_record, business=terminal_business)
         journal.retire(first_record, business=terminal_business)
         assert not (journal_dir / 'intent.json').exists()
 
-        failed, second_record = strict(journal, lock_fd, next_generation, lambda *_: False)
+        failed, second_record = strict(journal, lock_fd, next_generation, lambda *_: False,
+                                       expect_failure=True)
         assert failed is None
         assert journal.read_pending(second_record)['phase'] == 'RESTORED_FILE'
         journal.confirm_rollback(second_record, business=terminal_business)
