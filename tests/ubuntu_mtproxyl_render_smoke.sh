@@ -205,9 +205,15 @@ try:
                 identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original)
 
     def terminal_business(record, generation):
-        worker_pid = runtime.probe_generation(marker, generation)
-        worker = identity._child_identity(worker_pid, original, Path('/proc'), require_worker=True)
-        return master_check(record) and selfmask(record, worker)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                worker_pid = runtime.probe_generation(marker, generation, timeout=0.5)
+                worker = identity._child_identity(worker_pid, original, Path('/proc'), require_worker=True)
+                return master_check(record) and selfmask(record, worker)
+            except (OSError, ValueError, identity.IdentityError):
+                time.sleep(0.05)
+        return False
 
     # TEST STUB ONLY: no non-cooperating vendor-writer barrier is implemented.
     def barrier_stub():
@@ -297,6 +303,8 @@ try:
                         strict(child_journal, child_fd, previous_generation, lambda *_: False)
                     os._exit(97)
                 except BaseException:
+                    import traceback
+                    traceback.print_exc()
                     os._exit(98)
             _, status = os.waitpid(child, 0)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
