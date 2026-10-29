@@ -575,8 +575,8 @@ def _verify_public_http01(webroot: Path, domain: str) -> None:
         os.close(fd)
 
 
-def _check_empty_global_cli_config() -> None:
-    """Refuse active global options, including hidden hooks or alternate servers."""
+def _check_safe_global_cli_config() -> None:
+    """Allow only known harmless global options; reject hooks and server overrides."""
     fd = _open_trusted_hook_directory(CERTBOT_ROOT)
     try:
         try:
@@ -593,9 +593,21 @@ def _check_empty_global_cli_config() -> None:
             if (len(data) != info.st_size or _hook_identity(info) != _hook_identity(os.fstat(config_fd))
                     or _hook_identity(info) != _hook_identity(named)):
                 raise ValueError("Certbot global cli.ini changed")
-            if any(line.strip() and not line.lstrip().startswith((b"#", b";"))
-                   for line in data.splitlines()):
-                raise ValueError("active Certbot global cli.ini options require manual review")
+            seen = set()
+            for line in data.splitlines():
+                line = line.strip()
+                if not line or line.startswith((b"#", b";")):
+                    continue
+                match = re.fullmatch(rb"(max-log-backups|preconfigured-renewal)\s*=\s*([^\s#;]+)", line)
+                if not match:
+                    raise ValueError("unsupported Certbot global cli.ini option")
+                key, value = match.groups()
+                if key in seen:
+                    raise ValueError("duplicate Certbot global cli.ini option")
+                seen.add(key)
+                if ((key == b"max-log-backups" and not re.fullmatch(rb"[0-9]+", value))
+                        or (key == b"preconfigured-renewal" and value.lower() != b"true")):
+                    raise ValueError("invalid Certbot global cli.ini option value")
         finally:
             os.close(config_fd)
     finally:
@@ -644,7 +656,7 @@ def reconfigure_admin_renewal(domain: str, webroot: Path, hook_dir: Path) -> Non
     certificate = ssl._ssl._test_decode_cert(str(cert_path))
     if certificate.get("subjectAltName") != (("DNS", domain),):
         raise ValueError("admin certificate must contain exactly the selected DNS name")
-    _check_empty_global_cli_config()
+    _check_safe_global_cli_config()
     _check_no_global_pre_post_hooks(hook_dir)
     _check_legacy_admin_hook(hook_dir, domain)
     _verify_public_http01(webroot, domain)
@@ -652,7 +664,7 @@ def reconfigure_admin_renewal(domain: str, webroot: Path, hook_dir: Path) -> Non
     _check_legacy_admin_hook(hook_dir, domain)
     ensure_lineage_reload_hook(hook_dir, domain, ReloadUnit.SHARED_NGINX)
     # Check again immediately before Certbot; hook creation does not touch these directories.
-    _check_empty_global_cli_config()
+    _check_safe_global_cli_config()
     _check_no_global_pre_post_hooks(hook_dir)
     # A private, disposable home avoids both inherited user configuration and
     # implementations which require HOME/XDG_CONFIG_HOME to be directories.

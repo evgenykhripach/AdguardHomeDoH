@@ -139,7 +139,7 @@ class AdminRenewalTests(unittest.TestCase):
 
     def test_global_cli_config_blocks_before_any_write(self):
         config = self.hooks.parent.parent / "cli.ini"
-        config.write_text("pre-hook = dangerous-command\n")
+        config.write_text("max-log-backups = 0\npreconfigured-renewal = true\n")
         config.chmod(0o600)
         real_fstat, real_stat = os.fstat, os.stat
         class RootOwner:
@@ -158,8 +158,21 @@ class AdminRenewalTests(unittest.TestCase):
              mock.patch.object(renewal.os, "stat", side_effect=root_stat), \
              mock.patch.object(renewal, "_verify_public_http01") as probe, \
              mock.patch.object(renewal, "ensure_lineage_reload_hook") as publish:
-            with self.assertRaisesRegex(ValueError, "global cli.ini"):
-                self.invoke()
+            for value in ("true", "True", "TRUE"):
+                config.write_text(f"max-log-backups = 0\npreconfigured-renewal = {value}\n")
+                renewal._check_safe_global_cli_config()
+            invalid = (
+                "pre-hook = dangerous-command\n", "post-hook = dangerous-command\n",
+                "server = https://example.com/acme\n", "max-log-backups = -1\n",
+                "max-log-backups = 0; pre-hook = run\n", "preconfigured-renewal = false\n", "preconfigured-renewal = other\n",
+                "max-log-backups = 0\nmax-log-backups = 1\n",
+                "preconfigured-renewal = true\npreconfigured-renewal = true\n",
+            )
+            for text in invalid:
+                with self.subTest(config=text):
+                    config.write_text(text)
+                    with self.assertRaisesRegex(ValueError, "global cli.ini"):
+                        self.invoke()
             probe.assert_not_called()
             publish.assert_not_called()
 
