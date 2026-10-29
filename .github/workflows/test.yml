@@ -25,6 +25,10 @@ jobs:
           export PATH="/usr/bin:$PATH"
           python3 -m unittest discover -s tests -v
           python3 tools/check_release.py
+      - name: Test systemd front process identity
+        run: |
+          sudo apt-get install -y nginx
+          sudo bash tests/ubuntu_systemd_front_smoke.sh "$PWD"
       - name: Ubuntu 26.04 installation smoke test
         run: |
           docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
