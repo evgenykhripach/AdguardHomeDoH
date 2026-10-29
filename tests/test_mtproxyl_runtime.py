@@ -1,4 +1,10 @@
+import hashlib
+import json
 import os
+import signal
+import stat
+import sys
+import time
 import stat
 from types import SimpleNamespace
 from unittest import mock
@@ -6,6 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from deploy.lib import mtproxyl_front as front
 from deploy.lib import mtproxyl_runtime as runtime
@@ -46,6 +53,129 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.prepare(), 'overlay')
         self.assertEqual(self.target.stat().st_ino, first)
         self.assertFalse(list(self.folder.glob('.*.doh-*')))
+
+    def test_stage_journals_exact_candidate_before_same_inode_publish(self):
+        before = self.target.read_bytes()
+        with runtime.stage(self.source, self.target, DOMAIN, self.nginx) as candidate:
+            self.assertEqual(self.target.read_bytes(), before)
+            staged = Path(candidate.candidate_path)
+            self.assertTrue(staged.is_file())
+            self.assertEqual(candidate.candidate_identity[1], staged.stat().st_ino)
+            self.assertEqual(candidate.candidate_exact[1:], (staged.stat().st_mtime_ns, staged.stat().st_ctime_ns))
+            self.assertEqual(runtime.publish(candidate), 'overlay')
+            after = self.target.stat()
+            self.assertEqual((after.st_dev, after.st_ino), candidate.candidate_identity[:2])
+            self.assertEqual(after.st_mtime_ns, candidate.candidate_exact[1])
+            self.assertEqual(self.target.read_bytes(), candidate.candidate_identity[-1])
+            self.assertEqual(hashlib.sha256(self.target.read_bytes()).digest(), candidate.candidate_identity[-2])
+            self.assertFalse(staged.exists())
+        self.assertEqual(self.source.read_text(), REALISTIC)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux rename ctime check')
+    def test_linux_rename_allows_ctime_change_but_preserves_inode_and_mtime(self):
+        with runtime.stage(self.source, self.target, DOMAIN, self.nginx) as candidate:
+            before = Path(candidate.candidate_path).stat()
+            time.sleep(.02)
+            self.assertEqual(runtime.publish(candidate), 'overlay')
+            after = self.target.stat()
+            self.assertEqual((after.st_dev, after.st_ino, after.st_mtime_ns),
+                             (before.st_dev, before.st_ino, before.st_mtime_ns))
+            self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+
+    def test_stage_and_publish_fsync_file_and_parent_in_order(self):
+        actual = os.fsync
+        events = []
+        def tracked(fd):
+            events.append('dir' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+            return actual(fd)
+        with mock.patch.object(runtime.os, 'fsync', side_effect=tracked):
+            with runtime.stage(self.source, self.target, DOMAIN, self.nginx) as candidate:
+                self.assertEqual(events, ['file', 'dir'])
+                runtime.publish(candidate)
+                self.assertEqual(events, ['file', 'dir', 'file', 'dir'])
+
+    def test_stage_fsync_failure_does_not_publish(self):
+        actual = os.fsync
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('simulated directory fsync failure')
+            return actual(fd)
+        with mock.patch.object(runtime.os, 'fsync', side_effect=fail_directory):
+            with self.assertRaises(OSError):
+                runtime.stage(self.source, self.target, DOMAIN, self.nginx)
+        self.assertEqual(self.target.read_text(), 'previous runtime')
+        self.assertFalse(list(self.folder.glob('.*.doh-*')))
+
+    def test_stage_rejects_same_bytes_different_candidate_inode(self):
+        with runtime.stage(self.source, self.target, DOMAIN, self.nginx) as candidate:
+            name = Path(candidate.candidate_path)
+            foreign = self.folder / 'foreign'
+            foreign.write_bytes(name.read_bytes())
+            foreign.chmod(0o600)
+            os.replace(foreign, name)
+            foreign_inode = name.stat().st_ino
+            with self.assertRaises(RuntimeError):
+                runtime.publish(candidate)
+            self.assertEqual(self.target.read_text(), 'previous runtime')
+        self.assertEqual(name.stat().st_ino, foreign_inode)
+
+    def test_stage_rejects_source_or_candidate_metadata_aba(self):
+        with runtime.stage(self.source, self.target, DOMAIN, self.nginx) as candidate:
+            before = self.source.stat()
+            self.source.write_bytes(self.source.read_bytes())
+            os.utime(self.source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with self.assertRaises(RuntimeError):
+                runtime.publish(candidate)
+        self.assertEqual(self.target.read_text(), 'previous runtime')
+        with runtime.stage(self.source, self.target, DOMAIN, self.nginx) as candidate:
+            path = Path(candidate.candidate_path)
+            before = path.stat()
+            path.write_bytes(path.read_bytes())
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with self.assertRaises(RuntimeError):
+                runtime.publish(candidate)
+        self.assertEqual(self.target.read_text(), 'previous runtime')
+
+    def test_stage_close_and_unpublished_failure_preserve_runtime(self):
+        candidate = runtime.stage(self.source, self.target, DOMAIN, self.nginx)
+        path = Path(candidate.candidate_path)
+        candidate.close()
+        candidate.close()
+        self.assertFalse(path.exists())
+        self.assertEqual(self.target.read_text(), 'previous runtime')
+        with self.assertRaises(ValueError):
+            runtime.publish(candidate)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux SIGKILL crash window')
+    def test_sigkill_after_rename_leaves_journaled_candidate_identity(self):
+        script = r"""
+import hashlib, json, os, signal, sys
+from pathlib import Path
+from deploy.lib import mtproxyl_runtime as r
+source, target, nginx, journal = map(Path, sys.argv[1:])
+s = r.stage(source, target, 'dns.example.com', nginx)
+base, mtime, ctime = s.candidate_exact
+record = {'dev':base[0], 'ino':base[1], 'mode':base[2], 'uid':base[3], 'gid':base[4],
+          'nlink':base[5], 'sha256':base[6].hex(), 'mtime':mtime, 'pre_ctime':ctime,
+          'candidate_path':s.candidate_path}
+with journal.open('x') as f:
+ os.fchmod(f.fileno(),0o600); json.dump(record,f); f.flush(); os.fsync(f.fileno())
+dirfd=os.open(journal.parent,os.O_RDONLY|os.O_DIRECTORY); os.fsync(dirfd); os.close(dirfd)
+os.replace(s.candidate_name,s.runtime_name,src_dir_fd=s.runtime_parent,dst_dir_fd=s.runtime_parent)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+        journal = self.folder / 'journal.json'
+        result = subprocess.run([sys.executable, '-c', script, str(self.source), str(self.target),
+                                 str(self.nginx), str(journal)], capture_output=True)
+        self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+        record = json.loads(journal.read_text())
+        actual = self.target.stat()
+        self.assertEqual((actual.st_dev, actual.st_ino, actual.st_mode, actual.st_uid, actual.st_gid,
+                          actual.st_nlink, actual.st_mtime_ns),
+                         (record['dev'], record['ino'], record['mode'], record['uid'], record['gid'],
+                          record['nlink'], record['mtime']))
+        self.assertEqual(hashlib.sha256(self.target.read_bytes()).hexdigest(), record['sha256'])
+        self.assertEqual(self.source.read_text(), REALISTIC)
 
     def test_patch_failure_strict_and_fallback(self):
         self.source.write_text('events {}\n')

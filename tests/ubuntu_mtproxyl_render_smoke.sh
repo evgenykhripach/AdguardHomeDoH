@@ -128,8 +128,12 @@ PY
 # Check that HUP actually loads the new generation in a new worker. This does
 # not exercise systemd or prove crash recovery; the entire nginx is disposable.
 python3 - "$PROJECT_ROOT" <<'PY'
+import fcntl
+import json
 import os
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -182,9 +186,81 @@ try:
             time.sleep(0.05)
     assert new_worker.pid != old_worker
     assert identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original
+    backups = {}
+
+    def record(item):
+        backup = root / ('backup-' + item.transaction_id)
+        with backup.open('xb') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(item.previous_identity[-1])
+            stream.flush()
+            os.fsync(stream.fileno())
+        journal = root / ('journal-' + item.transaction_id)
+        with journal.open('x') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump({'id': item.transaction_id, 'old': item.previous_generation,
+                       'new': item.next_generation, 'candidate_sha256': item.candidate_sha256}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        backups[item.transaction_id] = backup
+        return identity.JournalReceipt(item.transaction_id, True)
+
+    def restore(item):
+        staged = root / ('restore-' + item.transaction_id)
+        with staged.open('xb') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(backups[item.transaction_id].read_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, target)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return item.previous_generation
+
+    def selfmask(_record, _worker):
+        context = ssl.create_default_context()
+        with socket.create_connection(('127.0.0.1', 8444), timeout=3) as raw:
+            with context.wrap_socket(raw, server_hostname='dns.example.com') as conn:
+                conn.sendall(b'GET / HTTP/1.1\r\nHost: dns.example.com\r\nConnection: close\r\n\r\n')
+                response = b''
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+        return b'200 OK' in response and response.endswith(b'selfmask-ok\n')
+
+    lock_path = root / 'front.lock'
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        common = dict(source=source, runtime_path=target, domain='dns.example.com',
+                      nginx_bin='/usr/sbin/nginx', marker_socket=marker, master=original,
+                      lock_fd=lock_fd, lock_path=lock_path, record_before_publish=record,
+                      restore_previous=restore, verify_previous=selfmask, timeout=10)
+        next_generation = identity.strict_reload(previous_generation=second,
+                                                  verify_business=selfmask, **common)
+        try:
+            identity.strict_reload(previous_generation=next_generation,
+                                   verify_business=lambda *_: False, **common)
+            raise AssertionError('failed verification accepted')
+        except identity.ReloadFailed:
+            pass
+        assert len(list(root.glob('journal-*'))) == 2
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
     assert source.read_bytes() == before
     assert target.stat().st_mode & 0o777 == 0o600
-    print('nginx generation and master identity smoke: ok')
+    print('nginx generation, strict reload and rollback smoke: ok')
 finally:
     master.terminate()
     try:
