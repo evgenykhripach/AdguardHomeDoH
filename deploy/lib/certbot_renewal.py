@@ -22,6 +22,8 @@ import hashlib
 import os
 import re
 import secrets
+import ssl
+import subprocess
 import stat
 import sys
 import tempfile
@@ -159,6 +161,14 @@ def _check_existing_lineage_hook_with_retry(directory_fd, name, expected):
             time.sleep(0.01)
 
 
+def _validate_domain(domain: str) -> None:
+    if (not isinstance(domain, str) or len(domain) > 253 or domain != domain.lower()
+            or len(domain.split(".")) < 2
+            or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                   for label in domain.split("."))):
+        raise ValueError("invalid canonical domain for renewal hook")
+
+
 def ensure_lineage_reload_hook(directory: Path, domain: str, unit: ReloadUnit) -> Path:
     """Create, or verify, one root-owned reload hook without overwriting anything.
 
@@ -171,11 +181,7 @@ def ensure_lineage_reload_hook(directory: Path, domain: str, unit: ReloadUnit) -
     remove the new hook on rollback, or integrate service/supervisor actions.
     Callers must handle those operations and a possible partial commit.
     """
-    if (not isinstance(domain, str) or len(domain) > 253 or domain != domain.lower()
-            or len(domain.split(".")) < 2
-            or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
-                   for label in domain.split("."))):
-        raise ValueError("invalid canonical domain for renewal hook")
+    _validate_domain(domain)
     if unit is not ReloadUnit.SHARED_NGINX:
         raise ValueError("invalid unit for renewal hook")
     directory = Path(directory)
@@ -473,7 +479,211 @@ def migrate_file(path: Path, domain: str, webroot: str) -> bool:
     return True
 
 
+CERTBOT_ROOT = Path("/etc/letsencrypt")
+ADMIN_WEBROOT = Path("/var/www/adguardhome-doh-acme")
+
+
+def _admin_profile_values(text: str, domain: str) -> dict:
+    """Read simple profile keys, rejecting duplicates and active hook commands."""
+    values = {}
+    section = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[[") and stripped.endswith("]]"):
+            section = stripped
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped
+            continue
+        key = _key(line)
+        if key is None:
+            continue
+        value = line.split("=", 1)[1].strip()
+        if key in {"pre_hook", "post_hook", "deploy_hook", "manual_auth_hook", "manual_cleanup_hook"} and value:
+            raise ValueError("admin renewal profile contains a hook: " + key)
+        if section in (None, "[renewalparams]") and key in {"cert", "authenticator", "webroot_path"}:
+            if key in values:
+                raise ValueError("duplicate renewal profile key: " + key)
+            values[key] = value
+        if section == "[[webroot_map]]" and key == domain:
+            if "map" in values:
+                raise ValueError("duplicate admin webroot map")
+            values["map"] = value
+    return values
+
+
+def _check_legacy_admin_hook(directory: Path, domain: str) -> None:
+    """Refuse any admin lineage reference in the existing shared hook."""
+    directory_fd = _open_trusted_hook_directory(directory)
+    try:
+        try:
+            fd = os.open("adguardhome-doh-reload", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory_fd)
+        except FileNotFoundError:
+            return
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or info.st_mode & 0o022 or info.st_size > 65536):
+                raise ValueError("unsafe shared Certbot hook")
+            content = os.read(fd, 65537)
+            if len(content) != info.st_size or _hook_identity(info) != _hook_identity(os.fstat(fd)):
+                raise ValueError("shared Certbot hook changed")
+            named = os.stat("adguardhome-doh-reload", dir_fd=directory_fd, follow_symlinks=False)
+            if _hook_identity(info) != _hook_identity(named):
+                raise ValueError("shared Certbot hook changed")
+            if domain.encode("ascii") in content:
+                raise ValueError("shared Certbot hook already references admin lineage")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _verify_public_http01(webroot: Path, domain: str) -> None:
+    """Publish one random probe and require its exact response via public DNS."""
+    challenge = webroot / ".well-known" / "acme-challenge"
+    fd = _open_trusted_hook_directory(challenge)
+    name = "adguard-probe-" + secrets.token_hex(24)
+    payload = secrets.token_hex(32).encode("ascii")
+    probe_fd = None
+    try:
+        probe_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                           0o644, dir_fd=fd)
+        os.fchmod(probe_fd, 0o644)
+        if os.write(probe_fd, payload) != len(payload):
+            raise OSError("short HTTP-01 probe write")
+        result = subprocess.run(
+            ["curl", "--disable", "--fail", "--silent", "--show-error", "--max-time", "15",
+             "--noproxy", "*", "--proto", "=http", "http://" + domain
+             + "/.well-known/acme-challenge/" + name],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+        )
+        if result.stdout != payload:
+            raise ValueError("public HTTP-01 probe returned unexpected content")
+    finally:
+        if probe_fd is not None:
+            try:
+                opened = os.fstat(probe_fd)
+                named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                    raise ValueError("HTTP-01 probe changed; refusing cleanup")
+                os.unlink(name, dir_fd=fd)
+            finally:
+                os.close(probe_fd)
+        os.close(fd)
+
+
+def _check_empty_global_cli_config() -> None:
+    """Refuse active global options, including hidden hooks or alternate servers."""
+    fd = _open_trusted_hook_directory(CERTBOT_ROOT)
+    try:
+        try:
+            config_fd = os.open("cli.ini", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        except FileNotFoundError:
+            return
+        try:
+            info = os.fstat(config_fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or info.st_mode & 0o022 or info.st_size > 65536):
+                raise ValueError("unsafe Certbot global cli.ini")
+            data = os.read(config_fd, 65537)
+            named = os.stat("cli.ini", dir_fd=fd, follow_symlinks=False)
+            if (len(data) != info.st_size or _hook_identity(info) != _hook_identity(os.fstat(config_fd))
+                    or _hook_identity(info) != _hook_identity(named)):
+                raise ValueError("Certbot global cli.ini changed")
+            if any(line.strip() and not line.lstrip().startswith((b"#", b";"))
+                   for line in data.splitlines()):
+                raise ValueError("active Certbot global cli.ini options require manual review")
+        finally:
+            os.close(config_fd)
+    finally:
+        os.close(fd)
+
+
+def _check_no_global_pre_post_hooks(hook_dir: Path) -> None:
+    """Fail closed if Certbot could execute a global pre/post directory hook."""
+    for kind in ("pre", "post"):
+        directory = hook_dir.parent / kind
+        try:
+            fd = _open_trusted_hook_directory(directory)
+        except ValueError as exc:
+            # A missing directory is safe; all other errors are not.
+            if isinstance(exc.__cause__, FileNotFoundError):
+                continue
+            raise
+        try:
+            for name in os.listdir(fd):
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_mode & 0o111:
+                    raise ValueError("unknown Certbot %s hook: %s" % (kind, name))
+        finally:
+            os.close(fd)
+
+
+def reconfigure_admin_renewal(domain: str, webroot: Path, hook_dir: Path) -> None:
+    """Switch the selected admin lineage after a public HTTP and staging test.
+
+    Certbot reconfigure performs a staging renewal before saving options. Active
+    profile and directory pre/post hooks are refused. A published lineage hook
+    can remain if a later step fails. Run as root on the production host.
+    """
+    _validate_domain(domain)
+    webroot = Path(webroot)
+    hook_dir = Path(hook_dir)
+    if webroot != ADMIN_WEBROOT:
+        raise ValueError("admin webroot must be %s" % ADMIN_WEBROOT)
+    if hook_dir != CERTBOT_ROOT / "renewal-hooks" / "deploy":
+        raise ValueError("unexpected Certbot deploy hook directory")
+    profile_path = CERTBOT_ROOT / "renewal" / (domain + ".conf")
+    cert_path = CERTBOT_ROOT / "live" / domain / "cert.pem"
+    profile = _admin_profile_values(profile_path.read_text(encoding="utf-8"), domain)
+    if profile.get("cert") != str(cert_path):
+        raise ValueError("admin profile certificate path does not match selected lineage")
+    certificate = ssl._ssl._test_decode_cert(str(cert_path))
+    if certificate.get("subjectAltName") != (("DNS", domain),):
+        raise ValueError("admin certificate must contain exactly the selected DNS name")
+    _check_empty_global_cli_config()
+    _check_no_global_pre_post_hooks(hook_dir)
+    _check_legacy_admin_hook(hook_dir, domain)
+    _verify_public_http01(webroot, domain)
+    _check_no_global_pre_post_hooks(hook_dir)
+    _check_legacy_admin_hook(hook_dir, domain)
+    ensure_lineage_reload_hook(hook_dir, domain, ReloadUnit.SHARED_NGINX)
+    # Check again immediately before Certbot; hook creation does not touch these directories.
+    _check_empty_global_cli_config()
+    _check_no_global_pre_post_hooks(hook_dir)
+    # A private, disposable home avoids both inherited user configuration and
+    # implementations which require HOME/XDG_CONFIG_HOME to be directories.
+    with tempfile.TemporaryDirectory(prefix="adguard-certbot-home-", dir="/tmp") as home:
+        info = os.lstat(home)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError("unsafe temporary Certbot home directory")
+        environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
+                       "HOME": home, "XDG_CONFIG_HOME": home}
+        subprocess.run(["certbot", "reconfigure", "--cert-name", domain,
+                        "--webroot", "--webroot-path", str(webroot), "--non-interactive"],
+                       check=True, env=environment, timeout=300)
+    updated = _admin_profile_values(profile_path.read_text(encoding="utf-8"), domain)
+    if (updated.get("cert") != str(cert_path) or updated.get("authenticator") != "webroot"
+            or updated.get("map") != str(webroot)):
+        raise ValueError("Certbot returned success but admin renewal profile is unexpected")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "reconfigure-admin":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--domain", required=True)
+        parser.add_argument("--webroot", type=Path, required=True)
+        parser.add_argument("--hook-dir", type=Path, required=True)
+        args = parser.parse_args(argv[1:])
+        reconfigure_admin_renewal(args.domain, args.webroot, args.hook_dir)
+        print("admin renewal configured after public HTTP-01 and Certbot staging test")
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=Path, required=True)
     parser.add_argument("--domain", required=True)
