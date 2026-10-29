@@ -60,11 +60,11 @@ it sends clients to the real address of a service they reach through this server
 on purpose, and the client then caches that answer for the upstream TTL, so a
 brief blip must not trigger it.
 
-When *every* probed service fails in the same cycle the gate holds its previous
-state and reports `global_failure=1`. Services do not all break at the same
-second; a clean sweep means the fault is local - nginx down, resolver dead,
-uplink gone - and withdrawing every rewrite would make that outage worse and
-outlast it.
+When *every* probed service fails in the same cycle, including a single selected
+service, the gate holds its previous state and reports `global_failure=1`.
+This can indicate a local outage, and withdrawing every rewrite could make it
+worse and outlast it. With only one service, its own sustained failure also
+leaves the rewrite in place; investigate and manage the route manually if needed.
 
 The `oaiusercontent.com` suffix probes `files.oaiusercontent.com`, because its
 apex is not an upload TLS endpoint. AdGuard rewrites and nginx SNI entries are
@@ -174,11 +174,16 @@ seven copies). Summarize a window with:
 sudo adguardhome-doh-diag --minutes 60
 ```
 
-`no_clienthello` counts sessions that completed the TCP handshake and then
-received no byte at all: the path swallowed the TLS record, which is what DPI
-throttling looks like. `upstream_failures` means this host could not reach the
-target site. Zero connections during a reported stall means the client's
-packets never arrived.
+The UTC `window_start` and `window_end` bound the recorded session completion
+times. `log_state=unavailable` means no stream summary is available;
+`window_coverage=unverified` means the current file does not establish history
+before the window, or contains unparsed lines. Check rotated logs when needed.
+Even `observed_before_start` does not prove that every event was logged.
+Open sessions are logged only after they close, and writes are buffered.
+`no_clienthello` is the historical name for sessions with `in=0`; zero received
+bytes alone does not identify the cause. `upstream_failures` counts stream
+statuses 502 and 504 and warrants checking the nginx error log. No matching
+records do not prove that the client packets failed to reach the server.
 
 On the client, run the probe on the network where the stalls happen, for
 example a laptop tethered to the phone's hotspot with every VPN switched off:
@@ -188,27 +193,52 @@ DOH_URL='https://HOST/doh/<token>' tools/client-probe.sh HOST chatgpt.com 10
 ```
 
 Each line records ping, then TCP connect, TLS handshake, total time and HTTP
-code for the host itself, for a routed site, for the DoH endpoint and for a
-control host. `rc=28` with `connect=0` is an unanswered SYN, `rc=28` with a
-connect time but `tls=0` is a swallowed ClientHello, `rc=35` is a reset
-handshake. `site_ip` shows whether the routed site actually resolves to this
-host on that network. A stall on the host with the control host healthy and
-nothing in the host log at that time is a path problem between the client
-and this address, not a fault of the deployment.
+code for the host, routed site, DoH endpoint and control host. The probes are
+sequential: `time` is the ping start in UTC; `host_started_at`,
+`site_started_at`, `doh_started_at` and `control_started_at` record the start
+of each HTTP probe. Curl's connect, TLS and total values are elapsed seconds
+from that individual start, not absolute timestamps. `rc=28` is a curl timeout
+and `rc=35` is a TLS connection error; neither identifies its cause alone.
+`site_ip` shows the address curl connected to. Compare each probe's start and
+duration with server logs and a control host before drawing a conclusion. Keep
+client and server clocks synchronized; probe start timestamps have one-second
+resolution. The `tcp` counters are cumulative, not counts for the selected
+window; `health` covers the recent journal interval at the time it is read.
 
 ## Update and rollback
 
-Run the same bootstrap command with `--update`, or execute the local installer.
-Before activation, the installer stores the previous AdGuard and nginx files in
-`/var/backups/adguardhome-doh/<UTC timestamp>/`. The manager restores the
-newest complete backup after validating nginx configuration.
+For ordinary updates, use `sudo adguardhome-doh`, menu item 4. For the first
+upgrade from a release predating these fixes, including `v1.0.x` and `v1.1.5`,
+run the new installer directly with `--update` and the current domain, public
+IP and email: the old manager can overwrite the new installer's recovery with
+its own older snapshot after a failure. Keep an independent backup before
+upgrading. The installer stores managed-file snapshots
+under `/var/backups/adguardhome-doh/<UTC timestamp>/`; packages and issued ACME
+certificates are not rolled back. The manager validates the selected update
+snapshot and restores the previous runtime, reporting any recovery failure.
+
+An abrupt termination such as `SIGKILL` or an OOM kill can interrupt the
+operation after AdGuard was stopped and before a transaction marker is written.
+There is no automatic watchdog for this case; DNS/DoH can remain unavailable.
+Inspect the installation log, managed files and snapshots before restarting the
+service. If an unfinished `transaction.json` is present, keep it and the
+associated snapshot for manual recovery; do not assume the files are consistent.
+
+Updates and service changes preserve user settings made in the AdGuard Home UI
+and third-party rewrites. The application manages `http.address`, `http.doh`,
+`dns.bind_hosts`, `dns.port`, `auth_attempts`, `block_auth_min`, and its own
+rewrites from the old and current policies. The existing YAML must contain one
+valid `admin` entry with a password hash. The installer checks for the Ubuntu
+`python3-yaml` package, which is needed to preserve the existing configuration.
 
 ## Client setup
 
 Use the generated DoH URL in the operating system or browser's custom DoH
 settings. The generated Apple profile pins the server's public IPv4 address and lists
-the catalog domains; regenerate and reinstall the profile whenever that address
-changes and after updating from a release older than v1.1.1. If the
+the catalog domains; download and reinstall it when that address changes, after
+updating from a release older than v1.1.1, or after an update adds catalog
+domains missing from the installed profile. Changing only the service selection
+does not change the profile. If the
 client has cached the previous DNS answer, flush its DNS cache and restart the
 browser. Do not copy the server credential or DoH token into a public issue or
 chat.

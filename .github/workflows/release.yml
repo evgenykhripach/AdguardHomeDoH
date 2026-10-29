@@ -9,20 +9,28 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
       - name: Validate version and build archive
         shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           test "$(cat VERSION)" = "$tag"
+          tested_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          test "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" = "$tested_commit"
           archive="adguardhome-doh.tar.gz"
-          git archive --format=tar.gz --prefix="adguardhome-doh-${tag}/" "${GITHUB_REF_NAME}" > "$archive"
+          git archive --format=tar.gz --prefix="adguardhome-doh-${tag}/" "$tested_commit" > "$archive"
           sha256sum "$archive" > "${archive}.sha256"
       - name: Publish GitHub Release
         env:

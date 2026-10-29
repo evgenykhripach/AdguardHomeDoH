@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,6 +73,9 @@ class CertbotRenewalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / "dns.example.com.conf"
             profile.write_text(STANDALONE_PROFILE, encoding="utf-8")
+            profile.chmod(0o640)
+            unrelated_temp = profile.with_name(profile.name + ".tmp")
+            unrelated_temp.write_text("unrelated user data", encoding="utf-8")
 
             self.assertTrue(
                 module.migrate_file(profile, "dns.example.com", "/var/www/adguardhome-doh")
@@ -78,6 +83,8 @@ class CertbotRenewalTests(unittest.TestCase):
             backup = profile.with_suffix(profile.suffix + ".pre-webroot")
             self.assertEqual(STANDALONE_PROFILE, backup.read_text(encoding="utf-8"))
             self.assertIn("authenticator = webroot", profile.read_text(encoding="utf-8"))
+            self.assertEqual(0o640, profile.stat().st_mode & 0o777)
+            self.assertEqual("unrelated user data", unrelated_temp.read_text(encoding="utf-8"))
 
             # A second pass must leave both the profile and the backup alone.
             self.assertFalse(
@@ -93,6 +100,64 @@ class CertbotRenewalTests(unittest.TestCase):
                     Path(directory) / "absent.conf", "dns.example.com", "/var/www"
                 )
             )
+
+    def test_unrelated_hooks_survive_and_reload_hook_is_lineage_specific(self):
+        module = load_module()
+        profile = STANDALONE_PROFILE.replace(
+            "pre_hook = systemctl stop nginx", "pre_hook = /opt/local/pre-renew"
+        ).replace(
+            "post_hook = systemctl start nginx", "post_hook = /opt/local/post-renew"
+        ) + "deploy_hook = /opt/local/deploy && /opt/local/audit\n"
+        migrated = module.migrate(profile, "dns.example.com", "/var/www/adguardhome-doh")
+        self.assertIn("pre_hook = /opt/local/pre-renew", migrated)
+        self.assertIn("post_hook = /opt/local/post-renew", migrated)
+        self.assertIn("deploy_hook = /opt/local/deploy && /opt/local/audit", migrated)
+        self.assertEqual(1, migrated.count("deploy_hook ="))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "commands"
+            fake = root / "systemctl"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMANDS"\n', encoding="utf-8")
+            fake.chmod(0o755)
+            hook = module.ensure_reload_hook(root / "hooks", "dns.example.com")
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", COMMANDS=str(commands))
+            env["RENEWED_LINEAGE"] = "/etc/letsencrypt/live/other.example.com"
+            subprocess.run([str(hook)], env=env, check=True)
+            self.assertFalse(commands.exists())
+            env["RENEWED_LINEAGE"] = "/etc/letsencrypt/live/dns.example.com"
+            subprocess.run([str(hook)], env=env, check=True)
+            self.assertEqual("reload nginx\n", commands.read_text(encoding="utf-8"))
+            module.ensure_reload_hook(root / "hooks", "new.example.com")
+            subprocess.run([str(hook)], env=env, check=True)
+            env["RENEWED_LINEAGE"] = "/etc/letsencrypt/live/new.example.com"
+            subprocess.run([str(hook)], env=env, check=True)
+            self.assertEqual("reload nginx\n" * 3, commands.read_text(encoding="utf-8"))
+
+    def test_combined_user_hook_is_not_removed(self):
+        module = load_module()
+        profile = STANDALONE_PROFILE.replace(
+            "pre_hook = systemctl stop nginx", "pre_hook = systemctl stop nginx && /opt/local/audit"
+        )
+        migrated = module.migrate(profile, "dns.example.com", "/var/www")
+        self.assertIn("pre_hook = systemctl stop nginx && /opt/local/audit", migrated)
+        self.assertNotIn("post_hook = systemctl start nginx", migrated)
+        self.assertIn("deploy_hook = systemctl reload nginx", migrated)
+
+    def test_user_owned_directory_hook_is_never_replaced(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            hook = Path(directory) / "adguardhome-doh-reload"
+            hook.write_text("#!/bin/sh\necho user-owned\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unmanaged"):
+                module.ensure_reload_hook(Path(directory), "dns.example.com")
+            self.assertIn("user-owned", hook.read_text(encoding="utf-8"))
+            hook.unlink()
+            module.ensure_reload_hook(Path(directory), "dns.example.com")
+            with hook.open("a", encoding="utf-8") as stream:
+                stream.write("echo custom-command\n")
+            with self.assertRaisesRegex(ValueError, "unmanaged"):
+                module.ensure_reload_hook(Path(directory), "dns.example.com")
+            self.assertIn("custom-command", hook.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

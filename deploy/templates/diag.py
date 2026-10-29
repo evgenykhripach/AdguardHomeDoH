@@ -2,10 +2,9 @@
 """Summarize recent stream connections and TCP health of this host.
 
 A client that reports stalls while the host looks healthy needs evidence
-from both sides.  This command reads the nginx stream access log written by
-the deployment and answers three questions for the last N minutes: did the
-connections arrive at all, did their ClientHello arrive, and did the upstream
-connect succeed.  Pair it with tools/client-probe.sh run on the affected
+from both sides. This command summarizes completed nginx stream sessions in
+the available log. Missing records and zero received bytes do not identify
+the cause of a stall. Pair it with tools/client-probe.sh on the affected
 network and compare timestamps.
 """
 
@@ -17,7 +16,7 @@ import subprocess
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 LOG = Path("/var/log/adguardhome-doh/nginx-stream.access.log")
 LINE_RE = re.compile(
@@ -54,17 +53,24 @@ def parse_line(line: str) -> Optional[Dict[str, Any]]:
     return item
 
 
-def read_records(path: Path, since: datetime) -> List[Dict[str, Any]]:
-    try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
+def read_records(path: Path, since: datetime, until: datetime) -> Tuple[
+    List[Dict[str, Any]], Optional[datetime], int
+]:
+    lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
     records = []
+    first = None
+    invalid = 0
     for line in lines:
         item = parse_line(line)
-        if item is not None and item["when"] >= since:
+        if item is None:
+            invalid += 1
+            continue
+        when = item["when"]
+        if when <= until and (first is None or when < first):
+            first = when
+        if since <= when <= until:
             records.append(item)
-    return records
+    return records, first, invalid
 
 
 def percentile(values: List[float], fraction: float) -> Optional[float]:
@@ -77,10 +83,8 @@ def percentile(values: List[float], fraction: float) -> Optional[float]:
 
 def summarize(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     records = list(records)
-    # A session that closed without one byte from the client never carried
-    # a ClientHello: the TCP handshake completed and the path then swallowed
-    # the TLS record.  That is the signature of DPI throttling between the
-    # client and this host, not of a fault here.
+    # Retain the existing metric name; it counts zero bytes received, not a
+    # confirmed cause or a proven loss of the ClientHello in transit.
     no_hello = [item for item in records if item["received"] == 0]
     failed = [item for item in records if item["status"] != 200]
     return {
@@ -145,37 +149,58 @@ def _pairs(values: Dict[Any, Any]) -> str:
     return " ".join("%s=%s" % (key, value) for key, value in values.items()) or "-"
 
 
-def render(summary: Dict[str, Any], counters: Dict[str, str], health: Dict[str, int],
-           minutes: int, path: Path) -> str:
+def render(summary: Optional[Dict[str, Any]], counters: Dict[str, str], health: Dict[str, int],
+           minutes: int, path: Path, since: datetime, until: datetime,
+           first: Optional[datetime], invalid: int) -> str:
+    available = summary is not None
+    coverage = ("unavailable" if not available else
+                "observed_before_start" if first is not None and first <= since and not invalid
+                else "unverified")
     lines = [
-        "window_minutes=%d log=%s" % (minutes, path),
-        "connections=%d ok=%d failed=%d no_clienthello=%d upstream_failures=%d" % (
-            summary["connections"], summary["ok"], summary["failed"],
-            summary["no_clienthello"], summary["upstream_failures"]),
-        "status: " + _pairs(summary["by_status"]),
-        "no_clienthello_by_client: " + _pairs(summary["no_clienthello_by_client"]),
-        "failed_by_sni: " + _pairs(summary["failed_by_sni"]),
-        "session_p50=%s session_p95=%s connect_p95=%s" % (
-            _fmt(summary["session_p50"]), _fmt(summary["session_p95"]),
-            _fmt(summary["connect_p95"])),
+        "window_minutes=%d window_start=%s window_end=%s log=%s" % (
+            minutes, since.isoformat(), until.isoformat(), path),
+        "log_state=%s window_coverage=%s first_record=%s unparsed_lines=%d" % (
+            "available" if available else "unavailable", coverage,
+            first.isoformat() if first else "-", invalid),
+    ]
+    if summary is not None:
+        lines.extend([
+            "connections=%d ok=%d failed=%d no_clienthello=%d upstream_failures=%d" % (
+                summary["connections"], summary["ok"], summary["failed"],
+                summary["no_clienthello"], summary["upstream_failures"]),
+            "status: " + _pairs(summary["by_status"]),
+            "no_clienthello_by_client: " + _pairs(summary["no_clienthello_by_client"]),
+            "failed_by_sni: " + _pairs(summary["failed_by_sni"]),
+            "session_p50=%s session_p95=%s connect_p95=%s" % (
+                _fmt(summary["session_p50"]), _fmt(summary["session_p95"]),
+                _fmt(summary["connect_p95"])),
+        ])
+    lines.extend([
         "tcp: " + (_pairs(counters) if counters else "unavailable"),
         "health: " + (_pairs(health) if health else "unavailable"),
-    ]
+    ])
     hints = []
-    if summary["connections"] == 0:
-        hints.append("за окно не было ни одного соединения: если клиент в это время видел "
-                     "зависание, его пакеты до сервера не дошли вовсе")
-    if summary["no_clienthello"]:
-        hints.append("%d соединений без ClientHello: TCP-handshake прошёл, TLS-запись потерялась "
-                     "в пути; это почерк DPI или оператора, а не сервера" % summary["no_clienthello"])
-    if summary["upstream_failures"]:
-        hints.append("%d ошибок апстрима: сервер не смог подключиться к целевому сайту, "
-                     "смотрите nginx-stream.error.log" % summary["upstream_failures"])
+    if summary is None:
+        hints.append("журнал недоступен: проверьте путь и права доступа")
+    else:
+        if coverage == "unverified":
+            hints.append("полнота окна не подтверждена: проверьте ротацию и нераспознанные строки")
+        if not summary["connections"]:
+            hints.append("в доступном журнале не найдено записей о завершённых соединениях; "
+                         "открытые соединения могут ещё отсутствовать в журнале")
+        if summary["no_clienthello"]:
+            hints.append("%d записей с нулём принятых байт: причина по этому счётчику неизвестна" %
+                         summary["no_clienthello"])
+        if summary["failed"]:
+            hints.append("%d записей со статусом, отличным от 200: проверьте журнал ошибок nginx" %
+                         summary["failed"])
+        if summary["upstream_failures"]:
+            hints.append("%d записей со статусом 502 или 504: проверьте nginx-stream.error.log" %
+                         summary["upstream_failures"])
     if health.get("doh_fail"):
-        hints.append("health-gate видел отказ DoH %d раз: проблема на самом сервере" % health["doh_fail"])
-    if not hints and summary["connections"]:
-        hints.append("сервер обслужил все соединения; если клиент видел зависания, "
-                     "сравните время с выводом tools/client-probe.sh")
+        hints.append("health-gate видел отказ DoH %d раз; проверьте сервер и журнал" % health["doh_fail"])
+    if not hints and summary is not None and summary["connections"] and not summary["failed"]:
+        hints.append("у записанных сессий статус nginx 200; сравните время с tools/client-probe.sh")
     lines.extend("hint: " + hint for hint in hints)
     return "\n".join(lines)
 
@@ -186,10 +211,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--log", type=Path, default=LOG)
     args = parser.parse_args(argv)
     minutes = max(1, args.minutes)
-    since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
-    records = read_records(args.log, since)
-    print(render(summarize(records), tcp_counters(), health_journal(minutes), minutes, args.log))
-    return 0
+    until = datetime.now(timezone.utc).replace(microsecond=0)
+    since = until - timedelta(minutes=minutes)
+    try:
+        records, first, invalid = read_records(args.log, since, until)
+        summary = summarize(records)
+    except OSError:
+        summary, first, invalid = None, None, 0
+    print(render(summary, tcp_counters(), health_journal(minutes), minutes, args.log,
+                 since, until, first, invalid))
+    return 0 if summary is not None else 1
 
 
 if __name__ == "__main__":

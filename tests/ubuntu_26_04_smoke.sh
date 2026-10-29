@@ -48,6 +48,49 @@ nginx_running() {
     [[ -s /run/nginx.pid ]] && kill -0 "$(</run/nginx.pid)" 2>/dev/null
 }
 case "$*" in
+    "show --property=ControlGroup --value nginx")
+        if nginx_running; then awk -F: '$1 == "0" {print $3}' "/proc/$(</run/nginx.pid)/cgroup"; fi
+        ;;
+    "show --property=LoadState --value adguardhome-doh")
+        [[ -f /etc/systemd/system/adguardhome-doh.service ]] && printf 'loaded\n' || printf 'not-found\n'
+        ;;
+    "show --property=LoadState --value adguardhome-doh-health.timer")
+        [[ -f /etc/systemd/system/adguardhome-doh-health.timer ]] && printf 'loaded\n' || printf 'not-found\n'
+        ;;
+    "show --property=LoadState --value adguardhome-doh-health.service")
+        [[ -f /etc/systemd/system/adguardhome-doh-health.service ]] && printf 'loaded\n' || printf 'not-found\n'
+        ;;
+    "is-active nginx"|"is-active --quiet nginx")
+        if nginx_running; then [[ "$*" == *--quiet* ]] || printf 'active\n'; exit 0; fi
+        [[ "$*" == *--quiet* ]] || printf 'inactive\n'; exit 3
+        ;;
+    "is-active adguardhome-doh"|"is-active --quiet adguardhome-doh")
+        if [[ -s /tmp/adguardhome-doh.pid ]] && kill -0 "$(</tmp/adguardhome-doh.pid)" 2>/dev/null; then
+            [[ "$*" == *--quiet* ]] || printf 'active\n'; exit 0
+        fi
+        [[ "$*" == *--quiet* ]] || printf 'inactive\n'; exit 3
+        ;;
+    "is-active adguardhome-doh-health.timer"|"is-active --quiet adguardhome-doh-health.timer")
+        if [[ -e /tmp/adguardhome-doh-timer-active ]]; then
+            [[ "$*" == *--quiet* ]] || printf 'active\n'; exit 0
+        fi
+        [[ "$*" == *--quiet* ]] || printf 'inactive\n'; exit 3
+        ;;
+    "is-enabled "*)
+        unit="${2%.service}"
+        if [[ -e "/tmp/adguardhome-doh-enabled-$unit" ]]; then printf 'enabled\n'; exit 0; fi
+        printf 'disabled\n'; exit 1
+        ;;
+    "enable adguardhome-doh nginx")
+        touch /tmp/adguardhome-doh-enabled-adguardhome-doh /tmp/adguardhome-doh-enabled-nginx
+        ;;
+    "enable --now adguardhome-doh-health.timer")
+        touch /tmp/adguardhome-doh-enabled-adguardhome-doh-health.timer /tmp/adguardhome-doh-timer-active
+        ;;
+    "start adguardhome-doh-health.timer") touch /tmp/adguardhome-doh-timer-active ;;
+    "stop adguardhome-doh-health.timer") rm -f /tmp/adguardhome-doh-timer-active ;;
+    "start adguardhome-doh") start_adguardhome ;;
+    "stop adguardhome-doh") stop_adguardhome ;;
     "restart adguardhome-doh")
         start_adguardhome
         ;;
@@ -176,10 +219,15 @@ nginx -t
 test "$(grep -Fxc 'include /etc/nginx/stream.d/*.conf;' /etc/nginx/nginx.conf)" -eq 1
 test -s /var/lib/adguardhome-doh/admin-credentials.json
 test -f /var/lib/adguardhome-doh/install-complete
-test "$(stat -c '%a' /var/www/adguardhome-doh)" = 755
+test "$(stat -c '%a:%U:%G' /var/www/adguardhome-doh)" = 750:root:www-data
 first_token="$(active_token)"
 test -n "$first_token"
 test -s "/var/www/adguardhome-doh/$DOMAIN.mobileconfig"
+test "$(stat -c '%a:%U:%G' "/var/www/adguardhome-doh/$DOMAIN.mobileconfig")" = 640:root:www-data
+test "$(stat -c '%a' /etc/nginx/sites-enabled/adguardhome-doh)" = 600
+runuser -u www-data -- /usr/bin/test -r "/var/www/adguardhome-doh/$DOMAIN.mobileconfig"
+! runuser -u nobody -- /usr/bin/test -r "/var/www/adguardhome-doh/$DOMAIN.mobileconfig"
+! runuser -u nobody -- /usr/bin/test -r /etc/nginx/sites-enabled/adguardhome-doh
 grep -Fq 'Admin URL:' /tmp/adguardhome-doh-first-install.out
 
 systemctl stop nginx
@@ -225,11 +273,17 @@ sleep 7
 grep -Eq '^connections=[1-9]' /tmp/adguardhome-doh-diag.out
 grep -Fq "sni=$DOMAIN status=200" /var/log/adguardhome-doh/nginx-stream.access.log
 ! grep -Eq 'client=127\.0\.0\.1' /var/log/adguardhome-doh/nginx-stream.access.log
+old_yaml_sha="$(sha256sum /opt/AdGuardHome/AdGuardHome.yaml)"
 touch /tmp/adguardhome-doh-force-health-failure
 if install_once >/tmp/adguardhome-doh-failed-health.out 2>&1; then
     printf 'installer ignored a failed health-check\n' >&2
     exit 1
 fi
+test "$(sha256sum /opt/AdGuardHome/AdGuardHome.yaml)" = "$old_yaml_sha"
+test "$second_token" = "$(active_token)"
+kill -0 "$(</tmp/adguardhome-doh.pid)"
+curl --fail --silent --show-error --insecure --resolve "$DOMAIN:443:127.0.0.1" \
+    "https://$DOMAIN/$second_token.mobileconfig" -o /dev/null
 renewal_profile="/etc/letsencrypt/renewal/$DOMAIN.conf"
 grep -Fq 'authenticator = webroot' "$renewal_profile"
 grep -Fq "$DOMAIN = /var/www/adguardhome-doh" "$renewal_profile"
@@ -248,6 +302,68 @@ grep -Fq 'blocked_response_ttl: 300' /opt/AdGuardHome/AdGuardHome.yaml
 grep -Fq 'so_keepalive=30s:10s:3' /etc/nginx/stream.d/adguardhome-doh.conf
 grep -Fq 'net.ipv4.tcp_mtu_probing = 1' /etc/sysctl.d/90-adguardhome-doh.conf
 grep -Fq 'ADGUARDHOME_DOH_DOMAIN=dns.example.com' /etc/adguardhome-doh/runtime.env
+
+# Exercise a direct update against the real AdGuard process.  The custom rule
+# is written through its API, as it would be from the UI, while the process is
+# running.  A saved service selection must survive an update without flags.
+rm /tmp/adguardhome-doh-force-health-failure
+python3 - <<'PY'
+import base64
+import json
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+credentials = json.loads(Path('/var/lib/adguardhome-doh/admin-credentials.json').read_text())
+token = base64.b64encode((credentials['login'] + ':' + credentials['password']).encode()).decode()
+request = Request('http://127.0.0.1:3001/control/filtering/set_rules',
+                  data=json.dumps({'rules': ['||preserved.example^']}).encode(),
+                  headers={'Authorization': 'Basic ' + token, 'Content-Type': 'application/json'})
+with urlopen(request, timeout=8) as response:
+    assert response.status == 200
+Path('/var/lib/adguardhome-doh/enabled-services.json').write_text('["claude"]\n')
+PY
+"$PROJECT_ROOT/deploy/install.sh" --update --domain "$DOMAIN" --public-ip "$PUBLIC_IP" \
+    --email admin@example.com --yes > /tmp/adguardhome-doh-direct-update.out
+python3 - <<'PY'
+import json
+from pathlib import Path
+import yaml
+
+config = yaml.safe_load(Path('/opt/AdGuardHome/AdGuardHome.yaml').read_text())
+enabled = json.loads(Path('/var/lib/adguardhome-doh/enabled-services.json').read_text())
+policy = json.loads(Path('/etc/adguardhome-doh/health-policy.json').read_text())
+assert '||preserved.example^' in config['user_rules']
+assert enabled == ['claude']
+assert set(policy['services']) == {'claude'}
+PY
+curl --fail --silent --show-error --insecure --resolve "$DOMAIN:443:127.0.0.1" \
+    "https://$DOMAIN/$second_token.mobileconfig" -o /dev/null
+# Local HTTPS validation must stay local even on hosts configured with a proxy.
+HTTPS_PROXY=http://127.0.0.1:9 NO_PROXY= no_proxy= \
+    bash -c 'source "$1"; adguardhome_doh_smoke_https_sni "$2" 1 0' \
+    bash "$PROJECT_ROOT/deploy/lib/common.sh" "$DOMAIN"
+
+# The manager supplies cached flags but marks the saved state authoritative.
+# Exercise the non-dry-run branch after acquiring the operation locks.
+ADGUARDHOME_DOH_MANAGER_UPDATE=1 "$PROJECT_ROOT/deploy/install.sh" --update \
+    --domain stale.example.org --public-ip 203.0.113.20 \
+    --email stale@example.org --services chatgpt --yes \
+    > /tmp/adguardhome-doh-manager-update.out
+python3 - <<'PY'
+import json
+from pathlib import Path
+import yaml
+
+state = json.loads(Path('/var/lib/adguardhome-doh/install.json').read_text())
+enabled = json.loads(Path('/var/lib/adguardhome-doh/enabled-services.json').read_text())
+config = yaml.safe_load(Path('/opt/AdGuardHome/AdGuardHome.yaml').read_text())
+assert state['domain'] == 'dns.example.com'
+assert state['public_ip'] == '203.0.113.10'
+assert enabled == ['claude']
+assert '||preserved.example^' in config['user_rules']
+PY
+curl --fail --silent --show-error --insecure --resolve "$DOMAIN:443:127.0.0.1" \
+    "https://$DOMAIN/$second_token.mobileconfig" -o /dev/null
 
 # Relay mode renders and validates like an ordinary installation.
 "$PROJECT_ROOT/deploy/install.sh" --domain "$DOMAIN" --public-ip "$PUBLIC_IP" \

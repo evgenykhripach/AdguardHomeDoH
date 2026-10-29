@@ -3,6 +3,7 @@ name: Test installer
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -13,11 +14,22 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Install Python YAML support
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
       - name: Unit and release tests
+        env:
+          RUN_PTY_TESTS: '1'
         run: |
+          export PATH="/usr/bin:$PATH"
           python3 -m unittest discover -s tests -v
           python3 tools/check_release.py
       - name: Ubuntu 26.04 installation smoke test
         run: |
           docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
             /repo/tests/ubuntu_26_04_smoke.sh /repo
+      - name: Ubuntu shared-front rendering smoke test
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
+            /repo/tests/ubuntu_mtproxyl_render_smoke.sh /repo

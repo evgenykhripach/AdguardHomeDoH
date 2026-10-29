@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tools.render_config import (
     Catalog,
+    PolicyRow,
     load_policy,
     nginx_version,
     render,
@@ -17,11 +18,54 @@ from tools.render_config import (
     render_nginx_stream,
     render_rewrites,
     render_mobileconfig,
+    render_mtproxyl_sni_map,
     use_http2_directive,
 )
 
 
 class RenderConfigTests(unittest.TestCase):
+    def test_mtproxyl_stream_trust_and_http_listeners(self):
+        rows = [PolicyRow("example.org", "suffix", "example.org")]
+        stream = render_nginx_stream(rows, "dns.example.com", front="mtproxyl")
+        self.assertIn("listen 127.0.0.1:24443 proxy_protocol", stream)
+        self.assertIn("set_real_ip_from 127.0.0.1;", stream)
+        self.assertNotIn("listen 443", stream)
+        self.assertNotIn("listen [::]:443", stream)
+        self.assertNotIn("proxy_protocol on;", stream)
+        self.assertIn(".example.org $ssl_preread_server_name:443;", stream)
+        self.assertIn("dns.example.com 127.0.0.1:4443;", stream)
+        self.assertIn("default 127.0.0.1:9;", stream)
+        http = render_nginx_http("dns.example.com", "a" * 48, "/cert", "/web", front="mtproxyl")
+        self.assertIn("listen 127.0.0.1:4443 ssl", http)
+        self.assertNotIn("listen 80;", http)
+        self.assertNotIn("listen [::]:80;", http)
+        standard = render_nginx_stream(rows, "dns.example.com")
+        self.assertIn("listen 443 so_keepalive", standard)
+        self.assertNotIn("proxy_protocol", standard)
+        standard_http = render_nginx_http("dns.example.com", "a" * 48, "/cert", "/web")
+        self.assertIn("listen 80;", standard_http)
+        with self.assertRaises(ValueError):
+            render_nginx_stream(rows, "dns.example.com", local_sites=["*=127.0.0.1:8443"], front="mtproxyl")
+        with self.assertRaises(ValueError):
+            render_nginx_stream([PolicyRow("dns.example.com", "suffix", "")], "dns.example.com", front="mtproxyl")
+
+    def test_mtproxyl_map_validates_and_deduplicates_names(self):
+        rows = [PolicyRow("example.org", "fqdn", ""), PolicyRow("example.org", "suffix", ""),
+                PolicyRow("api.example.org", "fqdn", ""), PolicyRow("xn--e1afmkfd.xn--p1ai", "suffix", "")]
+        rows.append(PolicyRow("dns.other.org", "fqdn", ""))
+        mapping = render_mtproxyl_sni_map(rows, "dns.other.org")
+        self.assertEqual(1, mapping.splitlines().count(".example.org adguardhome_doh;"))
+        self.assertIn("api.example.org adguardhome_doh;", mapping)
+        self.assertIn(".xn--e1afmkfd.xn--p1ai adguardhome_doh;", mapping)
+        self.assertNotIn("dns.other.org adguardhome_doh;", mapping)
+        self.assertNotIn("hostnames;", mapping)
+        with self.assertRaises(ValueError):
+            render_mtproxyl_sni_map(rows, "dns.example.org")
+        for bad in ("evil.example; default bad", "xn--.example", "example.org."):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                render_mtproxyl_sni_map([PolicyRow(bad, "fqdn", "")], "dns.other.org")
+        with self.assertRaises(ValueError):
+            render_mtproxyl_sni_map([PolicyRow("example.org", "invalid", "")], "dns.other.org")
     def test_mobileconfig_uses_system_scope_for_macos_dns_settings(self):
         token = "a" * 48
         payload = plistlib.loads(
@@ -260,6 +304,14 @@ class RenderConfigTests(unittest.TestCase):
         self.assertIn("    listen 127.0.0.1:4443 ssl;", modern)
         self.assertIn("    http2 on;", modern)
         self.assertIn("ssl_session_cache shared:adguardhome_doh:10m;", legacy)
+
+    def test_nginx_accepts_valid_ascii_idna_and_rejects_invalid_tld(self):
+        http = render_nginx_http(
+            "dns.example.xn--p1ai", "a" * 48, "/cert", "/webroot", http2_directive=False
+        )
+        self.assertIn("server_name dns.example.xn--p1ai;", http)
+        with self.assertRaises(ValueError):
+            render_nginx_http("dns.example.xn--", "a" * 48, "/cert", "/webroot")
 
     def test_http2_style_detection_reads_the_nginx_version_banner(self):
         class Result:

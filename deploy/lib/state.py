@@ -21,11 +21,13 @@ MODE = 0o600
 INSTALL_FIELDS = ("domain", "public_ip", "email", "version", "repository")
 # A relay host forwards routed services to one exit host instead of the real
 # sites; the field is absent on ordinary installations.
-OPTIONAL_INSTALL_FIELDS = ("relay", "local_sites")
+OPTIONAL_INSTALL_FIELDS = ("relay", "local_sites", "policy", "front")
+MANAGED_POLICY_PATH = "/etc/adguardhome-doh/compat-policy.csv"
 LOCAL_SITE_RE = re.compile(r"^(\*|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)=(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
 SERVICE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 HOSTNAME_RE = re.compile(
-    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z]{2,63}|xn--[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?)$"
 )
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -77,6 +79,18 @@ def _string(value: Any, field: str) -> str:
     return value
 
 
+def _valid_hostname(value: str) -> bool:
+    if not HOSTNAME_RE.fullmatch(value):
+        return False
+    try:
+        for label in value.split("."):
+            if label.startswith("xn--"):
+                label.encode("ascii").decode("idna")
+    except UnicodeError:
+        return False
+    return True
+
+
 def _validate_install_state(value: Any) -> dict[str, str]:
     required = set(INSTALL_FIELDS)
     allowed = required | set(OPTIONAL_INSTALL_FIELDS)
@@ -87,7 +101,7 @@ def _validate_install_state(value: Any) -> dict[str, str]:
         )
     result = {field: _string(value[field], field) for field in INSTALL_FIELDS}
     domain = result["domain"].lower()
-    if not HOSTNAME_RE.fullmatch(domain):
+    if not _valid_hostname(domain):
         raise ValueError("invalid install domain: %s" % result["domain"])
     try:
         address = ipaddress.ip_address(result["public_ip"])
@@ -120,10 +134,21 @@ def _validate_install_state(value: Any) -> dict[str, str]:
             match = LOCAL_SITE_RE.fullmatch(item)
             if not match or not 1 <= int(match.group(3)) <= 65535 or int(match.group(3)) == 443:
                 raise ValueError("invalid local site: %s" % item)
+            if match.group(1) != "*" and not _valid_hostname(match.group(1)):
+                raise ValueError("invalid local site hostname: %s" % item)
             if item in cleaned:
                 raise ValueError("duplicate local site: %s" % item)
             cleaned.append(item)
         result["local_sites"] = cleaned
+    if "policy" in value:
+        policy = _string(value["policy"], "policy")
+        if policy != MANAGED_POLICY_PATH:
+            raise ValueError("policy must be the managed compatibility policy path")
+        result["policy"] = policy
+    if "front" in value:
+        if value["front"] != "mtproxyl":
+            raise ValueError("front must be mtproxyl when present")
+        result["front"] = value["front"]
     return result
 
 
@@ -149,6 +174,8 @@ def save_install_state(
     repository: str,
     relay: str | None = None,
     local_sites: Iterable[str] | None = None,
+    policy: str | None = None,
+    front: str | None = None,
 ) -> dict[str, str]:
     """Validate and atomically save installer metadata."""
 
@@ -164,6 +191,10 @@ def save_install_state(
     sites = [item for item in (local_sites or ()) if item]
     if sites:
         raw["local_sites"] = sites
+    if policy:
+        raw["policy"] = policy
+    if front is not None:
+        raw["front"] = front
     value = _validate_install_state(raw)
     _atomic_write(Path(path), value)
     return value

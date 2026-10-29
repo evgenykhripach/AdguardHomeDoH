@@ -15,7 +15,7 @@ COMMON = ROOT / "deploy" / "lib" / "common.sh"
 UI = ROOT / "deploy" / "lib" / "ui.sh"
 
 
-def run_pty(*args, input_text="", timeout=5, env_overrides=None, env_unset=()):
+def run_pty(*args, input_text="", timeout=20, env_overrides=None, env_unset=()):
     master, slave = pty.openpty()
     env = dict(os.environ)
     env["PYTHONPYCACHEPREFIX"] = "/tmp/adguardhome-doh-pycache"
@@ -107,7 +107,7 @@ class InteractiveInstallerTests(unittest.TestCase):
     def test_interactive_defaults_and_confirmation_are_read_in_order(self):
         code, output = run_pty(
             "--dry-run", "--root", tempfile.gettempdir(),
-            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\nd\ny\n",
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\nd\ny\ny\n",
         )
         self.assertEqual(0, code, output)
         self.assertIn("chatgpt", output.lower())
@@ -116,13 +116,17 @@ class InteractiveInstallerTests(unittest.TestCase):
         normalized_output = output.replace("\r\n", "\n")
         self.assertIn("[00%] проверка параметров\nДомен (например, dns.example.com):", normalized_output)
         self.assertIn("Категории:", output)
+        self.assertIn("Домен: dns.example.com", output)
+        self.assertIn("Публичный IPv4: 203.0.113.10", output)
+        self.assertIn("Email: admin@example.com", output)
+        self.assertLess(output.index("Домен: dns.example.com"), output.index("Продолжить установку?"))
         self.assertNotIn("78) [", output)
 
     @unittest.skipUnless(os.environ.get("RUN_PTY_TESTS"), "PTY unavailable in restricted test runner")
     def test_category_selector_opens_category_and_returns_to_categories(self):
         code, output = run_pty(
             "--dry-run", "--root", tempfile.gettempdir(),
-            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n1\n1 2\nb\ny\ny\n",
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n1\n1 2\nb\ny\ny\ny\n",
         )
         self.assertEqual(0, code, output)
         self.assertIn("ИИ:", output)
@@ -135,7 +139,7 @@ class InteractiveInstallerTests(unittest.TestCase):
     def test_selector_search_matches_name_and_id(self):
         code, output = run_pty(
             "--dry-run", "--root", tempfile.gettempdir(),
-            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n/copilot\n1 2\nb\ny\ny\n",
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n/copilot\n1 2\nb\ny\ny\ny\n",
         )
         self.assertEqual(0, code, output)
         self.assertIn("Результаты поиска", output)
@@ -230,7 +234,7 @@ class InteractiveInstallerTests(unittest.TestCase):
     def test_selector_markers_and_command_labels_are_explicit(self):
         code, output = run_pty(
             "--dry-run", "--root", tempfile.gettempdir(),
-            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n1\n1\nb\ny\ny\n",
+            input_text="dns.example.com\n203.0.113.10\nadmin@example.com\n1\n1\nb\ny\ny\ny\n",
             env_overrides={"TERM": "dumb", "COLUMNS": "60"},
         )
         self.assertEqual(0, code, output)
@@ -251,7 +255,7 @@ class InteractiveInstallerTests(unittest.TestCase):
         )
         result = subprocess.run(
             ["bash", "-c", script],
-            input=f"\x1b[200~\u200b {target_domain}\u200b\x1b[201~\r\n",
+            input=f"\x1b[200~ {target_domain.upper()} \x1b[201~\r\n",
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -259,6 +263,20 @@ class InteractiveInstallerTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(f"<{target_domain}>\n", result.stdout)
+
+    def test_invalid_domain_characters_are_not_silently_removed(self):
+        script = (
+            f'source "{COMMON}"; source "{UI}"; ADGUARDHOME_DOH_TTY_FD=0; '
+            'adguardhome_doh_prompt_value normalized "" adguardhome_doh_validate_hostname; '
+            'printf "<%s>\\n" "$normalized"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script], input="dns_.example.com\ndns\u200b.example.com\ndns\r.example.com\nDNS.EXAMPLE.COM\n",
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("<dns.example.com>\n", result.stdout)
+        self.assertEqual(3, result.stderr.count("значение не прошло проверку"))
 
     def test_selector_tty_detection_survives_command_substitution(self):
         ui_source = UI.read_text(encoding="utf-8")

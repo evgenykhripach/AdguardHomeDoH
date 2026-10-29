@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import os
 import subprocess
@@ -32,7 +33,10 @@ class RepositoryContractTests(unittest.TestCase):
             source = source_root / "deploy"
             source.mkdir(parents=True)
             installer = source / "install.sh"
-            installer.write_text("#!/bin/sh\nprintf 'installer ok\\n'\n", encoding="utf-8")
+            installer.write_text(
+                "#!/bin/sh\nprintf 'installer ok\\n'\nexit \"${ADGUARDHOME_DOH_TEST_INSTALL_STATUS:-0}\"\n",
+                encoding="utf-8",
+            )
             installer.chmod(0o755)
             for relative in (
                 "VERSION", "bootstrap.sh", "deploy/manage.py", "config/services.csv",
@@ -66,9 +70,12 @@ class RepositoryContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_curl.chmod(0o755)
+            bootstrap_tmp = temporary / "bootstrap-tmp"
+            bootstrap_tmp.mkdir()
             env = dict(os.environ)
             env.update({
                 "PATH": f"{fake_bin}:{env['PATH']}",
+                "TMPDIR": str(bootstrap_tmp),
                 "ADGUARDHOME_DOH_TEST_ARCHIVE": str(archive),
                 "ADGUARDHOME_DOH_TEST_CHECKSUM": str(checksum),
                 "ADGUARDHOME_DOH_TEST_METADATA": str(metadata),
@@ -78,11 +85,57 @@ class RepositoryContractTests(unittest.TestCase):
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual("installer ok\n", result.stdout)
+            self.assertEqual([], list(bootstrap_tmp.iterdir()), "temporary release remained after success")
             self.assertEqual(
                 "https://api.github.com/repos/evgenykhripach/AdguardHomeDoH/releases/latest\n"
                 "https://fixture/archive\nhttps://fixture/checksum\n",
                 url_log.read_text(encoding="utf-8"),
             )
+            env["ADGUARDHOME_DOH_TEST_INSTALL_STATUS"] = "37"
+            failed = subprocess.run([str(ROOT / "bootstrap.sh")], env=env,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(37, failed.returncode, failed.stderr)
+            self.assertEqual([], list(bootstrap_tmp.iterdir()), "temporary release remained after failure")
+
+    def test_client_probe_records_each_sequential_probe_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            fake_bin = temporary / "bin"
+            fake_bin.mkdir()
+            scripts = {
+                "date": (
+                    "#!/bin/sh\n"
+                    "case \"$*\" in *%Y%m%d*) echo fixture;; *) "
+                    "count=$(cat \"$PROBE_COUNTER\"); count=$((count + 1)); "
+                    "echo \"$count\" > \"$PROBE_COUNTER\"; "
+                    "printf '2026-10-29T00:00:%02dZ\\n' \"$count\";; esac\n"
+                ),
+                "ping": "#!/bin/sh\necho 'time=1.2 ms'\n",
+                "curl": "#!/bin/sh\nprintf '0.1|0.2|0.3|200|203.0.113.10'\n",
+                "sleep": "#!/bin/sh\nkill -TERM \"$PPID\"\n",
+            }
+            for name, body in scripts.items():
+                script = fake_bin / name
+                script.write_text(body, encoding="utf-8")
+                script.chmod(0o755)
+            counter = temporary / "counter"
+            counter.write_text("0\n", encoding="utf-8")
+            env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+                       PROBE_COUNTER=str(counter), DOH_URL="https://dns.example/doh/secret")
+            result = subprocess.run(
+                [str(ROOT / "tools/client-probe.sh"), "dns.example", "site.example", "1"],
+                cwd=temporary, env=env, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=10,
+            )
+            rows = list(csv.DictReader(result.stdout.splitlines()))
+            self.assertEqual(1, len(rows), result.stderr)
+            row = rows[0]
+            self.assertEqual("2026-10-29T00:00:01Z", row["time"])
+            self.assertEqual("2026-10-29T00:00:02Z", row["host_started_at"])
+            self.assertEqual("2026-10-29T00:00:03Z", row["site_started_at"])
+            self.assertEqual("2026-10-29T00:00:04Z", row["doh_started_at"])
+            self.assertEqual("2026-10-29T00:00:05Z", row["control_started_at"])
+            self.assertNotIn("secret", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

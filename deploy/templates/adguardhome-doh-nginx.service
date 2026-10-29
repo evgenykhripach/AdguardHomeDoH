@@ -1,0 +1,20 @@
+[Unit]
+Description=AdGuard Home DoH internal nginx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/run/adguardhome-doh-nginx.pid
+ExecStartPre=/usr/sbin/nginx -t -q -c /etc/adguardhome-doh/mtproxyl-nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/adguardhome-doh/mtproxyl-nginx.conf -g 'daemon on; master_process on;'
+ExecReload=/usr/sbin/nginx -c /etc/adguardhome-doh/mtproxyl-nginx.conf -s reload
+ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/5 --pidfile /run/adguardhome-doh-nginx.pid
+TimeoutStopSec=5
+KillMode=mixed
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

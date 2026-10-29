@@ -30,7 +30,7 @@ adguardhome_doh_require_ubuntu() {
 adguardhome_doh_required_packages() {
     printf '%s\n' \
         ca-certificates curl nginx libnginx-mod-stream certbot openssl \
-        apache2-utils tar gzip python3
+        apache2-utils tar gzip python3 python3-yaml
 }
 
 adguardhome_doh_missing_packages() {
@@ -169,7 +169,7 @@ adguardhome_doh_install_sysctl() {
         printf 'tcp_bbr\n' > "$modules"
         chmod 644 "$modules"
     fi
-    if [[ "$root" == / ]]; then
+    if [[ "$root" == / && "${ADGUARDHOME_DOH_DEFER_SYSCTL:-0}" != 1 ]]; then
         sysctl -q -p "$path" >/dev/null 2>&1 || \
             printf 'warning: kernel parameters were written but not applied: %s\n' "$path" >&2
     fi
@@ -201,12 +201,13 @@ ROTATE
 }
 
 adguardhome_doh_migrate_certbot_renewal() {
-    local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" profile helper
+    local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" profile helper hook_dir
     profile="$(adguardhome_doh_under_root "$root" "/etc/letsencrypt/renewal/$domain.conf")"
     helper="$project_root/deploy/lib/certbot_renewal.py"
     [[ -f "$helper" ]] || helper=/usr/local/libexec/adguardhome-doh/certbot_renewal.py
-    [[ -f "$profile" && -f "$helper" ]] || return 0
-    python3 "$helper" --path "$profile" --domain "$domain" --webroot "$webroot"
+    [[ -f "$profile" && -f "$helper" ]] || { printf 'missing Certbot renewal profile or migration helper\n' >&2; return 1; }
+    hook_dir="$(adguardhome_doh_under_root "$root" /etc/letsencrypt/renewal-hooks/deploy)"
+    python3 "$helper" --path "$profile" --domain "$domain" --webroot "$webroot" --hook-dir "$hook_dir"
 }
 
 adguardhome_doh_load_or_create_doh_token() {
@@ -242,12 +243,26 @@ adguardhome_doh_certbot_contact_args() {
     esac
 }
 
+adguardhome_doh_hash_password() {
+    printf '%s\n' "$1" | htpasswd -niBC 10 admin | tr -d '\r' | cut -d: -f2-
+}
+
 adguardhome_doh_validate_email() {
     [[ "${1:-}" =~ ^[^@[:space:]]+@[^@[:space:]]+[.][^@[:space:]]+$ ]]
 }
 
 adguardhome_doh_validate_hostname() {
-    [[ "${1:-}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+    python3 - "${1:-}" "${BASH_SOURCE[0]}" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]).resolve().parents[2]))
+from tools.render_config import _hostname
+try:
+    if _hostname(sys.argv[1], "hostname") != sys.argv[1]:
+        raise ValueError("hostname is not normalized")
+except ValueError:
+    raise SystemExit(1)
+PY
 }
 
 adguardhome_doh_validate_ipv4() {
@@ -298,13 +313,276 @@ adguardhome_doh_activate_binary() {
     fi
 }
 
+adguardhome_doh_acquire_operation_lock() {
+    local path="${ADGUARDHOME_DOH_OPERATION_LOCK_PATH:-/run/lock/adguardhome-doh-operations.lock}"
+    command -v flock >/dev/null 2>&1 || { printf 'flock is required for installation\n' >&2; return 1; }
+    exec 8>>"$path" || return 1
+    if ! flock -x 8; then exec 8>&-; return 1; fi
+    ADGUARDHOME_DOH_OPERATION_LOCK_HELD=1
+}
+
+adguardhome_doh_release_operation_lock() {
+    if [[ "${ADGUARDHOME_DOH_OPERATION_LOCK_HELD:-0}" == 1 ]]; then
+        flock -u 8 || return 1
+        exec 8>&-
+        ADGUARDHOME_DOH_OPERATION_LOCK_HELD=0
+    fi
+}
+
+adguardhome_doh_acquire_health_lock() {
+    local path="${ADGUARDHOME_DOH_LOCK_PATH:-/run/lock/adguardhome-doh-health.lock}"
+    command -v flock >/dev/null 2>&1 || { printf 'flock is required for installation\n' >&2; return 1; }
+    exec 9>>"$path" || return 1
+    if ! flock -x 9; then
+        exec 9>&-
+        return 1
+    fi
+    ADGUARDHOME_DOH_LOCK_HELD=1
+}
+
+adguardhome_doh_release_health_lock() {
+    if [[ "${ADGUARDHOME_DOH_LOCK_HELD:-0}" == 1 ]]; then
+        flock -u 9 || return 1
+        exec 9>&-
+        ADGUARDHOME_DOH_LOCK_HELD=0
+    fi
+}
+
+adguardhome_doh_capture_directory_permissions() {
+    local values line
+    values="$(python3 - "$@" <<'PY'
+import os
+import stat
+import sys
+for path in sys.argv[1:]:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if stat.S_ISDIR(metadata.st_mode):
+        print("\t".join(map(str, (path, metadata.st_dev, metadata.st_ino,
+                                    stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid))))
+PY
+)" || return 1
+    ADGUARDHOME_DOH_DIRECTORY_PERMISSIONS=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && ADGUARDHOME_DOH_DIRECTORY_PERMISSIONS+=("$line")
+    done <<< "$values"
+    return 0
+}
+
+adguardhome_doh_restore_directory_permissions() {
+    python3 - ${ADGUARDHOME_DOH_DIRECTORY_PERMISSIONS[@]+"${ADGUARDHOME_DOH_DIRECTORY_PERMISSIONS[@]}"} <<'PY'
+import os
+import sys
+failed = False
+for record in sys.argv[1:]:
+    path, device, inode, mode, uid, gid = record.split("\t")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(fd)
+            if (metadata.st_dev, metadata.st_ino) != (int(device), int(inode)):
+                raise RuntimeError("directory was replaced after snapshot")
+            if (metadata.st_uid, metadata.st_gid) != (int(uid), int(gid)):
+                os.fchown(fd, int(uid), int(gid))
+            os.fchmod(fd, int(mode))
+        finally:
+            os.close(fd)
+    except (OSError, RuntimeError) as exc:
+        print("cannot restore directory permissions %s: %s" % (path, exc), file=sys.stderr)
+        failed = True
+raise SystemExit(1 if failed else 0)
+PY
+}
+
+adguardhome_doh_capture_runtime() {
+    ADGUARDHOME_DOH_NGINX_ACTIVE="$(systemctl is-active nginx 2>/dev/null || true)"
+    ADGUARDHOME_DOH_NGINX_ENABLED="$(systemctl is-enabled nginx 2>/dev/null || true)"
+    ADGUARDHOME_DOH_AGH_ACTIVE="$(systemctl is-active adguardhome-doh 2>/dev/null || true)"
+    ADGUARDHOME_DOH_AGH_ENABLED="$(systemctl is-enabled adguardhome-doh 2>/dev/null || true)"
+    ADGUARDHOME_DOH_TIMER_ACTIVE="$(systemctl is-active adguardhome-doh-health.timer 2>/dev/null || true)"
+    ADGUARDHOME_DOH_TIMER_ENABLED="$(systemctl is-enabled adguardhome-doh-health.timer 2>/dev/null || true)"
+    ADGUARDHOME_DOH_HEALTH_ACTIVE="$(systemctl is-active adguardhome-doh-health.service 2>/dev/null || true)"
+}
+
+adguardhome_doh_stop_loaded_unit() {
+    local unit="$1" load_state
+    ADGUARDHOME_DOH_STOPPED_LOADED_UNIT=0
+    if ! load_state="$(systemctl show --property=LoadState --value "$unit" 2>/dev/null)"; then
+        [[ "$load_state" == not-found ]] || return 1
+    fi
+    case "$load_state" in
+        not-found) ;;
+        '') printf 'cannot determine systemd load state for %s\n' "$unit" >&2; return 1 ;;
+        *) systemctl stop "$unit" || return 1; ADGUARDHOME_DOH_STOPPED_LOADED_UNIT=1 ;;
+    esac
+}
+
+adguardhome_doh_pause_health() {
+    # Old workers read the policy before taking the health lock. Stop both the
+    # timer and worker even while a oneshot is activating or has a queued job.
+    ADGUARDHOME_DOH_HEALTH_PAUSED=1
+    adguardhome_doh_stop_loaded_unit adguardhome-doh-health.timer || return 1
+    adguardhome_doh_stop_loaded_unit adguardhome-doh-health.service || return 1
+}
+
+adguardhome_doh_restore_enablement() {
+    local unit="$1" original="$2" current
+    current="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    case "$original:$current" in
+        enabled:enabled|disabled:disabled|*:static|*:masked) return 0 ;;
+        enabled:*) systemctl enable "$unit" >/dev/null ;;
+        disabled:enabled|not-found:enabled|:enabled) systemctl disable "$unit" >/dev/null ;;
+    esac
+}
+
+adguardhome_doh_restore_runtime() {
+    local failed=0 agh_was_running=0
+    case "${ADGUARDHOME_DOH_AGH_ACTIVE:-}" in
+        active|activating|reloading) agh_was_running=1 ;;
+    esac
+    # Stop only units which the installer started and which were not active at
+    # capture time. Existing nginx sites keep their previous running service.
+    if [[ "${ADGUARDHOME_DOH_TIMER_ACTIVE:-}" != active ]] && systemctl is-active --quiet adguardhome-doh-health.timer; then
+        systemctl stop adguardhome-doh-health.timer >/dev/null 2>&1 || failed=1
+    fi
+    if ((agh_was_running == 0)) && systemctl is-active --quiet adguardhome-doh; then
+        systemctl stop adguardhome-doh >/dev/null 2>&1 || failed=1
+    fi
+    if [[ "${ADGUARDHOME_DOH_NGINX_ACTIVE:-}" != active ]] && systemctl is-active --quiet nginx; then
+        systemctl stop nginx >/dev/null 2>&1 || failed=1
+    fi
+    systemctl daemon-reload >/dev/null || failed=1
+    adguardhome_doh_restore_enablement nginx "${ADGUARDHOME_DOH_NGINX_ENABLED:-}" || failed=1
+    adguardhome_doh_restore_enablement adguardhome-doh "${ADGUARDHOME_DOH_AGH_ENABLED:-}" || failed=1
+    adguardhome_doh_restore_enablement adguardhome-doh-health.timer "${ADGUARDHOME_DOH_TIMER_ENABLED:-}" || failed=1
+    if ((agh_was_running)); then
+        systemctl start adguardhome-doh >/dev/null || failed=1
+    fi
+    if [[ "${ADGUARDHOME_DOH_NGINX_ACTIVE:-}" == active ]]; then
+        if nginx -t >/dev/null 2>&1; then
+            if systemctl is-active --quiet nginx; then
+                systemctl reload nginx >/dev/null || failed=1
+            else
+                systemctl start nginx >/dev/null || failed=1
+            fi
+        else
+            failed=1
+        fi
+    fi
+    ((failed == 0))
+}
+
+adguardhome_doh_completed_transaction_fingerprint() {
+    # The manager writes a prepared marker before touching managed files.
+    # An unreadable, unrecognised, or unfinished marker makes recovery uncertain.
+    python3 - "$1" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+backup_root = Path(sys.argv[1]) / "var/backups/adguardhome-doh"
+if backup_root.exists() and not backup_root.is_dir():
+    raise SystemExit(1)
+digest = hashlib.sha256()
+try:
+    for marker in sorted(backup_root.glob("*/transaction.json")):
+        contents = marker.read_bytes()
+        value = json.loads(contents)
+        if not isinstance(value, list) and (
+            not isinstance(value, dict) or value.get("version") != 1
+            or value.get("state") not in ("committed", "restored")
+        ):
+            raise ValueError("unfinished transaction")
+        name = str(marker.relative_to(backup_root)).encode("utf-8")
+        digest.update(len(name).to_bytes(8, "big") + name)
+        digest.update(len(contents).to_bytes(8, "big") + contents)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+print(digest.hexdigest())
+PY
+}
+
 adguardhome_doh_install_exit() {
-    local status=$? restore_failed=0
+    local status=$? restore_failed=0 stopped_adguard=0 restore_cli_failed=0 early_refusal=0
+    local marker_before= marker_after= marker_before_valid=0
+    local -a restore_args=()
     trap - EXIT
     if [[ -n "${ADGUARDHOME_DOH_WORK_DIR:-}" ]]; then
         rm -rf -- "$ADGUARDHOME_DOH_WORK_DIR"
     fi
-    if ((status != 0)) && [[ -f "${ADGUARDHOME_DOH_BINARY_BACKUP:-}" ]]; then
+    if [[ -n "${ADGUARDHOME_DOH_STAGE:-}" && -d "$ADGUARDHOME_DOH_STAGE" ]]; then
+        rm -rf -- "$ADGUARDHOME_DOH_STAGE"
+    fi
+    if [[ -n "${ADGUARDHOME_DOH_MOBILECONFIG_TEMP:-}" ]]; then
+        rm -f -- "$ADGUARDHOME_DOH_MOBILECONFIG_TEMP"
+    fi
+    if [[ -n "${ADGUARDHOME_DOH_NGINX_TEMP:-}" ]]; then
+        rm -f -- "$ADGUARDHOME_DOH_NGINX_TEMP"
+    fi
+    if [[ -n "${ADGUARDHOME_DOH_LEGACY_POLICY_TEMP:-}" ]]; then
+        rm -f -- "$ADGUARDHOME_DOH_LEGACY_POLICY_TEMP"
+    fi
+    if ((status != 0)) && [[ -n "${ADGUARDHOME_DOH_SNAPSHOT:-}" && "${ADGUARDHOME_DOH_MUTATIONS:-0}" == 1 ]]; then
+        if [[ "${ADGUARDHOME_DOH_LOCK_HELD:-0}" != 1 ]]; then
+            adguardhome_doh_acquire_health_lock || restore_failed=1
+        fi
+        if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_HEALTH_PAUSED:-0}" == 1 ]]; then
+            adguardhome_doh_pause_health || restore_failed=1
+        fi
+        # AdGuard may save its live state on shutdown. Stop it before restoring
+        # the YAML, otherwise a later restart can overwrite the restored file.
+        if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 ]]; then
+            if adguardhome_doh_stop_loaded_unit adguardhome-doh >/dev/null; then
+                stopped_adguard="$ADGUARDHOME_DOH_STOPPED_LOADED_UNIT"
+            else
+                restore_failed=1
+                printf 'failed to stop AdGuard; files were not restored\n' >&2
+            fi
+        fi
+        if ((restore_failed == 0)); then
+            [[ "${ADGUARDHOME_DOH_NEW_CERTBOT_LINEAGE:-0}" == 1 ]] && \
+                restore_args=(--preserve-new-certbot-lineage)
+            if marker_before="$(adguardhome_doh_completed_transaction_fingerprint "$ROOT")"; then
+                marker_before_valid=1
+            fi
+            if ! python3 "$PROJECT_ROOT/deploy/manage.py" --restore-update-backup "$ADGUARDHOME_DOH_SNAPSHOT" \
+                --root "$ROOT" --domain "$DOMAIN" --files-only \
+                ${restore_args[@]+"${restore_args[@]}"}; then
+                restore_failed=1
+                restore_cli_failed=1
+                if ((marker_before_valid)) && \
+                   marker_after="$(adguardhome_doh_completed_transaction_fingerprint "$ROOT")" && \
+                   [[ "$marker_before" == "$marker_after" ]]; then
+                    early_refusal=1
+                fi
+            fi
+        fi
+        if ((restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 ]]; then
+            adguardhome_doh_restore_runtime || restore_failed=1
+        fi
+        if ((restore_failed)); then
+            printf 'automatic restoration failed; snapshot retained at %s\n' "$ADGUARDHOME_DOH_SNAPSHOT" >&2
+            if ((stopped_adguard && restore_cli_failed && early_refusal)); then
+                case "${ADGUARDHOME_DOH_AGH_ACTIVE:-}" in
+                    active|activating|reloading)
+                        systemctl start adguardhome-doh >/dev/null || \
+                            printf 'failed to restart AdGuard after an early restoration refusal\n' >&2 ;;
+                esac
+            elif ((restore_cli_failed && !early_refusal)); then
+                if ((stopped_adguard)); then
+                    printf 'AdGuard left stopped: file restoration may be incomplete; inspect the transaction marker and snapshot\n' >&2
+                else
+                    printf 'AdGuard was not restarted: file restoration may be incomplete; inspect the transaction marker and snapshot\n' >&2
+                fi
+            fi
+        fi
+    elif ((status != 0)) && [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 ]]; then
+        adguardhome_doh_restore_runtime || restore_failed=1
+        printf 'package changes are not reverted; verify installed packages and services\n' >&2
+    elif ((status != 0)) && [[ -f "${ADGUARDHOME_DOH_BINARY_BACKUP:-}" ]]; then
         adguardhome_doh_activate_binary \
             "$ADGUARDHOME_DOH_BINARY_BACKUP" \
             "$ADGUARDHOME_DOH_BINARY_TARGET" || restore_failed=1
@@ -312,6 +590,27 @@ adguardhome_doh_install_exit() {
             printf 'failed to restore previous AdGuard Home binary\n' >&2
         fi
     fi
+    if ((status != 0)) && [[ "${ADGUARDHOME_DOH_DIRECTORY_CAPTURED:-0}" == 1 ]]; then
+        adguardhome_doh_restore_directory_permissions || \
+            printf 'failed to restore one or more directory permissions\n' >&2
+    fi
+    adguardhome_doh_release_health_lock || printf 'failed to release health lock\n' >&2
+    if ((status != 0 && restore_failed == 0)) && \
+       [[ "${ADGUARDHOME_DOH_RUNTIME_TOUCHED:-0}" == 1 || "${ADGUARDHOME_DOH_HEALTH_PAUSED:-0}" == 1 ]]; then
+        case "${ADGUARDHOME_DOH_TIMER_ACTIVE:-}" in
+            active|activating|reloading)
+                systemctl start adguardhome-doh-health.timer >/dev/null || \
+                    printf 'failed to restore previous health timer state\n' >&2 ;;
+        esac
+    fi
+    if ((status != 0 && restore_failed == 0)) && [[ "${ADGUARDHOME_DOH_HEALTH_PAUSED:-0}" == 1 ]]; then
+        case "${ADGUARDHOME_DOH_HEALTH_ACTIVE:-}" in
+            active|activating|reloading)
+                systemctl start adguardhome-doh-health.service >/dev/null || \
+                    printf 'failed to restore previous health service state\n' >&2 ;;
+        esac
+    fi
+    adguardhome_doh_release_operation_lock || printf 'failed to release operation lock\n' >&2
     exit "$status"
 }
 
@@ -422,7 +721,7 @@ adguardhome_doh_smoke_https_sni() {
     [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
     [[ "$delay" =~ ^[0-9]+$ ]] || return 1
     for ((attempt = 1; attempt <= attempts; attempt++)); do
-        if curl --fail --silent --show-error \
+        if curl --fail --silent --show-error --noproxy '*' \
             --resolve "$host:443:127.0.0.1" \
             --connect-timeout 3 --max-time 8 \
             --output /dev/null "https://$host/"; then
@@ -474,6 +773,35 @@ adguardhome_doh_nginx_owns_listeners() {
     (( found ))
 }
 
+adguardhome_doh_system_nginx_owns_listeners() {
+    # A different service may also run a process named nginx.  Only take over
+    # listeners from the active system nginx unit whose cgroup owns every PID.
+    local listeners="$1" proc_root="${2:-/proc}" group line endpoint port rest pid found=0
+    systemctl is-active --quiet nginx || return 1
+    group="$(systemctl show --property=ControlGroup --value nginx 2>/dev/null)" || return 1
+    [[ "$group" == /* ]] || return 1
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        endpoint="$(awk '{print $4}' <<< "$line")"
+        port="${endpoint##*:}"
+        [[ "$port" == 80 || "$port" == 443 ]] || continue
+        [[ "$line" == *'users:(("nginx"'* && "$line" == *'pid='* ]] || return 1
+        rest="$line"
+        while [[ "$rest" =~ pid=([0-9]+) ]]; do
+            pid="${BASH_REMATCH[1]}"
+            [[ -r "$proc_root/$pid/cgroup" ]] || return 1
+            awk -F: -v group="$group" '
+                $3 == group || (group == "/" && substr($3, 1, 1) == "/") ||
+                    (group != "/" && index($3, group "/") == 1) { found = 1 }
+                END { exit !found }
+            ' "$proc_root/$pid/cgroup" || return 1
+            found=1
+            rest="${rest#*pid=$pid}"
+        done
+    done <<< "$listeners"
+    (( found ))
+}
+
 adguardhome_doh_validate_local_site() {
     # HOST=IPV4:PORT, or *=IPV4:PORT for the default target; 443 stays ours.
     local value="${1:-}" host addr ip port
@@ -487,10 +815,33 @@ adguardhome_doh_validate_local_site() {
 }
 
 adguardhome_doh_preflight() {
-    local root="$1" domain="$2" public_ip="$3" allow_managed_update="${4:-0}" fronting="${5:-0}" os_release
+    local root="$1" domain="$2" public_ip="$3" allow_managed_update="${4:-0}" fronting="${5:-0}" os_release managed_path
     adguardhome_doh_require_valid_input "$domain" "$public_ip" "preflight@example.com"
     os_release="$(adguardhome_doh_under_root "$root" /etc/os-release)"
     adguardhome_doh_require_ubuntu "$os_release"
+    # Several writes below use shell redirection or cp. Following an existing
+    # symlink would modify its target while the snapshot saves only the link.
+    for managed_path in \
+        /etc/nginx/nginx.conf /etc/nginx/stream.d/adguardhome-doh.conf \
+        /etc/systemd/system/nginx.service.d/adguardhome-doh.conf \
+        /etc/systemd/system/adguardhome-doh.service \
+        /etc/systemd/system/adguardhome-doh-health.service \
+        /etc/systemd/system/adguardhome-doh-health.timer \
+        /etc/sysctl.d/90-adguardhome-doh.conf /etc/modules-load.d/adguardhome-doh.conf \
+        /etc/logrotate.d/adguardhome-doh /etc/adguardhome-doh/runtime.env \
+        /etc/adguardhome-doh/health-policy.json /etc/adguardhome-doh/compat-policy.csv \
+        /etc/adguardhome-doh/catalog/services.csv /etc/adguardhome-doh/catalog/domains.csv \
+        /etc/adguardhome-doh/catalog/service-domains.csv /etc/adguardhome-doh/catalog/service-probes.csv \
+        /usr/local/libexec/adguardhome-doh/healthcheck.py \
+        /usr/local/libexec/adguardhome-doh/render_config.py \
+        /usr/local/libexec/adguardhome-doh/render_runtime.py \
+        /usr/local/libexec/adguardhome-doh/releases.py \
+        /usr/local/libexec/adguardhome-doh/certbot_renewal.py \
+        /usr/local/libexec/adguardhome-doh/VERSION \
+        /usr/local/sbin/adguardhome-doh /usr/local/sbin/adguardhome-doh-diag; do
+        [[ ! -L "$(adguardhome_doh_under_root "$root" "$managed_path")" ]] || \
+            adguardhome_doh_die "managed file is a symlink; refusing to overwrite: $managed_path"
+    done
     if [[ "$root" == / ]]; then
         command -v ss >/dev/null 2>&1 || adguardhome_doh_die "ss is required for listener preflight"
         local listeners
@@ -506,9 +857,11 @@ adguardhome_doh_preflight() {
         ' <<< "$listeners"; then
             local listeners_with_process
             listeners_with_process="$(ss -H -ltnp 2>/dev/null || true)"
-            if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process"; then
+            if (( allow_managed_update )) && adguardhome_doh_managed_nginx_update_allowed / "$domain" "$listeners_with_process" && \
+                adguardhome_doh_system_nginx_owns_listeners "$listeners_with_process"; then
                 :
-            elif (( fronting )) && adguardhome_doh_nginx_owns_listeners "$listeners_with_process"; then
+            elif (( fronting )) && adguardhome_doh_nginx_owns_listeners "$listeners_with_process" && \
+                adguardhome_doh_system_nginx_owns_listeners "$listeners_with_process"; then
                 # Existing sites keep running behind the stream listener.
                 :
             else

@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z]{2,63}|xn--[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?)$"
+)
 NGINX_VERSION_RE = re.compile(r"nginx/(\d+)\.(\d+)\.(\d+)")
 
 # Encrypted upstreams keep queries private.  The IP-addressed fallbacks need no
@@ -301,6 +304,12 @@ def _hostname(value: str, field: str, allow_empty: bool = False) -> str:
         return ""
     if value.endswith(".") or not HOST_RE.fullmatch(value):
         raise ValueError("%s must be a normalized hostname: %r" % (field, value))
+    for label in value.split("."):
+        if label.startswith("xn--"):
+            try:
+                label.encode("ascii").decode("idna")
+            except UnicodeError as exc:
+                raise ValueError("%s contains an invalid IDNA label: %r" % (field, value)) from exc
     return value
 
 
@@ -654,7 +663,10 @@ def render_nginx_http(
     webroot: str,
     *,
     http2_directive: Optional[bool] = None,
+    front: str = "standard",
 ) -> str:
+    if front not in ("standard", "mtproxyl"):
+        raise ValueError("unknown front: %s" % front)
     doh_host = _hostname(doh_host, "doh-host")
     if not re.fullmatch(r"[a-f0-9]{32,64}", doh_token):
         raise ValueError("doh-token must be lowercase hexadecimal")
@@ -667,20 +679,24 @@ def render_nginx_http(
         # budget rather than a per-client one.  It exists so that unattended
         # brute force cannot flood AdGuard Home's login endpoint.
         "limit_req_zone $binary_remote_addr zone=adguardhome_doh_login:1m rate=30r/m;",
-        "server {",
-        "    listen 80;",
-        "    listen [::]:80;",
-        "    server_name %s;" % doh_host,
-        "    location ^~ /.well-known/acme-challenge/ {",
-        "        root %s;" % webroot,
-        "        default_type text/plain;",
-        "        try_files $uri =404;",
-        "    }",
-        "    location / { return 301 https://$host$request_uri; }",
-        "}",
-        "server {",
-        listen_tls,
     ]
+    if front == "standard":
+        lines.extend([
+            "server {",
+            "    listen 80;",
+            "    listen [::]:80;",
+            "    server_name %s;" % doh_host,
+            "    location ^~ /.well-known/acme-challenge/ {",
+            "        root %s;" % webroot,
+            "        default_type text/plain;",
+            "        try_files $uri =404;",
+            "    }",
+            "    location / { return 301 https://$host$request_uri; }",
+            "}",
+        ])
+    lines.extend([
+        "server {", listen_tls,
+    ])
     if http2_directive:
         lines.append("    http2 on;")
     lines.extend([
@@ -800,8 +816,18 @@ def render_nginx_stream(
     doh_host: str,
     relay: Optional[str] = None,
     local_sites: Optional[Iterable[Any]] = None,
+    front: str = "standard",
 ) -> str:
+    if front not in ("standard", "mtproxyl"):
+        raise ValueError("unknown front: %s" % front)
     doh_host = _hostname(doh_host, "doh-host")
+    if front == "mtproxyl":
+        if local_sites:
+            raise ValueError("local sites are not supported with mtproxyl front")
+        rows = _map_policy(rows)
+        if any(row.domain == doh_host and row.kind == "suffix" for row in rows):
+            raise ValueError("DoH host conflicts with a routed suffix")
+        rows = [row for row in rows if row.domain != doh_host]
     default_target, sites = _local_sites(local_sites, doh_host, rows)
     # A relay host sits where clients can reach it and hands every routed
     # service to one exit host that can reach the real sites.  The TLS bytes
@@ -831,9 +857,8 @@ def render_nginx_stream(
     lines.extend([
         "    }",
         # Clients report stalls while this host looks healthy, so every
-        # connection leaves one line: whether a ClientHello ever arrived
-        # (in=0 means the TCP handshake completed and the TLS record was
-        # then swallowed on the path), how the upstream connect went and how
+        # connection leaves one line: whether any client bytes arrived,
+        # how the upstream connect went and how
         # long the session lived.  The client address is truncated to its
         # /24, the same privacy level as the anonymized query log.
         "    map $remote_addr $adguardhome_doh_client {",
@@ -851,8 +876,18 @@ def render_nginx_stream(
         # this side keep the mapping alive while a phone's HTTP/2 connection
         # idles, and detect a vanished peer within a minute instead of
         # holding a dead slot for the whole proxy_timeout.
-        "        listen 443 so_keepalive=30s:10s:3;",
-        "        listen [::]:443 so_keepalive=30s:10s:3;",
+    ])
+    if front == "mtproxyl":
+        lines.extend([
+            "        listen 127.0.0.1:24443 proxy_protocol so_keepalive=30s:10s:3;",
+            "        set_real_ip_from 127.0.0.1;",
+        ])
+    else:
+        lines.extend([
+            "        listen 443 so_keepalive=30s:10s:3;",
+            "        listen [::]:443 so_keepalive=30s:10s:3;",
+        ])
+    lines.extend([
         "        proxy_socket_keepalive on;",
         "        proxy_connect_timeout 5s;",
         # Long-lived streaming responses (chat completions, websockets) idle
@@ -868,6 +903,31 @@ def render_nginx_stream(
         "",
     ])
     return "\n".join(lines)
+
+
+def _map_policy(rows: Iterable[PolicyRow]) -> List[PolicyRow]:
+    """Validate names and collapse identical exact/suffix map entries."""
+    domains = {}
+    for row in rows:
+        domain = _hostname(row.domain, "domain")
+        if row.kind not in ("fqdn", "suffix"):
+            raise ValueError("kind must be fqdn or suffix")
+        if domain not in domains or row.kind == "suffix":
+            domains[domain] = PolicyRow(domain, row.kind, domain)
+    return _ordered_rows(domains.values())
+
+
+def render_mtproxyl_sni_map(rows: Iterable[PolicyRow], doh_host: str) -> str:
+    """Render entries for inclusion inside MTProxyL's existing stream map."""
+    doh_host = _hostname(doh_host, "doh-host")
+    entries = _map_policy(rows)
+    if any(row.kind == "suffix" and
+           (row.domain == doh_host or doh_host.endswith("." + row.domain)) for row in entries):
+        raise ValueError("routed suffix covers the DoH host used by MTProxyL")
+    return "".join(
+        "%s%s adguardhome_doh;\n" % ("." if row.kind == "suffix" else "", row.domain)
+        for row in entries if row.domain != doh_host
+    )
 
 
 def render_health_policy(rows: Iterable[PolicyRow]) -> str:

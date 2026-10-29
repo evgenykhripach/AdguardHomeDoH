@@ -1,4 +1,5 @@
 import csv
+import json
 import subprocess
 import sys
 import tempfile
@@ -194,6 +195,155 @@ class CatalogTests(unittest.TestCase):
 
 
 class ActivationSeedingTests(unittest.TestCase):
+    def test_mtproxyl_map_contains_catalog_and_compatibility_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / "policy.csv"
+            policy.write_text("domain,kind,probe\nlegacy.example,suffix,\napi.example,fqdn,\n", encoding="utf-8")
+            def run(output, extra):
+                result = subprocess.run([
+                    sys.executable, str(ROOT / "deploy/lib/render_runtime.py"),
+                    "--front", "mtproxyl", "--config-dir", str(ROOT / "config"), *extra,
+                    "--public-ip", "203.0.113.10", "--doh-host", "dns.example.com",
+                    "--doh-token", "a" * 48, "--password-hash", "secret-hash",
+                    "--certificate-root", "/cert", "--webroot", "/web", "--output", str(output),
+                ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(0, result.returncode, result.stderr)
+                return (output / "mtproxyl-sni.map").read_text(encoding="utf-8")
+            first = run(root / "one", ["--services", "chatgpt"])
+            second = run(root / "two", ["--services", "claude"])
+            compat = run(root / "three", ["--policy", str(policy)])
+            self.assertEqual(first, second)
+            self.assertIn(".chatgpt.com adguardhome_doh;", first)
+            self.assertIn(".anthropic.com adguardhome_doh;", first)
+            self.assertIn(".legacy.example adguardhome_doh;", compat)
+            self.assertIn("api.example adguardhome_doh;", compat)
+            self.assertIn(".chatgpt.com adguardhome_doh;", compat)
+            self.assertNotIn("secret-hash", compat)
+            self.assertNotIn("a" * 48, compat)
+            self.assertNotIn("anthropic.com", (root / "one/nginx-stream.conf").read_text(encoding="utf-8"))
+            self.assertNotIn("chatgpt.com", (root / "three/nginx-stream.conf").read_text(encoding="utf-8"))
+
+    def test_compatibility_policy_seeds_previously_healthy_domains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / "policy.csv"
+            policy.write_text("domain,kind,probe\nexample.com,suffix,\n", encoding="utf-8")
+            output = root / "output"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "deploy/lib/render_runtime.py"),
+                "--policy", str(policy), "--healthy-services", "example.com",
+                "--public-ip", "203.0.113.10", "--doh-host", "dns.example.com",
+                "--doh-token", "a" * 48, "--password-hash", "hash",
+                "--certificate-root", "/cert", "--webroot", "/web", "--output", str(output),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(0, result.returncode, result.stderr)
+            output_yaml = (output / "AdGuardHome.yaml").read_text(encoding="utf-8")
+            self.assertIn("domain: 'example.com'", output_yaml)
+            self.assertIn("domain: '*.example.com'", output_yaml)
+
+    def test_activation_reads_token_and_password_hash_from_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "token").write_text("a" * 48, encoding="utf-8")
+            (root / "hash").write_text("$2a$10$fixture", encoding="utf-8")
+            output = root / "output"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "deploy/lib/render_runtime.py"),
+                "--config-dir", str(ROOT / "config"), "--services", "chatgpt",
+                "--public-ip", "203.0.113.10", "--doh-host", "dns.example.com",
+                "--doh-token-file", str(root / "token"),
+                "--password-hash-file", str(root / "hash"),
+                "--certificate-root", "/cert", "--webroot", "/web", "--output", str(output),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("$2a$10$fixture", (output / "AdGuardHome.yaml").read_text(encoding="utf-8"))
+            self.assertIn("/doh/" + "a" * 48, (output / "nginx-http.conf").read_text(encoding="utf-8"))
+
+    def test_activation_preserves_custom_settings_and_unmanaged_rewrites(self):
+        import yaml
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = root / "existing.yaml"
+            previous.write_text(
+                "http:\n  address: 0.0.0.0:3001\n"
+                "users:\n  - name: operator\n    password: operator-hash\n"
+                "  - name: admin\n    password: admin-hash\n"
+                "dns:\n  bind_hosts: [0.0.0.0]\n  upstream_dns: [192.0.2.53]\n"
+                "user_rules: ['||custom.example^']\n"
+                "filtering:\n  rewrites_enabled: false\n  rewrites:\n"
+                "  - {domain: old.example.com, answer: 203.0.113.9, enabled: true}\n"
+                "  - {domain: chatgpt.com, answer: 203.0.113.9, enabled: true}\n"
+                "  - {domain: custom.example.com, answer: 192.0.2.55, enabled: true}\n",
+                encoding="utf-8",
+            )
+            previous_policy = root / "policy.json"
+            previous_policy.write_text(json.dumps({"domains": [
+                {"domain": "old.example.com", "kind": "fqdn"},
+                {"domain": "chatgpt.com", "kind": "suffix"},
+            ]}), encoding="utf-8")
+            token = root / "token"
+            token.write_text("a" * 48, encoding="utf-8")
+            output = root / "output"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "deploy/lib/render_runtime.py"),
+                "--config-dir", str(ROOT / "config"), "--services", "chatgpt",
+                "--healthy-services", "chatgpt", "--public-ip", "203.0.113.10",
+                "--existing-config", str(previous), "--existing-policy", str(previous_policy),
+                "--existing-public-ip", "203.0.113.9",
+                "--doh-host", "dns.example.com", "--doh-token-file", str(token),
+                "--certificate-root", "/cert", "--webroot", "/web", "--output", str(output),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(0, result.returncode, result.stderr)
+            config = yaml.safe_load((output / "AdGuardHome.yaml").read_text(encoding="utf-8"))
+
+        self.assertEqual(["192.0.2.53"], config["dns"]["upstream_dns"])
+        self.assertEqual(["||custom.example^"], config["user_rules"])
+        self.assertEqual(["operator", "admin"], [user["name"] for user in config["users"]])
+        self.assertEqual("admin-hash", config["users"][1]["password"])
+        self.assertEqual("127.0.0.1:3001", config["http"]["address"])
+        self.assertEqual(["127.0.0.1"], config["dns"]["bind_hosts"])
+        self.assertTrue(config["filtering"]["rewrites_enabled"])
+        rules = {(item["domain"], item["answer"]) for item in config["filtering"]["rewrites"]}
+        self.assertIn(("custom.example.com", "192.0.2.55"), rules)
+        self.assertIn(("chatgpt.com", "203.0.113.10"), rules)
+        self.assertNotIn(("old.example.com", "203.0.113.9"), rules)
+        self.assertNotIn(("chatgpt.com", "203.0.113.9"), rules)
+
+    def test_activation_rejects_ambiguous_existing_configuration_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = root / "existing.yaml"
+            previous.write_text("users: []\nusers: []\n", encoding="utf-8")
+            output = root / "output"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "deploy/lib/render_runtime.py"),
+                "--config-dir", str(ROOT / "config"), "--services", "chatgpt",
+                "--public-ip", "203.0.113.10", "--doh-host", "dns.example.com",
+                "--doh-token", "a" * 48, "--existing-config", str(previous),
+                "--certificate-root", "/cert", "--webroot", "/web", "--output", str(output),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(0, result.returncode)
+            self.assertFalse((output / "AdGuardHome.yaml").exists())
+
+    def test_activation_rejects_existing_config_without_an_admin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = root / "existing.yaml"
+            previous.write_text("users:\n  - name: other\n    password: hash\n", encoding="utf-8")
+            output = root / "output"
+            result = subprocess.run([
+                sys.executable, str(ROOT / "deploy/lib/render_runtime.py"),
+                "--config-dir", str(ROOT / "config"), "--services", "chatgpt",
+                "--public-ip", "203.0.113.10", "--doh-host", "dns.example.com",
+                "--doh-token", "a" * 48, "--existing-config", str(previous),
+                "--certificate-root", "/cert", "--webroot", "/web", "--output", str(output),
+            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("exactly one admin", result.stderr)
+            self.assertFalse((output / "AdGuardHome.yaml").exists())
+
     def test_only_healthy_services_are_seeded_while_nginx_keeps_the_union(self):
         """A restart must not send clients to the real addresses in between."""
 

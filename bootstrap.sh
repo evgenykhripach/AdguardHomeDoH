@@ -96,4 +96,4 @@ source_dir="$(find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -pri
     printf 'error: downloaded release has no deploy/install.sh\n' >&2
     exit 1
 }
-exec "$source_dir/deploy/install.sh" "$@"
+"$source_dir/deploy/install.sh" "$@"

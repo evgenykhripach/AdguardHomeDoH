@@ -2,12 +2,16 @@ import hashlib
 import importlib.util
 import io
 import json
+import fcntl
+import contextlib
 import shutil
 import re
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from tools.render_config import Catalog
@@ -70,7 +74,7 @@ class ManagerTests(unittest.TestCase):
                 (backup / "manifest.json").read_text(encoding="utf-8")
             )
             entry = next(
-                item for item in manifest
+                item for item in manifest["files"]
                 if item["path"] == "/opt/AdGuardHome/AdGuardHome"
             )
             self.assertTrue(entry["present"])
@@ -208,10 +212,12 @@ class ManagerTests(unittest.TestCase):
             (certificate / "fullchain.pem").write_text("cert\n", encoding="utf-8")
             (certificate / "privkey.pem").write_text("key\n", encoding="utf-8")
             version.write_text("1.0.33\n", encoding="utf-8")
-            manager.create_backup(
+            backup = manager.create_backup(
                 root,
                 root / "var/backups/adguardhome-doh/20260823T000000000000Z",
+                operation="update",
             )
+            manager.finalize_update_backup(backup, root, "dns.example.com")
 
             def runner(command, **_kwargs):
                 active = command[-1] in {
@@ -234,6 +240,125 @@ class ManagerTests(unittest.TestCase):
         serialized = json.dumps(status, ensure_ascii=False)
         for secret in ("secret-login", "secret-password", "secret-token", "private@example.com"):
             self.assertNotIn(secret, serialized)
+
+    def test_uncertain_enabled_service_is_warning_in_menu_and_diagnostics(self):
+        manager = load_manager()
+        catalog = Catalog.load(ROOT / "config")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh"
+            config = root / "etc/adguardhome-doh"
+            state.mkdir(parents=True)
+            config.mkdir(parents=True)
+            (state / "enabled-services.json").write_text('["chatgpt"]', encoding="utf-8")
+            (state / "install.json").write_text(
+                '{"domain":"dns.example.com","email":"private@example.com"}', encoding="utf-8"
+            )
+            (state / "admin-credentials.json").write_text('{"password":"private-password"}', encoding="utf-8")
+            (state / "doh-token").write_text("private-token", encoding="utf-8")
+            (state / "health-state.json").write_text(json.dumps({
+                "chatgpt": {"healthy": True, "probe_uncertain": True, "private": "state-secret"},
+                "claude": {"healthy": True, "probe_uncertain": True},
+            }), encoding="utf-8")
+            (config / "health-policy.json").write_text(json.dumps({
+                "enabled_services": ["chatgpt"],
+                "services": {"chatgpt": {"probes": ["chatgpt.com"]}},
+                "domains": [{"domain": "chatgpt.com", "services": ["chatgpt"]}],
+            }), encoding="utf-8")
+
+            def runner(command, **_kwargs):
+                return subprocess.CompletedProcess(command, 0, b"ActiveState=inactive\nResult=success\nExecMainStatus=0\n", b"")
+
+            status = manager.collect_menu_status(root, catalog, runner=runner)
+            report = manager.collect_system_check(root, runner=runner)
+            menu = io.StringIO()
+            diagnostic = io.StringIO()
+            manager.render_main_screen(status, menu, width=40)
+            with mock.patch.object(manager, "collect_system_check", return_value=report), \
+                 mock.patch.object(manager, "_terminal_width", return_value=40):
+                manager.print_system_check(root, diagnostic)
+
+        self.assertEqual("attention", status["overall"])
+        self.assertTrue(status["probe_uncertain"])
+        self.assertEqual(1, status["enabled_services"])
+        self.assertEqual({"services": 1, "healthy": 1, "probe_uncertain": True}, report["health_state"])
+        for text in (menu.getvalue(), diagnostic.getvalue()):
+            flattened = " ".join(text.split())
+            self.assertIn("Текущее состояние неизвестно", flattened)
+            self.assertIn("Прежние DNS-правила сохранены", flattened)
+            for secret in ("private@example.com", "private-password", "private-token", "state-secret"):
+                self.assertNotIn(secret, text)
+            for line in text.splitlines():
+                self.assertLessEqual(len(manager._strip_ansi(line)), 40, line)
+        self.assertNotIn("● РАБОТАЕТ", menu.getvalue())
+        self.assertNotIn("1 / 1 здоровы", menu.getvalue())
+        self.assertIn("результат неопределён", diagnostic.getvalue())
+        self.assertNotIn("последняя проверка успешна", diagnostic.getvalue())
+        status["overall"] = "running"
+        stale_summary = io.StringIO()
+        manager.render_main_screen(status, stale_summary, width=80)
+        self.assertIn("ТРЕБУЕТ ВНИМАНИЯ", stale_summary.getvalue())
+        self.assertNotIn("● РАБОТАЕТ", stale_summary.getvalue())
+
+    def test_disabled_or_legacy_probe_state_does_not_show_uncertain_warning(self):
+        manager = load_manager()
+        catalog = Catalog.load(ROOT / "config")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh"
+            state.mkdir(parents=True)
+            (state / "enabled-services.json").write_text('["chatgpt"]', encoding="utf-8")
+            health = state / "health-state.json"
+            health.write_text(json.dumps({
+                "chatgpt": {"healthy": True},
+                "claude": {"healthy": False, "probe_uncertain": True},
+            }), encoding="utf-8")
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, b"Result=success\nExecMainStatus=0\n", b""))
+            status = manager.collect_menu_status(root, catalog, runner=runner)
+            report = manager.collect_system_check(root, runner=runner)
+            with mock.patch.object(manager, "_load_catalog", return_value=catalog):
+                unhealthy = manager._unhealthy_service_names(root)
+            self.assertFalse(status["probe_uncertain"])
+            self.assertEqual("running", status["overall"])
+            self.assertFalse(report["health_state"]["probe_uncertain"])
+            self.assertEqual(1, report["health_state"]["services"])
+            self.assertEqual([], unhealthy)
+            health.write_text('{"chatgpt":{"healthy":true,"probe_uncertain":true}}', encoding="utf-8")
+            (state / "enabled-services.json").write_text('[]', encoding="utf-8")
+            self.assertFalse(manager.collect_menu_status(root, catalog, runner=runner)["probe_uncertain"])
+            self.assertFalse(manager.collect_system_check(root, runner=runner)["health_state"]["probe_uncertain"])
+
+    def test_uncertain_compatibility_policy_tracks_only_current_domains(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh"
+            config = root / "etc/adguardhome-doh"
+            state.mkdir(parents=True)
+            config.mkdir(parents=True)
+            (state / "enabled-services.json").write_text('["chatgpt"]', encoding="utf-8")
+            policy = {"enabled_services": [], "services": {}, "domains": [
+                {"domain": "current.example.com", "services": []},
+            ]}
+            policy_file = config / "health-policy.json"
+            policy_file.write_text(json.dumps(policy), encoding="utf-8")
+            health = state / "health-state.json"
+            health.write_text(json.dumps({
+                "current.example.com": {"healthy": True, "probe_uncertain": True},
+                "removed.example.com": {"healthy": True, "probe_uncertain": True},
+            }), encoding="utf-8")
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, b"Result=success\nExecMainStatus=0\n", b""))
+            self.assertTrue(manager.collect_menu_status(root, runner=runner)["probe_uncertain"])
+            self.assertTrue(manager.collect_system_check(root, runner=runner)["health_state"]["probe_uncertain"])
+            policy_file.write_text(json.dumps(policy["domains"]), encoding="utf-8")
+            self.assertTrue(manager.collect_menu_status(root, runner=runner)["probe_uncertain"])
+            self.assertTrue(manager.collect_system_check(root, runner=runner)["health_state"]["probe_uncertain"])
+            health.write_text(json.dumps({
+                "current.example.com": {"healthy": True},
+                "removed.example.com": {"healthy": True, "probe_uncertain": True},
+            }), encoding="utf-8")
+            self.assertFalse(manager.collect_menu_status(root, runner=runner)["probe_uncertain"])
+            self.assertFalse(manager.collect_system_check(root, runner=runner)["health_state"]["probe_uncertain"])
 
     def test_main_screen_is_responsive_and_uses_semantic_status_text(self):
         manager = load_manager()
@@ -347,7 +472,7 @@ class ManagerTests(unittest.TestCase):
                 mock.call(["systemctl", "reload", "nginx"], check=True),
                 mock.call(
                     [
-                        "curl", "--fail", "--silent", "--show-error",
+                        "curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
                         "--resolve", "dns.example.com:443:127.0.0.1",
                         "--connect-timeout", "3", "--max-time", "8",
                         "--output", "/dev/null", "https://dns.example.com/",
@@ -367,28 +492,14 @@ class ManagerTests(unittest.TestCase):
             )
         self.assertEqual(3, runner.call_count)
 
-    def test_backup_restore_reloads_and_checks_previous_runtime(self):
+    def test_backup_restore_reloads_previous_runtime(self):
         manager = load_manager()
         runner = mock.Mock()
-        backup = Path("/var/backups/adguardhome-doh/test")
-        with mock.patch.object(manager, "_restore_backup") as restore, mock.patch.object(
-            manager, "reload_runtime_services"
-        ) as reload_services:
-            manager.restore_backup_runtime(
-                backup, Path("/"), "dns.example.com", runner=runner
-            )
-        restore.assert_called_once_with(backup, Path("/"))
+        with mock.patch.object(manager, "reload_runtime_services") as reload_services:
+            manager._reload_restored_runtime(Path("/"), "dns.example.com", runner)
         self.assertEqual(
             [
                 mock.call(["systemctl", "daemon-reload"], check=False),
-                mock.call(
-                    [
-                        "/opt/AdGuardHome/AdGuardHome", "--check-config",
-                        "-c", "/opt/AdGuardHome/AdGuardHome.yaml",
-                        "-w", "/var/lib/AdGuardHome",
-                    ],
-                    check=True, stdout=mock.ANY, stderr=mock.ANY,
-                ),
                 mock.call(["nginx", "-t"], check=True),
                 mock.call(
                     ["systemctl", "restart", "adguardhome-doh-health.timer"],
@@ -464,8 +575,8 @@ class ManagerTests(unittest.TestCase):
             )
 
             for name, invalid in (
-                ("partial", manifest[:1]),
-                ("duplicate", manifest + [manifest[0]]),
+                ("partial", {**manifest, "files": manifest["files"][:1]}),
+                ("duplicate", {**manifest, "files": manifest["files"] + [manifest["files"][0]]}),
             ):
                 with self.subTest(name=name):
                     (backup / "manifest.json").write_text(
@@ -485,16 +596,16 @@ class ManagerTests(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_text("before\n", encoding="utf-8")
             backup_root = root / "var/backups/adguardhome-doh"
-            manager.create_backup(root, backup_root / "20240101T00000000000000Z")
+            previous = manager.create_backup(root, backup_root / "20240101T000000000000Z", operation="update")
+            manager.finalize_update_backup(previous, root, "")
             target.write_text("after\n", encoding="utf-8")
             newer = backup_root / "20240201T00000000000000Z"
             newer.mkdir(parents=True)
-            (newer / "transaction.json").write_text("{}\n", encoding="utf-8")
 
             self.assertTrue(manager.rollback_last(root, runner=mock.Mock()))
             self.assertEqual("before\n", target.read_text(encoding="utf-8"))
 
-    def test_rollback_accepts_nested_full_backup_manifest(self):
+    def test_rollback_skips_nested_service_change_snapshot(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -502,11 +613,11 @@ class ManagerTests(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_text("before\n", encoding="utf-8")
             nested = root / "var/backups/adguardhome-doh/20240301T00000000000000Z/full"
-            manager.create_backup(root, nested)
+            manager.create_backup(root, nested, operation="service-change")
             target.write_text("after\n", encoding="utf-8")
 
-            self.assertTrue(manager.rollback_last(root, runner=mock.Mock()))
-            self.assertEqual("before\n", target.read_text(encoding="utf-8"))
+            self.assertFalse(manager.rollback_last(root, runner=mock.Mock()))
+            self.assertEqual("after\n", target.read_text(encoding="utf-8"))
 
     def test_rollback_returns_false_when_only_incomplete_backups_exist(self):
         manager = load_manager()
@@ -514,7 +625,6 @@ class ManagerTests(unittest.TestCase):
             root = Path(directory)
             backup = root / "var/backups/adguardhome-doh/20240401T00000000000000Z"
             backup.mkdir(parents=True)
-            (backup / "transaction.json").write_text("{}\n", encoding="utf-8")
 
             self.assertFalse(manager.rollback_last(root, runner=mock.Mock()))
 
@@ -659,15 +769,18 @@ class ManagerTests(unittest.TestCase):
             "active_domain_count": 50,
         }
         output = io.StringIO()
+        selected = Path("/var/backups/adguardhome-doh/fixture")
         with mock.patch.object(manager, "_load_catalog", return_value=catalog), \
              mock.patch.object(manager, "collect_menu_status", return_value=self._menu_status()), \
              mock.patch.object(manager, "collect_system_check", return_value=report), \
+             mock.patch.object(manager, "_latest_valid_backup", return_value=selected), \
+             mock.patch.object(manager, "_read_json", return_value={"version_before": "1.0.0", "version_after": "2.0.0"}), \
              mock.patch.object(manager, "rollback_last", return_value=True) as rollback:
             result = manager.run_menu(
                 Path("/"), io.StringIO("3\n5\ny\n0\n"), output
             )
         self.assertEqual(0, result)
-        rollback.assert_called_once_with(Path("/"))
+        rollback.assert_called_once_with(Path("/"), selected=selected)
         self.assertIn("ДИАГНОСТИКА СИСТЕМЫ", output.getvalue())
         self.assertIn("ОТКАТ ОБНОВЛЕНИЯ", output.getvalue())
         self.assertIn("Откат выполнен", output.getvalue())
@@ -731,6 +844,420 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual("before\n", target.read_text(encoding="utf-8"))
 
 
+class BackupSafetyTests(unittest.TestCase):
+    def _legacy_snapshot(self, manager, root, backup, paths):
+        backup.mkdir(parents=True)
+        entries = []
+        for index, path in enumerate(paths):
+            source = manager.under_root(root, path)
+            name = "%03d-%s" % (index, Path(path).name)
+            present = source.exists() or source.is_symlink()
+            if present:
+                manager._copy_path(source, backup / name)
+            entries.append({"path": path, "backup": name, "present": present})
+        (backup / "manifest.json").write_text(json.dumps(entries), encoding="utf-8")
+
+    def test_legacy_update_is_partial_and_skips_newer_service_snapshot(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "opt/AdGuardHome/AdGuardHome"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("old binary", encoding="utf-8")
+            yaml = binary.with_name("AdGuardHome.yaml")
+            yaml.write_text("old yaml", encoding="utf-8")
+            backup_root = root / "var/backups/adguardhome-doh"
+            old = backup_root / "20240101T000000000000Z"
+            self._legacy_snapshot(manager, root, old, manager.LEGACY_NO_BINARY_FILES)
+            binary.write_text("new binary", encoding="utf-8")
+            yaml.write_text("new yaml", encoding="utf-8")
+            manager.create_backup(
+                root, backup_root / "20240201T000000000000Z/full", operation="service-change"
+            )
+            self.assertEqual(old, manager._latest_valid_backup(root))
+            self.assertTrue(manager.rollback_last(root))
+            self.assertEqual("old yaml", yaml.read_text(encoding="utf-8"))
+            self.assertEqual("new binary", binary.read_text(encoding="utf-8"))
+
+    def test_legacy_unrecognised_list_is_rejected(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "backup"
+            self._legacy_snapshot(manager, root, backup, manager.LEGACY_NO_BINARY_FILES[:-1])
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                manager._validated_backup_manifest(backup)
+
+    def test_pending_update_is_not_selected_until_finalized(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup_root = root / "var/backups/adguardhome-doh"
+            previous = manager.create_backup(root, backup_root / "20240101T000000000000Z",
+                                             operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(previous, root, "dns.example.com")
+            pending = manager.create_backup(root, backup_root / "20240201T000000000000Z",
+                                            operation="update", domain="dns.example.com")
+            self.assertEqual("pending", json.loads((pending / "manifest.json").read_text())["status"])
+            self.assertEqual(previous, manager._latest_valid_backup(root))
+            self.assertEqual(0, manager.main(["--finalize-update-backup", str(pending),
+                                              "--root", str(root), "--domain", "dns.example.com"]))
+            self.assertEqual("applied", json.loads((pending / "manifest.json").read_text())["status"])
+            self.assertEqual(pending, manager._latest_valid_backup(root))
+
+    def test_finalize_rejects_wrong_domain_tampered_files_and_outside_path(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            source.parent.mkdir(parents=True)
+            source.write_text("saved", encoding="utf-8")
+            backup_root = root / "var/backups/adguardhome-doh"
+            backup = manager.create_backup(root, backup_root / "20240101T000000000000Z",
+                                           operation="update", domain="dns.example.com")
+            with self.assertRaisesRegex(RuntimeError, "pending update for this domain"):
+                manager.finalize_update_backup(backup, root, "other.example.com")
+            with self.assertRaisesRegex(RuntimeError, "outside the backup directory"):
+                manager.finalize_update_backup(root / "other", root, "dns.example.com")
+            manifest = json.loads((backup / "manifest.json").read_text())
+            entry = next(item for item in manifest["files"] if item["path"].endswith("AdGuardHome.yaml"))
+            (backup / entry["backup"]).write_text("changed", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                manager.finalize_update_backup(backup, root, "dns.example.com")
+            self.assertEqual("pending", json.loads((backup / "manifest.json").read_text())["status"])
+            self.assertIsNone(manager._latest_valid_backup(root))
+
+    def test_finalize_write_failure_keeps_snapshot_pending(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            with mock.patch.object(manager.os, "replace", side_effect=OSError("disk error")):
+                with self.assertRaisesRegex(OSError, "disk error"):
+                    manager.finalize_update_backup(backup, root, "dns.example.com")
+            self.assertEqual("pending", json.loads((backup / "manifest.json").read_text())["status"])
+            self.assertIsNone(manager._latest_valid_backup(root))
+
+    def test_old_versioned_manifest_without_owner_hash_is_readable(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            source.parent.mkdir(parents=True)
+            source.write_text("saved", encoding="utf-8")
+            backup = manager.create_backup(root, root / "backup", operation="update", domain="dns.example.com")
+            manifest_path = backup / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = 2
+            manifest.pop("status")
+            manifest["files"] = [item for item in manifest["files"]
+                                 if not item["path"].endswith(".conf.pre-webroot")
+                                 and item["path"] not in manager.FRONT_MANAGED_FILES]
+            for item in manifest["files"]:
+                if item["present"]:
+                    item["sha256"] = manager._path_digest(backup / item["backup"], include_owners=False)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertTrue(manager._validated_backup_manifest(backup))
+            source.write_text("current", encoding="utf-8")
+            manager.restore_backup_runtime(backup, root, "dns.example.com")
+            self.assertEqual("saved", source.read_text())
+
+    def test_version_three_snapshot_without_front_files_remains_readable(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            yaml.parent.mkdir(parents=True)
+            yaml.write_text("old", encoding="utf-8")
+            backup = manager.create_backup(root, root / "backup", operation="update", domain="dns.example.com")
+            manifest_path = backup / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = 3
+            manifest["files"] = [item for item in manifest["files"]
+                                 if item["path"] not in manager.FRONT_MANAGED_FILES]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertTrue(manager._validated_backup_manifest(backup))
+            yaml.write_text("new", encoding="utf-8")
+            manager.restore_backup_runtime(backup, root, "dns.example.com")
+            self.assertEqual("old", yaml.read_text(encoding="utf-8"))
+
+    def test_previous_v4_snapshot_without_overlay_files_remains_readable(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, root / "backup", operation="recovery", domain="dns.example.com")
+            manifest_path = backup / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files"] = [item for item in manifest["files"]
+                                 if item["path"] not in manager.FRONT_OVERLAY_FILES]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertTrue(manager._validated_backup_manifest(backup))
+
+    def test_backup_copy_preserves_owner_and_group_or_fails_closed(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.write_text("data", encoding="utf-8")
+            destination = Path(directory) / "destination"
+            original_lstat = Path.lstat
+
+            def different_destination(path):
+                info = original_lstat(path)
+                if path == destination:
+                    return SimpleNamespace(st_uid=info.st_uid, st_gid=info.st_gid + 1)
+                return info
+
+            with mock.patch.object(Path, "lstat", different_destination), \
+                 mock.patch.object(manager.os, "chown") as chown:
+                manager._copy_path(source, destination)
+            chown.assert_called_once_with(destination, source.stat().st_uid, source.stat().st_gid,
+                                          follow_symlinks=False)
+            destination.unlink()
+            with mock.patch.object(Path, "lstat", different_destination), \
+                 mock.patch.object(manager.os, "chown", side_effect=PermissionError("cannot preserve owner")):
+                with self.assertRaisesRegex(PermissionError, "cannot preserve owner"):
+                    manager._copy_path(source, destination)
+
+    def test_new_hash_includes_owner_but_version_two_hash_does_not(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source"
+            path.write_text("data", encoding="utf-8")
+            current = manager._path_digest(path)
+            old = manager._path_digest(path, include_owners=False)
+            original_lstat = Path.lstat
+
+            def changed_owner(item):
+                info = original_lstat(item)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1, st_gid=info.st_gid)
+
+            with mock.patch.object(Path, "lstat", changed_owner):
+                self.assertNotEqual(current, manager._path_digest(path))
+                self.assertEqual(old, manager._path_digest(path, include_owners=False))
+
+    def test_domain_pre_webroot_file_is_restored(self):
+        manager = load_manager()
+        for existed in (False, True):
+            with self.subTest(existed=existed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                renewal = root / "etc/letsencrypt/renewal/dns.example.com.conf.pre-webroot"
+                renewal.parent.mkdir(parents=True)
+                if existed:
+                    renewal.write_text("before", encoding="utf-8")
+                backup = manager.create_backup(root, root / "backup", operation="recovery", domain="dns.example.com")
+                renewal.write_text("after", encoding="utf-8")
+                manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True)
+                self.assertEqual(existed, renewal.exists())
+                if existed:
+                    self.assertEqual("before", renewal.read_text())
+
+    def test_restore_preserves_only_new_live_certbot_lineage(self):
+        manager = load_manager()
+        domain = "dns.example.com"
+        cases = (
+            (False, True, True, True, "new profile"),
+            (True, True, True, True, "old profile"),
+            (False, True, False, True, None),
+            (False, False, True, True, None),
+            (False, True, True, False, None),
+        )
+        for existed, fullchain, key, preserve, expected in cases:
+            with self.subTest(existed=existed, fullchain=fullchain, key=key, preserve=preserve), \
+                 tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                renewal = root / ("etc/letsencrypt/renewal/%s.conf" % domain)
+                renewal.parent.mkdir(parents=True)
+                if existed:
+                    renewal.write_text("old profile", encoding="utf-8")
+                nginx = root / "etc/nginx/nginx.conf"
+                nginx.parent.mkdir(parents=True)
+                nginx.write_text("old nginx", encoding="utf-8")
+                backup = manager.create_backup(root, operation="recovery", domain=domain)
+                renewal.write_text("new profile", encoding="utf-8")
+                nginx.write_text("new nginx", encoding="utf-8")
+                foreign = root / "var/www/adguardhome-doh/unrelated.txt"
+                foreign.parent.mkdir(parents=True)
+                foreign.write_text("keep", encoding="utf-8")
+                live = root / ("etc/letsencrypt/live/%s" % domain)
+                live.mkdir(parents=True)
+                if fullchain:
+                    (live / "fullchain.pem").write_text("cert", encoding="utf-8")
+                if key:
+                    (live / "privkey.pem").write_text("key", encoding="utf-8")
+                args = ["--restore-update-backup", str(backup), "--root", str(root),
+                        "--domain", domain, "--files-only"]
+                if preserve:
+                    args.append("--preserve-new-certbot-lineage")
+                self.assertEqual(0, manager.main(args))
+                if expected is None:
+                    self.assertFalse(renewal.exists())
+                else:
+                    self.assertEqual(expected, renewal.read_text(encoding="utf-8"))
+                self.assertEqual("old nginx", nginx.read_text(encoding="utf-8"))
+                self.assertEqual("keep", foreign.read_text(encoding="utf-8"))
+
+    def test_certbot_preservation_refuses_wrong_domain_before_restore(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            target = root / "etc/nginx/nginx.conf"
+            target.parent.mkdir(parents=True)
+            target.write_text("current", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "cannot establish the Certbot lineage domain"):
+                manager.restore_backup_runtime(backup, root, "other.example.com", files_only=True,
+                                               preserve_new_certbot_lineage=True)
+            self.assertEqual("current", target.read_text(encoding="utf-8"))
+
+    def test_checksum_corruption_is_rejected_before_replacement(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text("old", encoding="utf-8")
+            backup = manager.create_backup(root, root / "backup", operation="update")
+            manifest = json.loads((backup / "manifest.json").read_text())
+            entry = next(item for item in manifest["files"] if item["path"].endswith("AdGuardHome.yaml"))
+            (backup / entry["backup"]).write_text("corrupt", encoding="utf-8")
+            target.write_text("current", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                manager.restore_backup_runtime(backup, root, "")
+            self.assertEqual("current", target.read_text(encoding="utf-8"))
+
+    def test_staged_validation_failure_does_not_replace_current_yaml(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text("old", encoding="utf-8")
+            backup = manager.create_backup(root, root / "backup", operation="update")
+            target.write_text("current", encoding="utf-8")
+            with mock.patch.object(manager, "_validate_staged_adguard", side_effect=RuntimeError("invalid YAML")):
+                with self.assertRaisesRegex(RuntimeError, "invalid YAML"):
+                    manager.restore_backup_runtime(backup, root, "")
+            self.assertEqual("current", target.read_text(encoding="utf-8"))
+
+    def test_live_staged_validation_uses_snapshot_binary_and_yaml_paths(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            yaml = Path(directory) / "AdGuardHome.yaml"
+            yaml.write_text("dns: {}\n", encoding="utf-8")
+            binary = Path(directory) / "AdGuardHome"
+            runner = mock.Mock()
+            manager._validate_staged_adguard(Path("/"), yaml, binary, runner)
+            self.assertEqual([str(binary), "--check-config", "-c", str(yaml),
+                              "-w", "/var/lib/AdGuardHome"], runner.call_args.args[0])
+
+    def test_keyboard_interrupt_restores_transaction_and_marks_it_restored(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "first", root / "second"
+            stage_a, stage_b = root / "stage-a", root / "stage-b"
+            for path, value in ((first, "old A"), (second, "old B"),
+                                (stage_a, "new A"), (stage_b, "new B")):
+                path.write_text(value, encoding="utf-8")
+            atomic_copy = manager._atomic_copy
+            calls = []
+
+            def interrupt(source, target):
+                calls.append(target)
+                if len(calls) == 2:
+                    raise KeyboardInterrupt()
+                atomic_copy(source, target)
+
+            backup = root / "backup"
+            with mock.patch.object(manager, "_atomic_copy", side_effect=interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    manager.activate_transaction({first: stage_a, second: stage_b}, backup)
+            self.assertEqual("old A", first.read_text())
+            self.assertEqual("old B", second.read_text())
+            self.assertEqual("restored", json.loads((backup / "transaction.json").read_text())["state"])
+
+    def test_failed_restore_reverts_to_state_before_attempt(self):
+        manager = load_manager()
+        for failure in (RuntimeError("restore failed"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "opt/AdGuardHome/AdGuardHome.yaml"
+                target.parent.mkdir(parents=True)
+                target.write_text("old", encoding="utf-8")
+                backup = manager.create_backup(root, root / "backup", operation="update")
+                target.write_text("current", encoding="utf-8")
+
+                def fail_restore(*_args):
+                    target.write_text("partially replaced", encoding="utf-8")
+                    raise failure
+
+                with mock.patch.object(manager, "_restore_backup", side_effect=fail_restore):
+                    with self.assertRaises(type(failure)):
+                        manager.restore_backup_runtime(backup, root, "")
+                self.assertEqual("current", target.read_text(encoding="utf-8"))
+
+    def test_failed_reversal_reports_failure_and_blocks_later_operations(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, root / "backup", operation="update")
+            with mock.patch.object(manager, "_restore_backup", side_effect=RuntimeError("restore error")), \
+                 mock.patch.object(manager, "_restore_transaction_entries", side_effect=RuntimeError("disk error")):
+                with self.assertRaisesRegex(RuntimeError, "returning to previous state also failed: disk error"):
+                    manager.restore_backup_runtime(backup, root, "")
+            with self.assertRaisesRegex(RuntimeError, "unfinished transaction"):
+                manager.rollback_last(root)
+
+    def test_new_snapshot_preserves_unrelated_files_in_managed_directories(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = root / "etc/adguardhome-doh/catalog"
+            catalog.mkdir(parents=True)
+            (catalog / "services.csv").write_text("old", encoding="utf-8")
+            backup = manager.create_backup(root, root / "backup", operation="update", domain="dns.example.com")
+            (catalog / "services.csv").write_text("new", encoding="utf-8")
+            unrelated = catalog / "unrelated.txt"
+            unrelated.write_text("keep", encoding="utf-8")
+            manager.restore_backup_runtime(backup, root, "dns.example.com")
+            self.assertEqual("old", (catalog / "services.csv").read_text())
+            self.assertEqual("keep", unrelated.read_text())
+
+    def test_restore_never_deletes_directory_at_file_target(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, root / "backup", operation="update")
+            target = root / "etc/nginx/nginx.conf"
+            target.mkdir(parents=True)
+            (target / "unrelated").write_text("keep")
+            with self.assertRaisesRegex(RuntimeError, "refusing to replace a directory"):
+                manager.restore_backup_runtime(backup, root, "")
+            self.assertEqual("keep", (target / "unrelated").read_text())
+
+    def test_installer_cli_snapshot_and_files_only_restore(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "opt/AdGuardHome/AdGuardHome"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("old", encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                result = manager.main(["--create-update-backup", "--root", str(root),
+                                       "--domain", "dns.example.com", "--target-version", "2.0.0"])
+            self.assertEqual(0, result)
+            backup = Path(output.getvalue().strip())
+            manifest = json.loads((backup / "manifest.json").read_text())
+            self.assertEqual("update", manifest["operation"])
+            self.assertEqual("2.0.0", manifest["version_after"])
+            binary.write_text("new", encoding="utf-8")
+            self.assertEqual(0, manager.main(["--restore-update-backup", str(backup),
+                                              "--root", str(root), "--domain", "dns.example.com",
+                                              "--files-only"]))
+            self.assertEqual("old", binary.read_text())
+
+
 class ServiceChangeSeedingTests(unittest.TestCase):
     """Changing services must not drop a working service for a probe cycle."""
 
@@ -759,6 +1286,14 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         )
         return root
 
+    def test_service_change_keeps_adguard_config_private(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            adguard = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            self.assertEqual(0, adguard.stat().st_mode & 0o007)
+
     def test_render_command_passes_healthy_services_as_a_complete_pair(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:
@@ -786,6 +1321,482 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         self.assertEqual("203.0.113.10", command[command.index("--public-ip") + 1])
         self.assertEqual("chatgpt", command[command.index("--healthy-services") + 1])
         self.assertEqual("chatgpt,claude", command[command.index("--services") + 1])
+        self.assertIn("--existing-config", command)
+        self.assertIn("--existing-public-ip", command)
+        self.assertIn("--doh-token-file", command)
+        self.assertNotIn("--doh-token", command)
+        self.assertNotIn("--password-hash", command)
+        self.assertNotIn("--front", command)
+
+    def test_service_change_waits_for_health_lock_before_reading_health(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            catalog = Catalog.load(root / "etc/adguardhome-doh/catalog")
+            renderer_started = threading.Event()
+            worker_started = threading.Event()
+            commands = []
+            errors = []
+
+            def render(command, **_kwargs):
+                commands.append(command)
+                renderer_started.set()
+                stage = Path(command[command.index("--output") + 1])
+                (stage / "AdGuardHome.yaml").write_text("dns: {}\n", encoding="utf-8")
+                (stage / "nginx-stream.conf").write_text("stream", encoding="utf-8")
+                (stage / "health-policy.json").write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0)
+
+            def worker():
+                worker_started.set()
+                try:
+                    manager.apply_service_change(["chatgpt", "claude"], root=root,
+                                                 catalog=catalog, validator=lambda: None)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(manager.subprocess, "run", side_effect=render):
+                with manager.health_lock(root):
+                    thread = threading.Thread(target=worker)
+                    thread.start()
+                    self.assertTrue(worker_started.wait(1))
+                    self.assertFalse(renderer_started.wait(0.1))
+                    (root / "var/lib/adguardhome-doh/health-state.json").write_text(
+                        '{"chatgpt":{"healthy":true},"claude":{"healthy":true}}',
+                        encoding="utf-8",
+                    )
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], errors)
+            command = commands[0]
+            self.assertEqual("chatgpt,claude", command[command.index("--healthy-services") + 1])
+            self.assertNotIn("a" * 48, command)
+
+    def test_operation_lock_blocks_service_change_without_holding_health_lock(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            renderer_started = threading.Event()
+            worker_started = threading.Event()
+            errors = []
+
+            def renderer(stage, _selected):
+                renderer_started.set()
+                (stage / "AdGuardHome.yaml").write_text("dns: {}\n")
+                (stage / "nginx-stream.conf").write_text("stream")
+                (stage / "health-policy.json").write_text("{}")
+
+            def worker():
+                worker_started.set()
+                try:
+                    manager.apply_service_change(["chatgpt"], root=root, renderer=renderer,
+                                                 validator=lambda: None)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with manager.operation_lock(root):
+                thread = threading.Thread(target=worker)
+                thread.start()
+                self.assertTrue(worker_started.wait(1))
+                self.assertFalse(renderer_started.wait(0.1))
+                health = manager.under_root(root, manager.HEALTH_LOCK)
+                with health.open("a+") as stream:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertTrue(renderer_started.is_set())
+
+    def test_operation_lock_blocks_rollback_until_installer_finishes(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            before = yaml.read_text(encoding="utf-8")
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            yaml.write_text("current", encoding="utf-8")
+            started, finished = threading.Event(), threading.Event()
+            errors = []
+
+            def worker():
+                started.set()
+                try:
+                    manager.rollback_last(root)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            with manager.operation_lock(root):
+                thread = threading.Thread(target=worker)
+                thread.start()
+                self.assertTrue(started.wait(1))
+                self.assertFalse(finished.wait(0.1))
+                health = manager.under_root(root, manager.HEALTH_LOCK)
+                with health.open("a+") as stream:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                self.assertEqual("current", yaml.read_text(encoding="utf-8"))
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertEqual(before, yaml.read_text(encoding="utf-8"))
+
+    def test_stop_command_runs_only_for_live_root(self):
+        manager = load_manager()
+        runner = mock.Mock()
+        manager._stop_adguard(Path("/"), runner=runner)
+        manager._stop_adguard(Path("/tmp/isolated"), runner=runner)
+        runner.assert_called_once_with(["systemctl", "stop", "adguardhome-doh"], check=True)
+
+    def test_live_service_change_stops_before_yaml_read_snapshot_and_activation(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            catalog = Catalog.load(root / "etc/adguardhome-doh/catalog")
+            events = []
+            under_root, copy_path, atomic_copy = manager.under_root, manager._copy_path, manager._atomic_copy
+
+            def map_root(_root, path):
+                return under_root(root, path)
+
+            def renderer(stage, _selected):
+                events.append("read")
+                self.assertIn("password", yaml.read_text(encoding="utf-8"))
+                (stage / "AdGuardHome.yaml").write_text("dns: {}\n")
+                (stage / "nginx-stream.conf").write_text("stream")
+                (stage / "health-policy.json").write_text("{}")
+
+            def copy(source, destination):
+                if Path(source) == yaml:
+                    events.append("snapshot")
+                return copy_path(source, destination)
+
+            def activate(source, target):
+                if Path(target) == yaml:
+                    events.append("activate")
+                return atomic_copy(source, target)
+
+            with mock.patch.object(manager, "under_root", side_effect=map_root), \
+                 mock.patch.object(manager, "_stop_adguard", side_effect=lambda *_a, **_k: events.append("stop")), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services", side_effect=lambda *_a, **_k: events.append("start")), \
+                 mock.patch.object(manager, "_copy_path", side_effect=copy), \
+                 mock.patch.object(manager, "_atomic_copy", side_effect=activate):
+                manager.apply_service_change(["chatgpt"], root=Path("/"), catalog=catalog,
+                                             renderer=renderer, validator=lambda: None)
+            self.assertEqual(["stop", "read", "snapshot", "snapshot", "activate", "start"], events)
+
+    def test_live_rollback_stops_before_saving_current_yaml_and_restoring(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            before = yaml.read_text(encoding="utf-8")
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            yaml.write_text("current", encoding="utf-8")
+            events = []
+            under_root, copy_path, restore_backup = manager.under_root, manager._copy_path, manager._restore_backup
+
+            def copy(source, destination):
+                if Path(source) == yaml:
+                    events.append("snapshot")
+                return copy_path(source, destination)
+
+            def restore(*args, **kwargs):
+                events.append("restore")
+                return restore_backup(*args, **kwargs)
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_stop_adguard", side_effect=lambda *_a, **_k: events.append("stop")), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "_reload_restored_runtime", side_effect=lambda *_a, **_k: events.append("start")), \
+                 mock.patch.object(manager, "_copy_path", side_effect=copy), \
+                 mock.patch.object(manager, "_restore_backup", side_effect=restore):
+                self.assertTrue(manager.rollback_last(Path("/"), selected=backup, runner=mock.Mock()))
+            self.assertEqual(["stop", "snapshot", "restore", "start"], events)
+            self.assertEqual(before, yaml.read_text(encoding="utf-8"))
+
+    def test_live_failure_or_interrupt_recovers_runtime_and_reports_recovery_failure(self):
+        manager = load_manager()
+        for original in (RuntimeError("failed"), KeyboardInterrupt()):
+            with self.subTest(original=type(original).__name__), \
+                 mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
+                 mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
+                 mock.patch.object(manager, "_check_incomplete_transactions"), \
+                 mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+                 mock.patch.object(manager, "_stop_adguard") as stop, \
+                 mock.patch.object(manager, "_apply_service_change_locked", side_effect=original), \
+                 mock.patch.object(manager, "reload_runtime_services") as reload:
+                with self.assertRaises(type(original)):
+                    manager.apply_service_change(["chatgpt"], root=Path("/"))
+                stop.assert_called_once()
+                reload.assert_called_once()
+        with mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(manager, "_check_incomplete_transactions"), \
+             mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+             mock.patch.object(manager, "_stop_adguard"), \
+             mock.patch.object(manager, "_apply_service_change_locked", side_effect=RuntimeError("activation")), \
+             mock.patch.object(manager, "reload_runtime_services", side_effect=RuntimeError("restart")):
+            with self.assertRaisesRegex(RuntimeError, "restoring previous runtime also failed: restart"):
+                manager.apply_service_change(["chatgpt"], root=Path("/"))
+
+    def test_live_activation_failure_restores_yaml_before_restart(self):
+        manager = load_manager()
+        for original in (RuntimeError("invalid"), KeyboardInterrupt()):
+            with self.subTest(original=type(original).__name__), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+                before = yaml.read_text(encoding="utf-8")
+                events = []
+                under_root = manager.under_root
+
+                def renderer(stage, _selected):
+                    (stage / "AdGuardHome.yaml").write_text("new yaml", encoding="utf-8")
+                    (stage / "nginx-stream.conf").write_text("stream", encoding="utf-8")
+                    (stage / "health-policy.json").write_text("{}", encoding="utf-8")
+
+                def validate():
+                    self.assertEqual("new yaml", yaml.read_text(encoding="utf-8"))
+                    raise original
+
+                def reload(*_args, **_kwargs):
+                    events.append(("restart", yaml.read_text(encoding="utf-8")))
+
+                with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                     mock.patch.object(manager, "_stop_adguard", side_effect=lambda *_a, **_k: events.append(("stop", None))), \
+                     mock.patch.object(manager, "_validate_staged_adguard"), \
+                     mock.patch.object(manager, "reload_runtime_services", side_effect=reload):
+                    with self.assertRaises(type(original)):
+                        manager.apply_service_change(["chatgpt"], root=Path("/"), renderer=renderer,
+                                                     validator=validate)
+                self.assertEqual([("stop", None), ("stop", None), ("restart", before)], events)
+                self.assertEqual(before, yaml.read_text(encoding="utf-8"))
+
+    def test_activation_smoke_failure_stops_new_process_before_file_recovery(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            previous = yaml.read_text(encoding="utf-8")
+            events = []
+            under_root, restore_entries = manager.under_root, manager._restore_transaction_entries
+
+            def renderer(stage, _selected):
+                (stage / "AdGuardHome.yaml").write_text("new yaml")
+                (stage / "nginx-stream.conf").write_text("stream")
+                (stage / "health-policy.json").write_text("{}")
+
+            def reload(*_args, **_kwargs):
+                if not any(event == "start new" for event in events):
+                    self.assertEqual("new yaml", yaml.read_text())
+                    events.extend(("start new", "smoke failure"))
+                    raise RuntimeError("smoke failure")
+                self.assertEqual(previous, yaml.read_text())
+                events.append("start previous")
+
+            def restore(saved):
+                self.assertEqual("new yaml", yaml.read_text())
+                events.append("restore files")
+                return restore_entries(saved)
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_stop_adguard", side_effect=lambda *_a, **_k: events.append("stop")), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services", side_effect=reload), \
+                 mock.patch.object(manager, "_restore_transaction_entries", side_effect=restore):
+                with self.assertRaisesRegex(RuntimeError, "smoke failure"):
+                    manager.apply_service_change(["chatgpt"], root=Path("/"), renderer=renderer,
+                                                 validator=lambda: None)
+            self.assertEqual(["stop", "start new", "smoke failure", "stop",
+                              "restore files", "start previous"], events)
+            self.assertEqual(previous, yaml.read_text())
+
+    def test_activation_failed_stop_keeps_new_yaml_and_pending_transaction(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            under_root = manager.under_root
+            stops = []
+
+            def renderer(stage, _selected):
+                (stage / "AdGuardHome.yaml").write_text("new yaml")
+                (stage / "nginx-stream.conf").write_text("stream")
+                (stage / "health-policy.json").write_text("{}")
+
+            def stop(*_args, **_kwargs):
+                stops.append("stop")
+                if len(stops) == 2:
+                    raise RuntimeError("cannot stop")
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_stop_adguard", side_effect=stop), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services", side_effect=RuntimeError("smoke")) as reload, \
+                 mock.patch.object(manager, "_restore_transaction_entries") as restore:
+                with self.assertRaisesRegex(RuntimeError, "AdGuard may still be running"):
+                    manager.apply_service_change(["chatgpt"], root=Path("/"), renderer=renderer,
+                                                 validator=lambda: None)
+            self.assertEqual(2, len(stops))
+            reload.assert_called_once()
+            restore.assert_not_called()
+            self.assertEqual("new yaml", yaml.read_text())
+            markers = list((root / "var/backups/adguardhome-doh").glob("*/transaction.json"))
+            self.assertEqual(1, len(markers))
+            self.assertEqual("prepared", json.loads(markers[0].read_text())["state"])
+            with self.assertRaisesRegex(RuntimeError, "unfinished transaction"):
+                manager._check_incomplete_transactions(root)
+
+    def test_rollback_smoke_failure_stops_restored_process_before_file_recovery(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            backup_yaml = yaml.read_text(encoding="utf-8")
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            yaml.write_text("current yaml")
+            events = []
+            under_root, restore_entries = manager.under_root, manager._restore_transaction_entries
+
+            def reload_rollback(*_args, **_kwargs):
+                self.assertEqual(backup_yaml, yaml.read_text())
+                events.extend(("start rollback", "smoke failure"))
+                raise RuntimeError("smoke failure")
+
+            def restore(saved):
+                self.assertEqual(backup_yaml, yaml.read_text())
+                events.append("restore files")
+                return restore_entries(saved)
+
+            def reload_previous(*_args, **_kwargs):
+                self.assertEqual("current yaml", yaml.read_text())
+                events.append("start previous")
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_stop_adguard", side_effect=lambda *_a, **_k: events.append("stop")), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "_reload_restored_runtime", side_effect=reload_rollback), \
+                 mock.patch.object(manager, "reload_runtime_services", side_effect=reload_previous), \
+                 mock.patch.object(manager, "_restore_transaction_entries", side_effect=restore):
+                with self.assertRaisesRegex(RuntimeError, "smoke failure"):
+                    manager.rollback_last(Path("/"), selected=backup, runner=mock.Mock())
+            self.assertEqual(["stop", "start rollback", "smoke failure", "stop",
+                              "restore files", "start previous"], events)
+            self.assertEqual("current yaml", yaml.read_text())
+
+    def test_rollback_failed_stop_keeps_files_and_pending_transaction(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            yaml = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            backup_yaml = yaml.read_text(encoding="utf-8")
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            yaml.write_text("current yaml")
+            stops = []
+            under_root = manager.under_root
+
+            def stop(*_args, **_kwargs):
+                stops.append("stop")
+                if len(stops) == 2:
+                    raise RuntimeError("cannot stop")
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_stop_adguard", side_effect=stop), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "_reload_restored_runtime", side_effect=RuntimeError("smoke")), \
+                 mock.patch.object(manager, "reload_runtime_services") as reload, \
+                 mock.patch.object(manager, "_restore_transaction_entries") as restore:
+                with self.assertRaisesRegex(RuntimeError, "AdGuard may still be running"):
+                    manager.rollback_last(Path("/"), selected=backup, runner=mock.Mock())
+            self.assertEqual(2, len(stops))
+            reload.assert_not_called()
+            restore.assert_not_called()
+            self.assertEqual(backup_yaml, yaml.read_text())
+            markers = list((root / "var/backups/adguardhome-doh").glob(".restore-*/transaction.json"))
+            self.assertEqual(1, len(markers))
+            self.assertEqual("prepared", json.loads(markers[0].read_text())["state"])
+            with self.assertRaisesRegex(RuntimeError, "unfinished transaction"):
+                manager._check_incomplete_transactions(root)
+
+    def test_live_file_recovery_failure_leaves_adguard_stopped(self):
+        manager = load_manager()
+        with mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(manager, "_check_incomplete_transactions"), \
+             mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+             mock.patch.object(manager, "_stop_adguard") as stop, \
+             mock.patch.object(manager, "_apply_service_change_locked",
+                               side_effect=manager._FileRecoveryError("disk error")), \
+             mock.patch.object(manager, "reload_runtime_services") as reload:
+            with self.assertRaisesRegex(RuntimeError, "AdGuard left stopped"):
+                manager.apply_service_change(["chatgpt"], root=Path("/"))
+            stop.assert_called_once()
+            reload.assert_not_called()
+
+    def test_live_rollback_error_or_failed_stop_restarts_previous_runtime(self):
+        manager = load_manager()
+        for failed_stop in (False, True):
+            with self.subTest(failed_stop=failed_stop):
+                events = []
+
+                def stop(*_args, **_kwargs):
+                    events.append("stop")
+                    if failed_stop:
+                        raise RuntimeError("stop failed")
+
+                def restore(*_args, **_kwargs):
+                    events.append("restore")
+                    raise RuntimeError("restore failed")
+
+                with mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
+                     mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
+                     mock.patch.object(manager, "_check_incomplete_transactions"), \
+                     mock.patch.object(manager, "_validated_backup_manifest"), \
+                     mock.patch.object(manager, "_backup_operation", return_value="update"), \
+                     mock.patch.object(manager, "_current_install_state", return_value={"domain": "dns.example.com"}), \
+                     mock.patch.object(manager, "_stop_adguard", side_effect=stop), \
+                     mock.patch.object(manager, "restore_backup_runtime", side_effect=restore), \
+                     mock.patch.object(manager, "reload_runtime_services", side_effect=lambda *_a, **_k: events.append("restart")):
+                    with self.assertRaises(RuntimeError):
+                        manager.rollback_last(Path("/"), selected=Path("/backup"), runner=mock.Mock())
+                self.assertEqual(["stop", "restart"] if failed_stop else ["stop", "restore", "restart"], events)
+
+    def test_service_change_removes_compat_policy_only_after_success(self):
+        manager = load_manager()
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                install = root / "var/lib/adguardhome-doh/install.json"
+                state = json.loads(install.read_text())
+                state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
+                install.write_text(json.dumps(state), encoding="utf-8")
+
+                def renderer(stage, _selected):
+                    (stage / "AdGuardHome.yaml").write_text("dns: {}\n")
+                    (stage / "nginx-stream.conf").write_text("stream")
+                    (stage / "health-policy.json").write_text("{}")
+
+                def validator():
+                    if fail:
+                        raise RuntimeError("invalid")
+
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "invalid"):
+                        manager.apply_service_change(["chatgpt"], root=root, renderer=renderer,
+                                                     validator=validator)
+                else:
+                    manager.apply_service_change(["chatgpt"], root=root, renderer=renderer,
+                                                 validator=validator)
+                current = json.loads(install.read_text())
+                self.assertEqual(fail, "policy" in current)
 
     def test_service_change_keeps_the_relay_exit_host(self):
         manager = load_manager()
@@ -824,7 +1835,7 @@ class ServiceChangeSeedingTests(unittest.TestCase):
             (root / "var/lib/adguardhome-doh/install.json").write_text(
                 json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10",
                             "email": "admin@example.com", "version": "1.0.0",
-                            "repository": "evgenykhripach/AdguardHomeDoH",
+                            "repository": "custom-owner/private-doh",
                             "relay": "203.0.113.99",
                             "local_sites": ["app.example.org=127.0.0.1:9443", "*=127.0.0.1:9443"]}),
                 encoding="utf-8",
@@ -858,17 +1869,57 @@ class ServiceChangeSeedingTests(unittest.TestCase):
                 ],
             })
             commands = []
+            environments = []
 
             def downloader(url, path):
                 shutil.copy2(archive if url.endswith("archive") else checksum, path)
 
             def runner(command, **kwargs):
                 commands.append([str(part) for part in command])
+                environments.append(kwargs["env"])
+                for lock_path in (manager.HEALTH_LOCK, manager.OPERATION_LOCK):
+                    lock = manager.under_root(root, lock_path)
+                    with lock.open("a+") as stream:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
                 return subprocess.CompletedProcess(command, 0)
 
-            self.assertTrue(manager.install_update(
-                root=root, release=release, downloader=downloader, runner=runner
-            ))
+            old_catalog = Catalog.load(root / "etc/adguardhome-doh/catalog")
+            new_catalog = SimpleNamespace(
+                services=old_catalog.services,
+                default_service_ids=old_catalog.default_service_ids,
+                full_policy=lambda: list(old_catalog.full_policy()) + [SimpleNamespace(domain="new.example")],
+            )
+            warning = io.StringIO()
+            with mock.patch.object(manager, "_load_catalog", side_effect=lambda path: (
+                old_catalog if Path(path) == root / "etc/adguardhome-doh/catalog" else new_catalog
+            )):
+                self.assertTrue(manager.install_update(
+                    root=root, release=release, downloader=downloader, runner=runner, output=warning
+                ))
+                state_file = root / "var/lib/adguardhome-doh/install.json"
+                state = json.loads(state_file.read_text())
+                state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
+                state_file.write_text(json.dumps(state), encoding="utf-8")
+                policy = root / "etc/adguardhome-doh/compat-policy.csv"
+                policy.write_text("domain,kind,probe\n", encoding="utf-8")
+                self.assertTrue(manager.install_update(
+                    root=root, release=release, downloader=downloader, runner=runner, output=warning
+                ))
+                state["front"] = "mtproxyl"
+                state_file.write_text(json.dumps(state), encoding="utf-8")
+                self.assertTrue(manager.install_update(
+                    root=root, release=release, downloader=downloader, runner=runner, output=warning
+                ))
+            policy_command = commands[-1]
+            self.assertEqual(str(policy), policy_command[policy_command.index("--policy") + 1])
+            self.assertNotIn("--services", policy_command)
+            self.assertEqual("mtproxyl", policy_command[policy_command.index("--front") + 1])
+            self.assertNotIn("--front", commands[0])
+            self.assertEqual("mtproxyl", json.loads(state_file.read_text())["front"])
+            self.assertIn("заново установите Apple-профиль", warning.getvalue())
+            self.assertEqual("custom-owner/private-doh", environments[0]["ADGUARDHOME_DOH_REPOSITORY"])
+            self.assertEqual("1", environments[0]["ADGUARDHOME_DOH_MANAGER_UPDATE"])
 
         install = next(c for c in commands if any(part.endswith("deploy/install.sh") for part in c))
         # The relay must survive an update, or the exit host silently becomes
@@ -894,6 +1945,442 @@ class ServiceChangeSeedingTests(unittest.TestCase):
                 "not json", encoding="utf-8"
             )
             self.assertEqual([], manager.healthy_services(paths, ["chatgpt"]))
+
+class MTProxyFrontTests(unittest.TestCase):
+    def build_root(self, directory):
+        root = ServiceChangeSeedingTests.build_root(self, directory)
+        state_file = root / "var/lib/adguardhome-doh/install.json"
+        state = json.loads(state_file.read_text())
+        state["front"] = "mtproxyl"
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        for relative, content in (
+            ("etc/adguardhome-doh/mtproxyl-sni.map", "old map"),
+            ("etc/adguardhome-doh/mtproxyl-nginx.conf", "old dedicated config"),
+            ("etc/systemd/system/adguardhome-doh-nginx.service", "old dedicated unit"),
+            ("opt/AdGuardHome/AdGuardHome", "binary"),
+            ("usr/local/libexec/adguardhome-doh/healthcheck.py", "helper"),
+            ("usr/local/libexec/adguardhome-doh/mtproxyl_front.py", "front helper"),
+            ("etc/adguardhome-doh/mtproxyl-http.conf", "front http"),
+            ("etc/systemd/system/mtproxyl-pq-nginx.service.d/adguardhome-doh.conf", "front dropin"),
+            ("opt/mtproxyl/nginx-custom.conf", "user config"),
+            ("opt/mtproxyl-nginx/sbin/nginx", "test binary"),
+            ("opt/mtproxyl-nginx/conf/nginx.conf", "generated config"),
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        (root / "opt/mtproxyl-nginx/sbin/nginx").chmod(0o755)
+        proc = root / "proc/123/cmdline"
+        proc.parent.mkdir(parents=True, exist_ok=True)
+        proc.write_bytes(b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0/opt/mtproxyl-nginx/conf/nginx.conf\0-g\0daemon off;\0")
+        (proc.parent / "exe").symlink_to("/opt/mtproxyl-nginx/sbin/nginx")
+        return root
+
+    def test_service_change_passes_front_preserves_map_and_front_state(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_file.read_text())
+            state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            calls = []
+
+            def render(command, **_kwargs):
+                calls.append(command)
+                stage = Path(command[command.index("--output") + 1])
+                (stage / "AdGuardHome.yaml").write_text("dns: {}\n")
+                (stage / "nginx-stream.conf").write_text("loopback")
+                (stage / "health-policy.json").write_text("{}")
+                (stage / "mtproxyl-sni.map").write_text("different staged map")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(manager.subprocess, "run", side_effect=render):
+                manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            command = calls[0]
+            self.assertEqual("mtproxyl", command[command.index("--front") + 1])
+            self.assertNotIn("a" * 48, command)
+            self.assertEqual("old map", map_path.read_text())
+            state = json.loads(state_file.read_text())
+            self.assertEqual("mtproxyl", state["front"])
+            self.assertNotIn("policy", state)
+            self.assertFalse(any("mtproxyl-pq-nginx" in part for call in calls for part in call))
+
+    def test_real_renderer_service_change_uses_loopback_without_replacing_front_map(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            stream = (root / "etc/nginx/stream.d/adguardhome-doh.conf").read_text()
+            self.assertIn("listen 127.0.0.1:24443 proxy_protocol", stream)
+            self.assertNotIn("listen 443", stream)
+            self.assertEqual("old map", map_path.read_text())
+
+    def test_front_runtime_reloads_only_private_nginx_and_probes_doh(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            under_root = manager.under_root
+            runner = mock.Mock()
+            probe = mock.Mock(return_value=True)
+            output = io.StringIO()
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck", return_value=SimpleNamespace(probe_doh=probe)), \
+                 mock.patch("sys.stdout", output):
+                manager.reload_runtime_services(Path("/"), "dns.example.com", runner=runner,
+                                                smoke_attempts=1, smoke_delay=0)
+            self.assertEqual([
+                mock.call(["systemctl", "restart", "adguardhome-doh"], check=True),
+                mock.call(["systemctl", "reload", "adguardhome-doh-nginx"], check=True),
+            ], runner.call_args_list)
+            self.assertEqual("dns.example.com", probe.call_args.args[0])
+            self.assertEqual("a" * 48, probe.call_args.args[1])
+            self.assertNotIn("a" * 48, str(runner.call_args_list))
+            self.assertNotIn("a" * 48, output.getvalue())
+
+    def test_front_status_uses_private_nginx_and_mtproxy(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            calls = []
+
+            def runner(command, **_kwargs):
+                calls.append(command)
+                return subprocess.CompletedProcess(command, 0, b"Result=success\nExecMainStatus=0\n", b"")
+
+            status = manager.collect_menu_status(root, runner=runner)
+            report = manager.collect_system_check(root, runner=runner)
+            menu, diagnostic = io.StringIO(), io.StringIO()
+            manager.render_main_screen(status, menu, width=80)
+            manager._render_system_check(report, diagnostic)
+            self.assertEqual("running", status["overall"])
+            self.assertIn("nginx DoH", menu.getvalue())
+            self.assertIn("MTProxy front", menu.getvalue())
+            self.assertIn("MTProxy front", diagnostic.getvalue())
+            self.assertIn(["/usr/sbin/nginx", "-t", "-c", manager.PRIVATE_NGINX_CONFIG], calls)
+            self.assertIn(["/opt/mtproxyl-nginx/sbin/nginx", "-t", "-c", "/opt/mtproxyl-nginx/conf/nginx.conf"], calls)
+            self.assertNotIn(["systemctl", "is-active", "--quiet", "nginx.service"], calls)
+            def front_down(command, **_kwargs):
+                return subprocess.CompletedProcess(command, 3 if command[-1] == "mtproxyl-pq-nginx.service" else 0)
+            down = manager.collect_menu_status(root, runner=front_down)
+            self.assertEqual("attention", down["overall"])
+            self.assertFalse(down["units"]["mtproxyl-pq-nginx.service"])
+
+    def test_active_mtproxy_config_requires_stable_pid_and_exact_argv(self):
+        manager = load_manager()
+        valid = b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0/opt/mtproxyl-nginx/conf/nginx.conf\0-g\0daemon off;\0"
+        title = b"nginx: master process /opt/mtproxyl-nginx/sbin/nginx -c /opt/mtproxyl-nginx/conf/nginx.conf -g daemon off;\0"
+        expected_exe = "/opt/mtproxyl-nginx/sbin/nginx"
+        cases = (
+            (valid, expected_exe, (b"123\n", b"123\n"), True),
+            (title, expected_exe, (b"123\n", b"123\n"), True),
+            (valid.replace(b"/opt/mtproxyl-nginx/conf/nginx.conf", b"/opt/mtproxyl/nginx-custom.conf"),
+             expected_exe, (b"123\n", b"123\n"), False),
+            (title.replace(b"/opt/mtproxyl-nginx/conf/nginx.conf", b"/opt/mtproxyl/nginx-custom.conf"),
+             expected_exe, (b"123\n", b"123\n"), False),
+            (valid.replace(b"/opt/mtproxyl-nginx/sbin/nginx", b"/usr/sbin/nginx"),
+             expected_exe, (b"123\n", b"123\n"), False),
+            (title, "/usr/sbin/nginx", (b"123\n", b"123\n"), False),
+            (title, expected_exe + " (deleted)", (b"123\n", b"123\n"), False),
+            (valid + b"-c\0/other.conf\0", expected_exe, (b"123\n", b"123\n"), False),
+            (b"nginx: master process nginx\0", expected_exe, (b"123\n", b"123\n"), False),
+            (b"nginx: master process /opt/mtproxyl-nginx/sbin/nginx -c 'unterminated\0",
+             expected_exe, (b"123\n", b"123\n"), False),
+            (title[:-1], expected_exe, (b"123\n", b"123\n"), False),
+            (title, expected_exe, (b"123\n", b"456\n"), False),
+            (valid, expected_exe, (b"0\n", b"0\n"), False),
+            (valid, None, (b"123\n", b"123\n"), False),
+        )
+        for argv, executable, pids, expected in cases:
+            with self.subTest(argv=argv, executable=executable, pids=pids), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                (root / "proc/123/cmdline").write_bytes(argv)
+                exe_link = root / "proc/123/exe"
+                exe_link.unlink()
+                if executable is not None:
+                    exe_link.symlink_to(executable)
+                under_root = manager.under_root
+                outputs = iter(pids)
+
+                def runner(command, **_kwargs):
+                    return subprocess.CompletedProcess(command, 0, next(outputs), b"")
+
+                with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)):
+                    if expected:
+                        self.assertEqual(123, manager._verify_mtproxyl_active_config(Path("/"), runner))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                            manager._verify_mtproxyl_active_config(Path("/"), runner)
+
+    def test_custom_mode_blocks_live_service_change_before_stop(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            (root / "proc/123/cmdline").write_bytes(
+                b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0/opt/mtproxyl/nginx-custom.conf\0"
+            )
+            under_root = manager.under_root
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, b"123\n", b""))
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager.subprocess, "run", runner), \
+                 mock.patch.object(manager, "_stop_adguard") as stop:
+                with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                    manager.apply_service_change(["chatgpt"], root=Path("/"))
+            stop.assert_not_called()
+
+    def test_custom_mode_blocks_live_rollback_before_stop(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            map_path.write_text("new map")
+            (root / "proc/123/cmdline").write_bytes(
+                b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0/opt/mtproxyl/nginx-custom.conf\0"
+            )
+            under_root = manager.under_root
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, b"123\n", b""))
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_stop_adguard") as stop:
+                with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                    manager.rollback_last(Path("/"), selected=backup, runner=runner)
+            stop.assert_not_called()
+            self.assertEqual("new map", map_path.read_text())
+
+    def test_custom_mode_is_not_reported_as_healthy_configuration(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            (root / "proc/123/cmdline").write_bytes(
+                b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0/opt/mtproxyl/nginx-custom.conf\0"
+            )
+            under_root = manager.under_root
+            commands = []
+
+            def runner(command, **_kwargs):
+                commands.append(command)
+                output = b"123\n" if "--property=MainPID" in command else b"Result=success\nExecMainStatus=0\n"
+                return subprocess.CompletedProcess(command, 0, output, b"")
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)):
+                status = manager.collect_menu_status(Path("/"), runner=runner)
+                report = manager.collect_system_check(Path("/"), runner=runner)
+            menu = io.StringIO()
+            manager.render_main_screen(status, menu, width=80)
+            self.assertEqual("attention", status["overall"])
+            self.assertFalse(status["front_config_supported"])
+            self.assertIn("Активная конфигурация MTProxy не подтверждена", menu.getvalue())
+            self.assertFalse(report["mtproxyl_config"])
+            self.assertNotIn([manager.MTPROXY_NGINX_BINARY, "-t", "-c", manager.MTPROXY_NGINX_CONFIG], commands)
+
+    def test_mtproxy_pid_change_after_validation_blocks_reload(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            under_root = manager.under_root
+            outputs = iter((b"123\n", b"123\n", b"123\n", b"456\n"))
+            commands = []
+
+            def runner(command, **_kwargs):
+                commands.append(command)
+                if command[:2] == ["systemctl", "show"]:
+                    return subprocess.CompletedProcess(command, 0, next(outputs), b"")
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)):
+                with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                    manager._reload_mtproxyl_map(Path("/"), runner)
+            self.assertIn([manager.MTPROXY_NGINX_BINARY, "-t", "-c", manager.MTPROXY_NGINX_CONFIG], commands)
+            self.assertNotIn(["systemctl", "reload", "mtproxyl-pq-nginx"], commands)
+
+    def test_front_backup_and_rollback_preserve_user_mtproxy_config(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            external = root / "opt/mtproxyl/nginx-custom.conf"
+            external.parent.mkdir(parents=True, exist_ok=True)
+            external.write_text("user config", encoding="utf-8")
+            system_config = root / "etc/nginx/nginx.conf"
+            system_config.parent.mkdir(parents=True)
+            system_config.write_text("system config", encoding="utf-8")
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            manifest = json.loads((backup / "manifest.json").read_text())
+            self.assertEqual(4, manifest["version"])
+            self.assertTrue(set(manager.FRONT_MANAGED_FILES).issubset({item["path"] for item in manifest["files"]}))
+            self.assertNotIn("/opt/mtproxyl/nginx-custom.conf", {item["path"] for item in manifest["files"]})
+            self.assertNotIn("/opt/mtproxyl-nginx/conf/nginx.conf", {item["path"] for item in manifest["files"]})
+            (root / "etc/adguardhome-doh/mtproxyl-sni.map").write_text("new map")
+            (root / "etc/adguardhome-doh/mtproxyl-nginx.conf").write_text("new dedicated config")
+            (root / "etc/systemd/system/adguardhome-doh-nginx.service").write_text("new dedicated unit")
+            external.write_text("user changed config", encoding="utf-8")
+            system_config.write_text("system changed config", encoding="utf-8")
+            self.assertTrue(manager.rollback_last(root))
+            self.assertEqual("old map", (root / "etc/adguardhome-doh/mtproxyl-sni.map").read_text())
+            self.assertEqual("old dedicated config", (root / "etc/adguardhome-doh/mtproxyl-nginx.conf").read_text())
+            self.assertEqual("old dedicated unit", (root / "etc/systemd/system/adguardhome-doh-nginx.service").read_text())
+            self.assertEqual("user changed config", external.read_text())
+            self.assertEqual("system changed config", system_config.read_text())
+            self.assertEqual("mtproxyl", json.loads((root / "var/lib/adguardhome-doh/install.json").read_text())["front"])
+
+    def test_mtproxy_rollback_rejects_snapshot_without_shared_front_before_stop(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = ServiceChangeSeedingTests.build_root(self, directory)
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_file.read_text())
+            state["front"] = "mtproxyl"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            with mock.patch.object(manager, "_stop_adguard") as stop:
+                with self.assertRaisesRegex(RuntimeError, "снимок несовместим с общим MTProxy front"):
+                    manager.rollback_last(root)
+            stop.assert_not_called()
+            self.assertEqual("mtproxyl", json.loads(state_file.read_text())["front"])
+
+    def test_changed_front_map_is_tested_and_reloaded_without_system_nginx(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            map_path.write_text("new map")
+            under_root = manager.under_root
+            calls = []
+
+            def runner(command, **_kwargs):
+                calls.append(command)
+                if command[:2] == ["systemctl", "show"]:
+                    return subprocess.CompletedProcess(command, 0, b"123\n", b"")
+                if command[0] == "/opt/mtproxyl-nginx/sbin/nginx":
+                    self.assertEqual("old map", map_path.read_text())
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services") as reload:
+                self.assertTrue(manager.rollback_last(Path("/"), selected=backup, runner=runner))
+            self.assertIn(["/usr/sbin/nginx", "-t", "-c", manager.PRIVATE_NGINX_CONFIG], calls)
+            self.assertIn(["/opt/mtproxyl-nginx/sbin/nginx", "-t", "-c", "/opt/mtproxyl-nginx/conf/nginx.conf"], calls)
+            self.assertIn(["systemctl", "reload", "mtproxyl-pq-nginx"], calls)
+            self.assertNotIn(["nginx", "-t"], calls)
+            self.assertNotIn(["systemctl", "restart", "mtproxyl-pq-nginx"], calls)
+            reload.assert_called_once()
+            self.assertEqual("old map", map_path.read_text())
+
+    def test_unchanged_front_map_does_not_reload_mtproxy(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            under_root = manager.under_root
+            calls = []
+
+            def runner(command, **_kwargs):
+                calls.append(command)
+                if command[:2] == ["systemctl", "show"]:
+                    return subprocess.CompletedProcess(command, 0, b"123\n", b"")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services"):
+                self.assertTrue(manager.rollback_last(Path("/"), selected=backup, runner=runner))
+            self.assertNotIn(["systemctl", "reload", "mtproxyl-pq-nginx"], calls)
+
+    def test_changed_front_map_requires_mtproxy_validator_before_stopping(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            (root / "etc/adguardhome-doh/mtproxyl-sni.map").write_text("new map")
+            (root / "opt/mtproxyl-nginx/sbin/nginx").unlink()
+            under_root = manager.under_root
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_stop_adguard") as stop:
+                with self.assertRaisesRegex(RuntimeError, "проверка MTProxy недоступна"):
+                    manager.rollback_last(Path("/"), selected=backup, runner=mock.Mock())
+            stop.assert_not_called()
+            self.assertEqual("new map", (root / "etc/adguardhome-doh/mtproxyl-sni.map").read_text())
+
+    def test_failed_shared_front_rollback_restores_previous_map_and_reloads_it(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            map_path.write_text("new map")
+            under_root = manager.under_root
+            tested_maps = []
+            reloads = []
+
+            def runner(command, **_kwargs):
+                if command[:2] == ["systemctl", "show"]:
+                    return subprocess.CompletedProcess(command, 0, b"123\n", b"")
+                if command[0] == "/opt/mtproxyl-nginx/sbin/nginx":
+                    tested_maps.append(map_path.read_text())
+                if command == ["systemctl", "reload", "mtproxyl-pq-nginx"]:
+                    reloads.append(map_path.read_text())
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services", side_effect=[RuntimeError("DoH smoke failed"), None]):
+                with self.assertRaisesRegex(RuntimeError, "DoH smoke failed"):
+                    manager.rollback_last(Path("/"), selected=backup, runner=runner)
+            self.assertEqual(["old map", "new map"], tested_maps)
+            self.assertEqual(["old map", "new map"], reloads)
+            self.assertEqual("new map", map_path.read_text())
+
+    def test_failed_mtproxy_recovery_leaves_transaction_pending(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+            manager.finalize_update_backup(backup, root, "dns.example.com")
+            map_path.write_text("new map")
+            under_root = manager.under_root
+            front_tests = []
+
+            def runner(command, **_kwargs):
+                if command[:2] == ["systemctl", "show"]:
+                    return subprocess.CompletedProcess(command, 0, b"123\n", b"")
+                if command[0] == "/opt/mtproxyl-nginx/sbin/nginx":
+                    front_tests.append(map_path.read_text())
+                    if len(front_tests) == 2:
+                        raise subprocess.CalledProcessError(1, command)
+                if command == ["systemctl", "reload", "mtproxyl-pq-nginx"]:
+                    raise subprocess.CalledProcessError(1, command)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_load_healthcheck"), \
+                 mock.patch.object(manager, "_validate_staged_adguard"), \
+                 mock.patch.object(manager, "reload_runtime_services") as reload:
+                with self.assertRaisesRegex(RuntimeError, "MTProxy recovery failed"):
+                    manager.rollback_last(Path("/"), selected=backup, runner=runner)
+            self.assertEqual(["old map", "new map"], front_tests)
+            self.assertEqual("new map", map_path.read_text())
+            reload.assert_not_called()
+            markers = list((root / "var/backups/adguardhome-doh").glob(".restore-*/transaction.json"))
+            self.assertEqual(1, len(markers))
+            self.assertEqual("prepared", json.loads(markers[0].read_text())["state"])
+
 
 if __name__ == "__main__":
     unittest.main()

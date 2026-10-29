@@ -1,5 +1,8 @@
 import os
+import json
+import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,6 +50,183 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("dry-run завершён", result.stdout)
             self.assertEqual([], list(Path(directory).iterdir()))
+
+    def test_front_dry_runs_render_the_selected_topology_and_full_map(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            shim = fake_bin / "python3"
+            shim.write_text(
+                '#!/bin/sh\n'
+                'case "$1" in\n'
+                '  */deploy/lib/render_runtime.py)\n'
+                '    printf "CALL\\n" >> "$RENDER_ARGS"\n'
+                '    for arg in "$@"; do printf "%s\\n" "$arg" >> "$RENDER_ARGS"; done\n'
+                '    "$REAL_PYTHON" "$@" || exit $?\n'
+                '    while [ "$#" -gt 0 ]; do\n'
+                '      if [ "$1" = --output ]; then output="$2"; break; fi\n'
+                '      shift\n'
+                '    done\n'
+                '    cp "$output/nginx-stream.conf" "$CAPTURE_DIR/stream"\n'
+                '    if [ -f "$output/mtproxyl-sni.map" ]; then\n'
+                '      cp "$output/mtproxyl-sni.map" "$CAPTURE_DIR/map"\n'
+                '    fi\n'
+                '    exit 0;;\n'
+                'esac\nexec "$REAL_PYTHON" "$@"\n', encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            for front, policy in (("standard", False), ("mtproxyl", False), ("mtproxyl", True)):
+                with self.subTest(front=front, policy=policy):
+                    capture = root / f"capture-{front}-{policy}"
+                    capture.mkdir()
+                    isolated = root / f"target-{front}-{policy}"
+                    isolated.mkdir()
+                    args_log = capture / "args"
+                    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+                               REAL_PYTHON=sys.executable, RENDER_ARGS=str(args_log),
+                               CAPTURE_DIR=str(capture))
+                    command = [str(INSTALL), "--front", front, "--domain", "dns.example.com",
+                               "--public-ip", "203.0.113.10", "--email", "admin@example.com",
+                               "--root", str(isolated), "--dry-run"]
+                    if policy:
+                        command += ["--policy", str(ROOT / "config/policy.csv")]
+                    result = subprocess.run(command, cwd=ROOT, env=env, text=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn(f"Front: {front}", result.stdout)
+                    arguments = args_log.read_text(encoding="utf-8")
+                    self.assertEqual(2, arguments.count(f"--front\n{front}\n"))
+                    stream = (capture / "stream").read_text(encoding="utf-8")
+                    if front == "mtproxyl":
+                        self.assertIn("listen 127.0.0.1:24443 proxy_protocol", stream)
+                        self.assertTrue((capture / "map").read_text(encoding="utf-8"))
+                        self.assertEqual(2, arguments.count("--config-dir\n"))
+                    else:
+                        self.assertIn("listen 443 ", stream)
+                        self.assertFalse((capture / "map").exists())
+                    if policy:
+                        self.assertEqual(2, arguments.count("--policy\n"))
+                    self.assertEqual([], list(isolated.iterdir()))
+
+    def test_front_option_validation_and_local_site_compatibility(self):
+        base = ("--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                "--email", "admin@example.com", "--dry-run")
+        for value in ("", "MTProxyL", "unknown", "mtproxyl;reboot"):
+            with self.subTest(value=value):
+                result = self.run_install(*base, "--front", value)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("invalid --front", result.stderr)
+        missing = self.run_install("--front")
+        self.assertNotEqual(0, missing.returncode)
+        self.assertIn("--front requires a value", missing.stderr)
+        standard = self.run_install(*base, "--front", "standard",
+                                    "--local-site", "app.example.org=127.0.0.1:9443")
+        self.assertEqual(0, standard.returncode, standard.stderr)
+        shared = self.run_install(*base, "--front", "mtproxyl",
+                                  "--local-site", "app.example.org=127.0.0.1:9443")
+        self.assertNotEqual(0, shared.returncode)
+        self.assertIn("local sites are not supported with mtproxyl front", shared.stderr)
+
+    def test_update_inherits_front_and_explicit_direct_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            legacy = dict(domain="dns.example.com", public_ip="203.0.113.10",
+                          email="admin@example.com", version="1.0.0", repository="owner/repo")
+            base = ("--update", "--dry-run", "--root", directory, "--domain", legacy["domain"],
+                    "--public-ip", legacy["public_ip"], "--email", legacy["email"])
+            state.write_text(json.dumps(legacy), encoding="utf-8")
+            state.chmod(0o600)
+            result = self.run_install(*base)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("Front: standard", result.stdout)
+            state.write_text(json.dumps({**legacy, "front": "mtproxyl"}), encoding="utf-8")
+            before = state.read_bytes()
+            inherited = self.run_install(*base)
+            self.assertEqual(0, inherited.returncode, inherited.stderr)
+            self.assertIn("Front: mtproxyl", inherited.stdout)
+            overridden = self.run_install(*base, "--front", "standard")
+            self.assertEqual(0, overridden.returncode, overridden.stderr)
+            self.assertIn("Front: standard", overridden.stdout)
+            self.assertEqual(before, state.read_bytes())
+            env = dict(os.environ, ADGUARDHOME_DOH_MANAGER_UPDATE="1")
+            manager = subprocess.run([str(INSTALL), *base, "--front", "standard"],
+                                     cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(0, manager.returncode, manager.stderr)
+            self.assertIn("Front: mtproxyl", manager.stdout)
+
+    def test_shared_front_real_install_is_rejected_before_system_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fresh = root / "fresh"
+            fresh.mkdir()
+            fresh_result = self.run_install(
+                "--root", str(fresh), "--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                "--email", "admin@example.com", "--yes", "--front", "mtproxyl",
+            )
+            self.assertNotEqual(0, fresh_result.returncode)
+            self.assertIn("совместный front MTProxyL ещё не активирован", fresh_result.stderr)
+            self.assertEqual([], list(fresh.iterdir()))
+            fresh.rmdir()
+            state = root / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            saved = dict(domain="dns.example.com", public_ip="203.0.113.10",
+                         email="admin@example.com", version="1.0.0", repository="owner/repo",
+                         front="mtproxyl")
+            state.write_text(json.dumps(saved), encoding="utf-8")
+            state.chmod(0o600)
+            before = state.read_bytes()
+            args = ("--root", directory, "--domain", saved["domain"], "--public-ip", saved["public_ip"],
+                    "--email", saved["email"], "--yes")
+            for flags in (("--front", "mtproxyl"), ("--update",),
+                          ("--update", "--front", "standard"), ("--front", "standard")):
+                with self.subTest(flags=flags):
+                    result = self.run_install(*args, *flags)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn("совместный front MTProxyL ещё не активирован", result.stderr)
+                    self.assertEqual(before, state.read_bytes())
+                    self.assertEqual([state], [path for path in root.rglob("*") if path.is_file()])
+
+            state.write_text(json.dumps({key: value for key, value in saved.items() if key != "front"}),
+                             encoding="utf-8")
+            standard = self.run_install(*args, "--front", "standard")
+            self.assertNotEqual(0, standard.returncode)
+            self.assertNotIn("совместный front MTProxyL ещё не активирован", standard.stderr)
+
+        source = INSTALL.read_text(encoding="utf-8")
+        guard = source.index("совместный front MTProxyL ещё не активирован")
+        self.assertLess(guard, source.index("adguardhome_doh_acquire_operation_lock ||"))
+        self.assertLess(guard, source.index("adguardhome_doh_init_log /"))
+        self.assertLess(guard, source.index("apt-get"))
+
+    def test_all_renderer_branches_receive_the_selected_front(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertEqual(4, source.count('--front "$FRONT"'))
+        self.assertEqual(2, source.count('${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"}'))
+
+    def test_state_writer_embedded_in_installer_persists_only_mtproxyl_front(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        match = re.search(r'^python3 - [^\n]* "\$FRONT" <<\'PY\'\n(.*?)\nPY$', source,
+                          re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "install.json"
+            enabled = root / "enabled-services.json"
+            for front in ("standard", "mtproxyl"):
+                args = [sys.executable, "-", str(ROOT / "deploy/lib/state.py"), str(state),
+                        "dns.example.com", "203.0.113.10", "admin@example.com", "1.0.0",
+                        "owner/repo", str(enabled), "chatgpt", "", "", "", front]
+                result = subprocess.run(args, input=match.group(1), cwd=ROOT, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(0, result.returncode, result.stderr)
+                data = json.loads(state.read_text(encoding="utf-8"))
+                if front == "standard":
+                    self.assertNotIn("front", data)
+                else:
+                    self.assertEqual("mtproxyl", data["front"])
 
     def test_dry_run_accepts_a_relay_exit_host_but_not_itself(self):
         base = ("--domain", "dns.example.com", "--public-ip", "203.0.113.10",
@@ -100,6 +280,29 @@ class InstallerCliTests(unittest.TestCase):
             result = self.run_common('adguardhome_doh_validate_local_site "$1"', value)
             self.assertEqual(expected, result.returncode, value)
 
+    def test_nginx_listener_must_belong_to_the_system_nginx_service(self):
+        listeners = (
+            'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=10,fd=7))\n'
+            'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=11,fd=8))\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory) / "proc"
+            for pid, unit in ((10, "nginx.service"), (11, "mtproxyl-pq-nginx.service")):
+                path = proc / str(pid)
+                path.mkdir(parents=True)
+                (path / "cgroup").write_text("0::/system.slice/%s\n" % unit, encoding="utf-8")
+            systemctl = 'systemctl() { case "$*" in "is-active --quiet nginx") return 0;; ' \
+                        '"show --property=ControlGroup --value nginx") echo /system.slice/nginx.service;; ' \
+                        '*) return 1;; esac; }; '
+            check = systemctl + 'adguardhome_doh_system_nginx_owns_listeners "$1" "$2"'
+            other = self.run_common(check, listeners, str(proc))
+            self.assertNotEqual(0, other.returncode)
+            (proc / "11/cgroup").write_text("0::/system.slice/nginx.service\n", encoding="utf-8")
+            ours = self.run_common(check, listeners, str(proc))
+            self.assertEqual(0, ours.returncode, ours.stderr)
+            (proc / "11/cgroup").unlink()
+            missing = self.run_common(check, listeners, str(proc))
+            self.assertNotEqual(0, missing.returncode)
     def test_missing_required_argument_fails(self):
         result = self.run_install("--domain", "dns.example.com")
         self.assertNotEqual(0, result.returncode)
@@ -420,6 +623,7 @@ class InstallerCliTests(unittest.TestCase):
         self.assertTrue(
             all("--resolve dns.example.com:443:127.0.0.1" in line for line in call_lines)
         )
+        self.assertTrue(all("--noproxy *" in line for line in call_lines))
         self.assertTrue(all("https://dns.example.com/" in line for line in call_lines))
 
     def test_installer_reloads_nginx_once_after_final_config_and_smoke_checks(self):
@@ -432,7 +636,7 @@ class InstallerCliTests(unittest.TestCase):
         self.assertLess(source.index("adguardhome_doh_run_logged systemctl start nginx"), first_reload)
         self.assertLess(first_reload, source.index("certbot certonly --webroot"))
         final_config = source.index(
-            'install -m 644 "$stage/nginx-http.conf" /etc/nginx/sites-enabled/adguardhome-doh'
+            'mv -f -- "$ADGUARDHOME_DOH_NGINX_TEMP" /etc/nginx/sites-enabled/adguardhome-doh'
         )
         reload_index = source.rindex(reload_command)
         smoke_index = source.index(
@@ -747,6 +951,687 @@ class InstallerCliTests(unittest.TestCase):
 
         self.assertIn("ReadWritePaths=/var/lib/adguardhome-doh /run/lock", unit)
         self.assertIn("ProtectSystem=strict", unit)
+
+    def test_direct_update_inherits_settings_and_honors_explicit_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "domain": "dns.example.com", "public_ip": "203.0.113.10",
+                "email": "admin@example.com", "version": "1.0.0",
+                "repository": "private/custom", "relay": "203.0.113.50",
+                "local_sites": ["shop.example.org=127.0.0.1:9443"],
+            }), encoding="utf-8")
+            state.chmod(0o600)
+            env = dict(os.environ, ADGUARDHOME_DOH_TTY_FD="0")
+            env.pop("ADGUARDHOME_DOH_REPOSITORY", None)
+            base = [str(INSTALL), "--update", "--dry-run", "--root", directory,
+                    "--public-ip", "203.0.113.10", "--email", "admin@example.com",
+                    "--services", "chatgpt"]
+            inherited = subprocess.run(base, input="DNS.EXAMPLE.COM\ny\n", env=env, cwd=ROOT,
+                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(0, inherited.returncode, inherited.stderr)
+            self.assertIn("Домен: dns.example.com", inherited.stdout)
+            self.assertIn("Relay: 203.0.113.50", inherited.stdout)
+            self.assertIn("shop.example.org=127.0.0.1:9443", inherited.stdout)
+            self.assertIn("Репозиторий: private/custom", inherited.stdout)
+            overridden = subprocess.run(
+                [*base, "--relay", "203.0.113.60", "--repository", "new/repo",
+                 "--local-site", "other.example.org=127.0.0.1:9444"],
+                input="dns.example.com\ny\n", env=env, cwd=ROOT, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, overridden.returncode, overridden.stderr)
+            self.assertIn("Relay: 203.0.113.60", overridden.stdout)
+            self.assertIn("Репозиторий: new/repo", overridden.stdout)
+            self.assertIn("other.example.org=127.0.0.1:9444", overridden.stdout)
+            self.assertNotIn("shop.example.org", overridden.stdout)
+
+    def test_direct_update_rejects_untrusted_saved_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text('{"relay":"203.0.113.9"}', encoding="utf-8")
+            state.chmod(0o644)
+            result = self.run_install("--update", "--root", directory, "--dry-run",
+                                      "--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                                      "--email", "admin@example.com")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("cannot load existing installation settings", result.stderr)
+            self.assertEqual(0o644, state.stat().st_mode & 0o777)
+
+    def test_direct_update_preserves_enabled_services_without_an_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "domain": "dns.example.com", "public_ip": "203.0.113.10",
+                "email": "admin@example.com", "version": "1.0.0",
+                "repository": "private/custom",
+                "local_sites": ["chatgpt.com=127.0.0.1:9443"],
+            }), encoding="utf-8")
+            state.chmod(0o600)
+            enabled = state.parent / "enabled-services.json"
+            enabled.write_text('["claude"]\n', encoding="utf-8")
+            enabled.chmod(0o600)
+            args = ("--update", "--dry-run", "--root", directory,
+                    "--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                    "--email", "admin@example.com")
+            preserved = self.run_install(*args)
+            self.assertEqual(0, preserved.returncode, preserved.stderr)
+            explicit = self.run_install(*args, "--services", "chatgpt")
+            self.assertNotEqual(0, explicit.returncode)
+
+    def test_saved_compat_policy_survives_legacy_manager_services_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / "etc/adguardhome-doh/compat-policy.csv"
+            policy.parent.mkdir(parents=True)
+            policy.write_bytes((ROOT / "config/policy.csv").read_bytes())
+            state = root / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "domain": "dns.example.com", "public_ip": "203.0.113.10",
+                "email": "admin@example.com", "version": "1.0.0",
+                "repository": "owner/repo", "policy": "/etc/adguardhome-doh/compat-policy.csv",
+            }), encoding="utf-8")
+            state.chmod(0o600)
+            env = dict(os.environ, ADGUARDHOME_DOH_TTY_FD="0")
+            result = subprocess.run(
+                [str(INSTALL), "--update", "--dry-run", "--root", directory,
+                 "--public-ip", "203.0.113.10", "--email", "admin@example.com",
+                 "--services", "chatgpt"], input="dns.example.com\ny\n", env=env,
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("Политика: " + str(policy), result.stdout)
+            self.assertNotIn("Сервисы:", result.stdout)
+
+    def test_legacy_policy_is_reconstructed_when_old_manager_passes_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "domain": "dns.example.com", "public_ip": "203.0.113.10",
+                "email": "admin@example.com", "version": "1.0.0", "repository": "owner/repo",
+            }), encoding="utf-8")
+            state.chmod(0o600)
+            health = root / "etc/adguardhome-doh/health-policy.json"
+            health.parent.mkdir(parents=True)
+            health.write_text(json.dumps({"services": {}, "domains": [
+                {"domain": "old.example.org", "kind": "fqdn", "probe": "old.example.org", "services": []}
+            ]}), encoding="utf-8")
+            env = dict(os.environ, ADGUARDHOME_DOH_TTY_FD="0")
+            base = [str(INSTALL), "--update", "--dry-run", "--root", directory,
+                    "--public-ip", "203.0.113.10", "--email", "admin@example.com",
+                    "--services", "chatgpt"]
+            result = subprocess.run(base, input="dns.example.com\ny\n", env=env, cwd=ROOT,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("Политика: восстановлена из предыдущей установки", result.stdout)
+            collision = subprocess.run([*base, "--local-site", "old.example.org=127.0.0.1:9443"],
+                                       input="dns.example.com\n", env=env, cwd=ROOT, text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(0, collision.returncode)
+            self.assertIn("collides with a routed domain", collision.stderr)
+
+    def test_manager_arguments_are_refreshed_from_install_and_enabled_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "var/lib/adguardhome-doh/install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(json.dumps({
+                "domain": "dns.example.com", "public_ip": "203.0.113.10",
+                "email": "admin@example.com", "version": "1.0.0", "repository": "owner/repo",
+                "local_sites": ["chatgpt.com=127.0.0.1:9443"],
+            }), encoding="utf-8")
+            state.chmod(0o600)
+            enabled = state.parent / "enabled-services.json"
+            enabled.write_text('["claude"]\n', encoding="utf-8")
+            enabled.chmod(0o600)
+            env = dict(os.environ, ADGUARDHOME_DOH_MANAGER_UPDATE="1")
+            result = subprocess.run(
+                [str(INSTALL), "--update", "--dry-run", "--root", directory,
+                 "--domain", "stale.example.com", "--public-ip", "203.0.113.20",
+                 "--email", "old@example.com", "--services", "chatgpt",
+                 "--local-site", "old.example.net=127.0.0.1:9443", "--repository", "old/repo"],
+                env=env, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("https://dns.example.com/", result.stdout)
+            # Without the manager sentinel an explicit selection still wins;
+            # it collides with the saved local-site and must be rejected.
+            env.pop("ADGUARDHOME_DOH_MANAGER_UPDATE")
+            explicit = subprocess.run(
+                [str(INSTALL), "--update", "--dry-run", "--root", directory,
+                 "--domain", "dns.example.com", "--public-ip", "203.0.113.10",
+                 "--email", "admin@example.com", "--services", "chatgpt"],
+                env=env, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(0, explicit.returncode)
+            self.assertIn("collides with a routed domain", explicit.stderr)
+
+    def test_password_stdin_is_not_echoed_or_passed_to_htpasswd_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials = root / "credentials.json"
+            secret = "not-an-argument-xyz"
+            result = subprocess.run(
+                ["python3", str(ROOT / "deploy/lib/credentials.py"), "--path", str(credentials),
+                 "--url", "https://dns.example.com/", "--password-stdin"], input=secret,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("", result.stdout)
+            self.assertEqual(secret, read_credentials(credentials)["password"])
+            fake = root / "htpasswd"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARG_FILE"\n'
+                            'cat > "$INPUT_FILE"\nprintf "admin:hashvalue\\n"\n', encoding="utf-8")
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                       ARG_FILE=str(root / "args"), INPUT_FILE=str(root / "input"))
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; adguardhome_doh_hash_password "$2"',
+                 "bash", str(ROOT / "deploy/lib/common.sh"), secret],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("hashvalue\n", result.stdout)
+            self.assertNotIn(secret, (root / "args").read_text(encoding="utf-8"))
+            self.assertEqual(secret + "\n", (root / "input").read_text(encoding="utf-8"))
+
+    def test_lock_fails_closed_when_flock_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "health.lock"
+            script = ('source "$1"; PATH="$2"; ADGUARDHOME_DOH_LOCK_PATH="$3"; '
+                      'adguardhome_doh_acquire_health_lock')
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(ROOT / "deploy/lib/common.sh"), directory, str(lock)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("flock is required", result.stderr)
+            self.assertFalse(lock.exists())
+
+    def test_legacy_health_worker_is_stopped_before_configuration_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "systemctl"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                            '[ "$1" = show ] && printf "loaded\\n"\nexit 0\n', encoding="utf-8")
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", CALLS=str(root / "calls"))
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; adguardhome_doh_pause_health',
+                 "bash", str(ROOT / "deploy/lib/common.sh")], env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual([
+                "show --property=LoadState --value adguardhome-doh-health.timer", "stop adguardhome-doh-health.timer",
+                "show --property=LoadState --value adguardhome-doh-health.service", "stop adguardhome-doh-health.service",
+            ], (root / "calls").read_text(encoding="utf-8").splitlines())
+
+    def test_activating_health_service_and_queued_job_are_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "systemctl"
+            fake.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                'case "$*" in *health.timer) echo not-found;; '
+                '"show --property=LoadState --value adguardhome-doh-health.service") echo loaded;; '
+                '"is-active --quiet adguardhome-doh-health.service") exit 3;; '
+                '"stop adguardhome-doh-health.service") rm -f "$QUEUED";; esac\nexit 0\n',
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            queued = root / "queued"
+            queued.touch()
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                       CALLS=str(root / "calls"), QUEUED=str(queued))
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; adguardhome_doh_pause_health',
+                 "bash", str(ROOT / "deploy/lib/common.sh")], env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertFalse(queued.exists())
+            self.assertIn("stop adguardhome-doh-health.service", (root / "calls").read_text(encoding="utf-8"))
+
+    def test_restoration_keeps_existing_nginx_and_stops_new_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "systemctl").write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                'case "$1" in is-active) exit 0;; is-enabled) echo disabled; exit 1;; esac\nexit 0\n',
+                encoding="utf-8",
+            )
+            (root / "nginx").write_text('#!/bin/sh\nexit 0\n', encoding="utf-8")
+            (root / "systemctl").chmod(0o755)
+            (root / "nginx").chmod(0o755)
+            calls = root / "calls"
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", CALLS=str(calls))
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; ADGUARDHOME_DOH_NGINX_ACTIVE=active; '
+                 'ADGUARDHOME_DOH_AGH_ACTIVE=inactive; ADGUARDHOME_DOH_TIMER_ACTIVE=inactive; '
+                 'adguardhome_doh_restore_runtime', "bash", str(ROOT / "deploy/lib/common.sh")],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            commands = calls.read_text(encoding="utf-8").splitlines()
+            self.assertIn("stop adguardhome-doh", commands)
+            self.assertIn("stop adguardhome-doh-health.timer", commands)
+            self.assertIn("reload nginx", commands)
+            self.assertNotIn("stop nginx", commands)
+
+    def test_failure_restores_snapshot_and_preserves_unrelated_webroot_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "etc/nginx/nginx.conf"
+            config.parent.mkdir(parents=True)
+            config.write_text("original nginx configuration\n", encoding="utf-8")
+            create = subprocess.run(
+                ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                 "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                 "--snapshot-operation", "recovery"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, create.returncode, create.stderr)
+            snapshot = create.stdout.strip()
+            config.write_text("partial change\n", encoding="utf-8")
+            webroot = root / "var/www/adguardhome-doh"
+            webroot.mkdir(parents=True)
+            owned = webroot / "dns.example.com.mobileconfig"
+            owned.write_text("new profile\n", encoding="utf-8")
+            foreign = webroot / "foreign.txt"
+            foreign.write_text("preserve me\n", encoding="utf-8")
+            fake_flock = root / "flock"
+            fake_flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_flock.chmod(0o755)
+            script = (
+                'source "$1"; PROJECT_ROOT="$2"; ROOT="$3"; DOMAIN=dns.example.com; '
+                'ADGUARDHOME_DOH_SNAPSHOT="$4"; ADGUARDHOME_DOH_MUTATIONS=1; '
+                'ADGUARDHOME_DOH_LOCK_HELD=1; ADGUARDHOME_DOH_RUNTIME_TOUCHED=0; '
+                'trap adguardhome_doh_install_exit EXIT; exit 7'
+            )
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}")
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(ROOT / "deploy/lib/common.sh"),
+                 str(ROOT), str(root), snapshot], env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertNotIn("automatic restoration failed", result.stderr)
+            self.assertEqual("original nginx configuration\n", config.read_text(encoding="utf-8"))
+            self.assertFalse(owned.exists())
+            self.assertEqual("preserve me\n", foreign.read_text(encoding="utf-8"))
+
+    def test_package_failure_does_not_remove_new_package_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "nginx.conf"
+            config.write_text("package configuration\n", encoding="utf-8")
+            for name in ("systemctl", "flock"):
+                executable = root / name
+                executable.write_text('#!/bin/sh\n[ "$1" = is-active ] && exit 3\nexit 0\n', encoding="utf-8")
+                executable.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}")
+            script = (
+                'source "$1"; ADGUARDHOME_DOH_RUNTIME_TOUCHED=1; '
+                'ADGUARDHOME_DOH_LOCK_HELD=1; ADGUARDHOME_DOH_MUTATIONS=0; '
+                'trap adguardhome_doh_install_exit EXIT; exit 17'
+            )
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(ROOT / "deploy/lib/common.sh")],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(17, result.returncode, result.stderr)
+            self.assertIn("package changes are not reverted", result.stderr)
+            self.assertEqual("package configuration\n", config.read_text(encoding="utf-8"))
+
+    def test_adguard_is_stopped_before_restoring_yaml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "opt/AdGuardHome/AdGuardHome.yaml"
+            config.parent.mkdir(parents=True)
+            config.write_text("original configuration\n", encoding="utf-8")
+            create = subprocess.run(
+                ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                 "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                 "--snapshot-operation", "recovery"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, create.returncode, create.stderr)
+            config.write_text("new configuration\n", encoding="utf-8")
+            (root / "systemctl").write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                'if [ "$1" = show ]; then echo loaded; exit 0; fi\n'
+                'if [ "$1" = is-active ]; then [ "$3" = adguardhome-doh ]; exit $?; fi\n'
+                'if [ "$1" = is-enabled ]; then echo disabled; exit 1; fi\n'
+                'if [ "$1" = stop ] && [ "$2" = adguardhome-doh ]; then '
+                'printf "saved by stopping service\\n" > "$CONFIG"; fi\nexit 0\n', encoding="utf-8",
+            )
+            (root / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for name in ("systemctl", "flock"):
+                (root / name).chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                       CONFIG=str(config), CALLS=str(root / "calls"))
+            script = (
+                'source "$1"; PROJECT_ROOT="$2"; ROOT="$3"; DOMAIN=dns.example.com; '
+                'ADGUARDHOME_DOH_SNAPSHOT="$4"; ADGUARDHOME_DOH_MUTATIONS=1; '
+                'ADGUARDHOME_DOH_LOCK_HELD=1; ADGUARDHOME_DOH_RUNTIME_TOUCHED=1; '
+                'ADGUARDHOME_DOH_AGH_ACTIVE=active; trap adguardhome_doh_install_exit EXIT; exit 7'
+            )
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(ROOT / "deploy/lib/common.sh"),
+                 str(ROOT), str(root), create.stdout.strip()], env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertNotIn("automatic restoration failed", result.stderr)
+            self.assertEqual("original configuration\n", config.read_text(encoding="utf-8"))
+            self.assertIn("start adguardhome-doh", (root / "calls").read_text(encoding="utf-8"))
+
+    def _run_exit_after_failed_restore(self, root, project, snapshot, extra_env=None,
+                                       systemctl_script=None, initial_agh_state="active"):
+        for name, content in {
+            "systemctl": systemctl_script or (
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                'if [ "$1" = show ]; then echo loaded; exit 0; fi\n'
+                'if [ "$1" = is-active ]; then [ "$3" = adguardhome-doh ]; exit $?; fi\n'
+                'exit 0\n'
+            ),
+            "flock": "#!/bin/sh\nexit 0\n",
+        }.items():
+            executable = root / name
+            executable.write_text(content, encoding="utf-8")
+            executable.chmod(0o755)
+        env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", CALLS=str(root / "calls"))
+        env.update(extra_env or {})
+        script = (
+            'source "$1"; PROJECT_ROOT="$2"; ROOT="$3"; DOMAIN=dns.example.com; '
+            'ADGUARDHOME_DOH_SNAPSHOT="$4"; ADGUARDHOME_DOH_MUTATIONS=1; '
+            'ADGUARDHOME_DOH_LOCK_HELD=1; ADGUARDHOME_DOH_RUNTIME_TOUCHED=1; '
+            'ADGUARDHOME_DOH_AGH_ACTIVE="$5"; trap adguardhome_doh_install_exit EXIT; exit 7'
+        )
+        return subprocess.run(
+            ["bash", "-c", script, "bash", str(ROOT / "deploy/lib/common.sh"),
+             str(project), str(root), str(snapshot), initial_agh_state], env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_double_restore_failure_leaves_adguard_stopped_and_marker_intact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "etc/nginx/nginx.conf"
+            config.parent.mkdir(parents=True)
+            config.write_text("original configuration\n", encoding="utf-8")
+            created = subprocess.run(
+                ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                 "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                 "--snapshot-operation", "recovery"], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, created.returncode, created.stderr)
+            snapshot = Path(created.stdout.strip())
+            config.write_text("activation before restore\n", encoding="utf-8")
+            project = root / "fake-project"
+            manager = project / "deploy/manage.py"
+            manager.parent.mkdir(parents=True)
+            manager.write_text(
+                'import importlib.util, os, sys\n'
+                'from pathlib import Path\n'
+                'spec = importlib.util.spec_from_file_location("manager_under_test", os.environ["REAL_MANAGER"])\n'
+                'module = importlib.util.module_from_spec(spec)\n'
+                'sys.modules[spec.name] = module\n'
+                'spec.loader.exec_module(module)\n'
+                'def partial_restore(*args, **kwargs):\n'
+                '    Path(os.environ["CONFIG"]).write_text("mixed state\\n", encoding="utf-8")\n'
+                '    raise OSError("initial restore failed")\n'
+                'def failed_emergency_restore(*args, **kwargs):\n'
+                '    raise OSError("emergency restore failed")\n'
+                'module._restore_backup = partial_restore\n'
+                'module._restore_transaction_entries = failed_emergency_restore\n'
+                'raise SystemExit(module.main())\n', encoding="utf-8",
+            )
+            result = self._run_exit_after_failed_restore(
+                root, project, snapshot,
+                {"REAL_MANAGER": str(ROOT / "deploy/manage.py"), "CONFIG": str(config)},
+            )
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertIn("emergency restore failed", result.stderr)
+            self.assertIn("AdGuard left stopped", result.stderr)
+            calls = (root / "calls").read_text(encoding="utf-8").splitlines()
+            self.assertIn("stop adguardhome-doh", calls)
+            self.assertNotIn("start adguardhome-doh", calls)
+            markers = list((root / "var/backups/adguardhome-doh").glob(".restore-*/transaction.json"))
+            self.assertEqual(1, len(markers))
+            self.assertEqual("prepared", json.loads(markers[0].read_text(encoding="utf-8"))["state"])
+            self.assertEqual("mixed state\n", config.read_text(encoding="utf-8"))
+            self.assertTrue(snapshot.is_dir())
+
+    def test_early_restore_refusal_restarts_only_without_pending_transactions(self):
+        for unfinished in (False, True):
+            with self.subTest(unfinished=unfinished), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                created = subprocess.run(
+                    ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                     "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                     "--snapshot-operation", "recovery"], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(0, created.returncode, created.stderr)
+                snapshot = Path(created.stdout.strip())
+                (snapshot / "manifest.json").write_text("invalid manifest", encoding="utf-8")
+                if unfinished:
+                    marker = root / "var/backups/adguardhome-doh/.restore-previous/transaction.json"
+                    marker.parent.mkdir()
+                    marker.write_text(json.dumps({"version": 1, "state": "prepared", "entries": []}),
+                                      encoding="utf-8")
+                result = self._run_exit_after_failed_restore(root, ROOT, snapshot)
+                self.assertEqual(7, result.returncode, result.stderr)
+                self.assertIn("automatic restoration failed", result.stderr)
+                calls = (root / "calls").read_text(encoding="utf-8").splitlines()
+                self.assertIn("stop adguardhome-doh", calls)
+                self.assertEqual(not unfinished, "start adguardhome-doh" in calls)
+                if unfinished:
+                    self.assertIn("AdGuard left stopped", result.stderr)
+                    self.assertTrue(marker.is_file())
+
+    def test_activating_adguard_and_queued_start_are_stopped_before_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "etc/nginx/nginx.conf"
+            config.parent.mkdir(parents=True)
+            config.write_text("original configuration\n", encoding="utf-8")
+            created = subprocess.run(
+                ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                 "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                 "--snapshot-operation", "recovery"], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, created.returncode, created.stderr)
+            config.write_text("changed configuration\n", encoding="utf-8")
+            queued = root / "queued"
+            queued.touch()
+            project = root / "fake-project"
+            manager = project / "deploy/manage.py"
+            manager.parent.mkdir(parents=True)
+            manager.write_text(
+                'import os, runpy, sys\nfrom pathlib import Path\n'
+                'if Path(os.environ["QUEUED"]).exists():\n'
+                '    raise SystemExit("queued AdGuard job was not stopped")\n'
+                'runpy.run_path(os.environ["REAL_MANAGER"], run_name="__main__")\n',
+                encoding="utf-8",
+            )
+            systemctl_script = (
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                'case "$1" in show) echo loaded;; is-active) exit 3;; '
+                'is-enabled) echo disabled; exit 1;; '
+                'stop) [ "$2" != adguardhome-doh ] || rm -f "$QUEUED";; esac\nexit 0\n'
+            )
+            result = self._run_exit_after_failed_restore(
+                root, project, Path(created.stdout.strip()),
+                {"REAL_MANAGER": str(ROOT / "deploy/manage.py"), "QUEUED": str(queued)},
+                systemctl_script=systemctl_script, initial_agh_state="activating",
+            )
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertNotIn("automatic restoration failed", result.stderr)
+            self.assertFalse(queued.exists())
+            self.assertEqual("original configuration\n", config.read_text(encoding="utf-8"))
+            calls = (root / "calls").read_text(encoding="utf-8").splitlines()
+            self.assertIn("stop adguardhome-doh", calls)
+            self.assertIn("start adguardhome-doh", calls)
+            self.assertLess(calls.index("stop adguardhome-doh"), calls.index("start adguardhome-doh"))
+
+    def test_failed_adguard_stop_prevents_restore_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            project = root / "fake-project"
+            manager = project / "deploy/manage.py"
+            manager.parent.mkdir(parents=True)
+            manager.write_text(
+                'import os\nfrom pathlib import Path\n'
+                'Path(os.environ["INVOKED"]).touch()\n', encoding="utf-8",
+            )
+            invoked = root / "invoked"
+            systemctl_script = (
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+                'if [ "$1" = show ]; then echo loaded; exit 0; fi\n'
+                'if [ "$1" = stop ] && [ "$2" = adguardhome-doh ]; then exit 1; fi\nexit 0\n'
+            )
+            result = self._run_exit_after_failed_restore(
+                root, project, snapshot, {"INVOKED": str(invoked)}, systemctl_script=systemctl_script,
+            )
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertIn("failed to stop AdGuard; files were not restored", result.stderr)
+            self.assertFalse(invoked.exists())
+            calls = (root / "calls").read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("start adguardhome-doh", calls)
+
+    def test_early_refusal_returns_previously_activating_adguard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            created = subprocess.run(
+                ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                 "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                 "--snapshot-operation", "recovery"], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(0, created.returncode, created.stderr)
+            snapshot = Path(created.stdout.strip())
+            (snapshot / "manifest.json").write_text("invalid", encoding="utf-8")
+            result = self._run_exit_after_failed_restore(root, ROOT, snapshot, initial_agh_state="activating")
+            self.assertEqual(7, result.returncode, result.stderr)
+            self.assertIn("automatic restoration failed", result.stderr)
+            self.assertIn("start adguardhome-doh", (root / "calls").read_text(encoding="utf-8"))
+
+    def test_new_certbot_lineage_survives_failure_and_existing_profile_is_restored(self):
+        for previously_present in (False, True):
+            with self.subTest(previously_present=previously_present), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "etc/letsencrypt/renewal/dns.example.com.conf"
+                profile.parent.mkdir(parents=True)
+                old_profile = "[renewalparams]\nauthenticator = standalone\n"
+                if previously_present:
+                    profile.write_text(old_profile, encoding="utf-8")
+                create = subprocess.run(
+                    ["python3", str(ROOT / "deploy/manage.py"), "--create-update-backup",
+                     "--root", str(root), "--domain", "dns.example.com", "--target-version", "1.2.3",
+                     "--snapshot-operation", "recovery"], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(0, create.returncode, create.stderr)
+                issued = ("[renewalparams]\nauthenticator = webroot\n"
+                          "deploy_hook = systemctl reload nginx\n")
+                profile.write_text(issued, encoding="utf-8")
+                live = root / "etc/letsencrypt/live/dns.example.com"
+                live.mkdir(parents=True)
+                (live / "fullchain.pem").write_text("certificate\n", encoding="utf-8")
+                (live / "privkey.pem").write_text("private key\n", encoding="utf-8")
+                fake = root / "flock"
+                fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}")
+                script = (
+                    'source "$1"; PROJECT_ROOT="$2"; ROOT="$3"; DOMAIN=dns.example.com; '
+                    'ADGUARDHOME_DOH_SNAPSHOT="$4"; ADGUARDHOME_DOH_MUTATIONS=1; '
+                    'ADGUARDHOME_DOH_NEW_CERTBOT_LINEAGE=1; ADGUARDHOME_DOH_LOCK_HELD=1; '
+                    'ADGUARDHOME_DOH_RUNTIME_TOUCHED=0; trap adguardhome_doh_install_exit EXIT; exit 7'
+                )
+                result = subprocess.run(
+                    ["bash", "-c", script, "bash", str(ROOT / "deploy/lib/common.sh"),
+                     str(ROOT), str(root), create.stdout.strip()], env=env, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(7, result.returncode, result.stderr)
+                self.assertNotIn("automatic restoration failed", result.stderr)
+                self.assertEqual(old_profile if previously_present else issued, profile.read_text(encoding="utf-8"))
+                if not previously_present:
+                    retry = self.run_common(
+                        'adguardhome_doh_migrate_certbot_renewal "$1" dns.example.com /var/www/adguardhome-doh "$2"',
+                        str(root), str(ROOT),
+                    )
+                    self.assertEqual(0, retry.returncode, retry.stderr)
+                    self.assertTrue((root / "etc/letsencrypt/renewal-hooks/deploy/adguardhome-doh-reload").is_file())
+
+    def test_preflight_rejects_symlink_that_would_modify_an_unbacked_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os_release = root / "etc/os-release"
+            os_release.parent.mkdir(parents=True)
+            os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
+            target = root / "user-owned.conf"
+            target.write_text("preserve\n", encoding="utf-8")
+            nginx = root / "etc/nginx/nginx.conf"
+            nginx.parent.mkdir(parents=True)
+            nginx.symlink_to(target)
+            result = self.run_common(
+                'adguardhome_doh_preflight "$1" dns.example.com 203.0.113.10 0 0', directory
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("managed file is a symlink", result.stderr)
+            self.assertEqual("preserve\n", target.read_text(encoding="utf-8"))
+
+    def test_directory_permissions_are_restored_without_following_replaced_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "webroot"
+            path.mkdir(mode=0o755)
+            script = ('adguardhome_doh_capture_directory_permissions "$1"; chmod 700 "$1"; '
+                      'adguardhome_doh_restore_directory_permissions')
+            result = self.run_common(script, str(path))
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(0o755, path.stat().st_mode & 0o777)
+            target = Path(directory) / "target"
+            target.mkdir(mode=0o700)
+            script = ('adguardhome_doh_capture_directory_permissions "$1"; rmdir "$1"; '
+                      'ln -s "$2" "$1"; adguardhome_doh_restore_directory_permissions')
+            result = self.run_common(script, str(path), str(target))
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(0o700, target.stat().st_mode & 0o777)
+
+    def test_renderer_preflight_lock_and_health_start_order(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        self.assertLess(source.index("adguardhome_doh_render_dry_run\n"), source.index("apt-get"))
+        self.assertLess(source.index("adguardhome_doh_acquire_operation_lock ||"), source.index("adguardhome_doh_acquire_health_lock ||"))
+        self.assertLess(source.index("adguardhome_doh_pause_health ||"), source.index("--create-update-backup"))
+        self.assertLess(source.index("adguardhome_doh_acquire_health_lock ||"), source.index("--create-update-backup"))
+        self.assertLess(source.index("--create-update-backup"), source.index("apt-get"))
+        self.assertLess(source.rindex("systemctl reload nginx"), source.index("adguardhome_doh_release_health_lock\n"))
+        self.assertLess(source.index("adguardhome_doh_release_health_lock\n"), source.index("systemctl start adguardhome-doh-health.service"))
+        self.assertLess(source.index("systemctl start adguardhome-doh-health.service"), source.index("--finalize-update-backup"))
+        self.assertLess(source.index("--finalize-update-backup"), source.rindex("adguardhome_doh_release_operation_lock"))
+        self.assertIn("ADGUARDHOME_DOH_LOCK=/run/lock/adguardhome-doh-health.lock", source)
+
+    def test_punycode_hostname_and_invalid_symbols_use_renderer_rules(self):
+        base = ("--public-ip", "203.0.113.10", "--email", "admin@example.com", "--dry-run")
+        valid = self.run_install(*base, "--domain", "DNS.XN--P1AI")
+        self.assertEqual(0, valid.returncode, valid.stderr)
+        self.assertIn("https://dns.xn--p1ai/", valid.stdout)
+        for hostname in ("dns_.example.com", "dns.рф", "dns.example.1"):
+            invalid = self.run_install(*base, "--domain", hostname)
+            self.assertNotEqual(0, invalid.returncode, hostname)
 
 if __name__ == "__main__":
     unittest.main()

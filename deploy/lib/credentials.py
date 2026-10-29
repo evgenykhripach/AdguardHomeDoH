@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -92,15 +93,17 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=Path, required=True)
     parser.add_argument("--url")
-    parser.add_argument("--password")
+    passwords = parser.add_mutually_exclusive_group()
+    passwords.add_argument("--password")
+    passwords.add_argument("--password-stdin", action="store_true")
     parser.add_argument("--login", default=LOGIN)
     parser.add_argument("--read", action="store_true")
     parser.add_argument("--field", choices=FIELDS)
     args = parser.parse_args(argv)
 
     if args.read:
-        if args.url is not None or args.password is not None:
-            parser.error("--read cannot be combined with --url or --password")
+        if args.url is not None or args.password is not None or args.password_stdin:
+            parser.error("--read cannot be combined with --url or a password")
         values = read_credentials(args.path)
         if args.field:
             print(values[args.field])
@@ -110,10 +113,11 @@ def main(argv=None) -> int:
 
     if args.url is None:
         parser.error("--url is required unless --read is used")
-    password = args.password or generate_password()
+    password = sys.stdin.read() if args.password_stdin else (args.password or generate_password())
     value = write_credentials(args.path, args.url, password, args.login)
-    # Keep command output useful without printing a secret by default.
-    print(value["password"])
+    # stdin mode is intended for automation and never echoes the secret.
+    if not args.password_stdin:
+        print(value["password"])
     return 0
 
 

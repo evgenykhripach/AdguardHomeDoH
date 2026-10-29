@@ -2,8 +2,8 @@
 """Service-level health gate for the neutral AdGuard Home deployment.
 
 The policy file contains the enabled service set and the effective domain
-union.  Health is persisted by service ID, never by a domain: shared domains
-remain active while any selected healthy service owns them.
+union. Health is persisted by service ID, or by domain for compatibility
+policies. Shared domains remain active while any healthy owner remains.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import re
+import struct
 import subprocess
 import tempfile
 import time
@@ -38,7 +39,10 @@ FAILURE_THRESHOLD = int(os.environ.get("ADGUARDHOME_DOH_FAILURE_THRESHOLD", "5")
 MAX_CONCURRENT_PROBES = 8
 DOMAIN = os.environ.get("ADGUARDHOME_DOH_DOMAIN", "")
 TOKEN_FILE = Path(os.environ.get("ADGUARDHOME_DOH_TOKEN_FILE", "/var/lib/adguardhome-doh/doh-token"))
-HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z]{2,63}|xn--[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?)$"
+)
 # The RFC 8484 example query: A for www.example.com, base64url without padding.
 DOH_PROBE_QUERY = "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
 
@@ -52,6 +56,74 @@ def load_json(path: Path, fallback: Any) -> Any:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return fallback
+
+
+def load_policy(path: Path) -> Any:
+    """Read and validate policy before changing persisted state or rewrites."""
+
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(value, Mapping):
+        if "domains" not in value or not isinstance(value["domains"], list):
+            raise ValueError("invalid policy domains")
+        rows = value["domains"]
+        services = value.get("services", {})
+    elif isinstance(value, list):
+        rows, services = value, {}
+    else:
+        raise ValueError("invalid policy")
+
+    def valid_hosts(hosts: Any, *, empty_string: bool = False) -> bool:
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        if not isinstance(hosts, list):
+            return False
+        return all(isinstance(host, str) and (
+            (empty_string and not host) or HOST_RE.fullmatch(host.lower())
+        ) for host in hosts)
+
+    service_ids = set()
+    if isinstance(services, Mapping):
+        service_entries = services.items()
+    elif isinstance(services, list):
+        if not all(isinstance(item, Mapping) for item in services):
+            raise ValueError("invalid policy services")
+        service_entries = ((item.get("id", item.get("service_id")), item) for item in services)
+    else:
+        raise ValueError("invalid policy services")
+    for service_id, hosts in service_entries:
+        if not isinstance(service_id, str) or not service_id or service_id in service_ids:
+            raise ValueError("invalid policy service ID")
+        service_ids.add(service_id)
+        if isinstance(hosts, Mapping):
+            if "probes" not in hosts and "hosts" not in hosts:
+                raise ValueError("invalid policy service probes")
+            hosts = hosts.get("probes", hosts.get("hosts"))
+        if not valid_hosts(hosts):
+            raise ValueError("invalid policy service probes")
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("invalid policy domain")
+        domain = row.get("domain")
+        if not isinstance(domain, str) or not HOST_RE.fullmatch(domain.lower()):
+            raise ValueError("invalid policy domain")
+        if row.get("kind") not in ("fqdn", "suffix"):
+            raise ValueError("invalid policy domain kind")
+        for key in ("probe", "probes"):
+            if key in row and not valid_hosts(row[key], empty_string=True):
+                raise ValueError("invalid policy domain probes")
+        owners = row.get("services", row.get("service_ids"))
+        if owners is None and row.get("service_id") is not None:
+            owners = [row["service_id"]]
+        if owners is None:
+            owners = []
+        if isinstance(owners, str):
+            owners = [owners]
+        if not isinstance(owners, list) or not all(
+            isinstance(owner, str) and owner in service_ids for owner in owners
+        ) or (service_ids and not owners):
+            raise ValueError("invalid policy domain owners")
+    return value
 
 
 def save_json(path: Path, value: Any) -> None:
@@ -110,13 +182,13 @@ def service_probe_map(policy: Any) -> Dict[str, Tuple[str, ...]]:
     result: Dict[str, set] = {}
     if isinstance(policy, Mapping):
         services = policy.get("services", {})
-        if isinstance(services, Mapping):
+        if isinstance(services, Mapping) and services:
             for service_id, value in services.items():
                 result[str(service_id)] = set(_as_hosts(value))
             # The service map is authoritative for the catalog format.  Domain
             # ownership rows describe rewrite coverage, not extra TLS probes.
             return {service_id: tuple(sorted(hosts)) for service_id, hosts in sorted(result.items())}
-        elif isinstance(services, Sequence):
+        elif isinstance(services, Sequence) and not isinstance(services, str) and services:
             for item in services:
                 if isinstance(item, Mapping):
                     service_id = item.get("id", item.get("service_id"))
@@ -135,11 +207,14 @@ def service_probe_map(policy: Any) -> Dict[str, Tuple[str, ...]]:
             service_ids = [row["service_id"]]
         if isinstance(service_ids, str):
             service_ids = [service_ids]
+        if not service_ids:
+            service_ids = [row.get("domain", "")]
         if not isinstance(service_ids, Sequence):
             continue
-        hosts = _as_hosts(row.get("probes", row.get("probe", row.get("domain", ""))))
+        hosts = _as_hosts(row.get("probes") or row.get("probe") or row.get("domain", ""))
         for service_id in service_ids:
-            result.setdefault(str(service_id), set()).update(hosts)
+            if service_id:
+                result.setdefault(str(service_id), set()).update(hosts)
 
     # Every service needs an actual probe.  A malformed/empty service remains
     # unhealthy instead of becoming healthy by vacuous truth.
@@ -152,14 +227,16 @@ def probe(host: str) -> bool:
     try:
         result = subprocess.run(
             ["/usr/bin/timeout", "8", "/usr/bin/openssl", "s_client", "-brief",
-             "-connect", "127.0.0.1:443", "-servername", host],
+             "-connect", "127.0.0.1:443", "-servername", host,
+             "-verify_hostname", host, "-verify_return_error"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
     text = result.stdout.decode("utf-8", "replace")
-    return result.returncode == 0 and "Protocol version:" in text and "Peer certificate" in text
+    return (result.returncode == 0 and "Protocol version:" in text
+            and "Peer certificate" in text and "Verification: OK" in text)
 
 
 def doh_probe_target(domain: str = DOMAIN, token_file: Path = TOKEN_FILE) -> Optional[Tuple[str, str]]:
@@ -175,6 +252,97 @@ def doh_probe_target(domain: str = DOMAIN, token_file: Path = TOKEN_FILE) -> Opt
     if not re.fullmatch(r"[a-f0-9]{32,64}", token):
         return None
     return domain, token
+
+
+def _valid_doh_answer(message: bytes) -> bool:
+    """Validate the response to the fixed A query, including compressed names."""
+
+    if len(message) < 12 or len(message) > 65535:
+        return False
+
+    def name_at(offset: int) -> Tuple[Tuple[bytes, ...], int]:
+        labels = []
+        end = None
+        visited = set()
+        while True:
+            if offset >= len(message) or offset in visited:
+                raise ValueError("invalid DNS name")
+            visited.add(offset)
+            length = message[offset]
+            if length & 0xc0 == 0xc0:
+                if offset + 1 >= len(message):
+                    raise ValueError("truncated DNS pointer")
+                if end is None:
+                    end = offset + 2
+                target = ((length & 0x3f) << 8) | message[offset + 1]
+                if target >= offset:
+                    raise ValueError("invalid DNS pointer")
+                offset = target
+                continue
+            if length & 0xc0 or length > 63:
+                raise ValueError("invalid DNS label")
+            offset += 1
+            if not length:
+                break
+            if offset + length > len(message):
+                raise ValueError("truncated DNS label")
+            labels.append(message[offset:offset + length])
+            if sum(len(label) + 1 for label in labels) > 254:
+                raise ValueError("DNS name too long")
+            offset += length
+        return tuple(label.lower() for label in labels), end if end is not None else offset
+
+    try:
+        transaction_id, flags, qdcount, ancount, nscount, arcount = struct.unpack_from("!6H", message)
+        if (transaction_id != 0 or not flags & 0x8000 or flags & 0x7800
+                or flags & 0x0200 or flags & 0x000f or qdcount != 1 or not ancount):
+            return False
+        name, offset = name_at(12)
+        if offset + 4 > len(message):
+            return False
+        qtype, qclass = struct.unpack_from("!HH", message, offset)
+        query_name = (b"www", b"example", b"com")
+        if name != query_name or qtype != 1 or qclass != 1:
+            return False
+        offset += 4
+        aliases: Dict[Tuple[bytes, ...], set] = {}
+        addresses = set()
+        for index in range(ancount + nscount + arcount):
+            owner, offset = name_at(offset)
+            if offset + 10 > len(message):
+                return False
+            record_type, record_class, ttl, length = struct.unpack_from("!HHIH", message, offset)
+            offset += 10
+            end = offset + length
+            if end > len(message):
+                return False
+            # EDNS carries the high bits of the response code in OPT's TTL.
+            if index >= ancount + nscount and record_type == 41 and ttl >> 24:
+                return False
+            if index < ancount and record_class == 1:
+                if record_type == 1:
+                    if length != 4:
+                        return False
+                    addresses.add(owner)
+                elif record_type == 5:
+                    target, name_end = name_at(offset)
+                    if name_end != end:
+                        return False
+                    aliases.setdefault(owner, set()).add(target)
+            offset = end
+        if offset != len(message):
+            return False
+        pending, visited = [query_name], set()
+        while pending:
+            owner = pending.pop()
+            if owner in addresses:
+                return True
+            if owner not in visited:
+                visited.add(owner)
+                pending.extend(aliases.get(owner, ()))
+        return False
+    except (ValueError, struct.error):
+        return False
 
 
 def probe_doh(
@@ -194,29 +362,35 @@ def probe_doh(
     between the phone and this host.
     """
 
+    if not HOST_RE.fullmatch(domain) or not re.fullmatch(r"[a-f0-9]{32,64}", token):
+        return False
     command = [
-        "/usr/bin/curl", "--silent", "--show-error",
+        "/usr/bin/curl", "--disable", "--silent", "--show-error",
+        "--noproxy", "*", "--config", "-",
         "--resolve", "%s:443:127.0.0.1" % domain,
         "--connect-timeout", "3", "--max-time", "8",
+        "--max-filesize", "65535",
         "--header", "accept: application/dns-message",
-        "--output", "/dev/null", "--write-out", "%{http_code} %{content_type}",
-        "https://%s/doh/%s?dns=%s" % (domain, token, DOH_PROBE_QUERY),
+        "--output", "-", "--write-out", "\n%{http_code} %{content_type}",
     ]
+    config = ('url = "https://%s/doh/%s?dns=%s"\n' % (domain, token, DOH_PROBE_QUERY)).encode("ascii")
     for attempt in range(max(1, int(attempts))):
         if attempt:
             time.sleep(delay)
         try:
             result = runner(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, timeout=10, check=False,
+                command, input=config, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=10, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
-        output = result.stdout or b""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", "replace")
-        fields = str(output).strip().split()
-        if fields and fields[0] == "200" and "application/dns-message" in " ".join(fields[1:]):
+        if result.returncode != 0 or not isinstance(result.stdout, bytes):
+            continue
+        body, separator, metadata = result.stdout.rpartition(b"\n")
+        fields = metadata.decode("ascii", "replace").split(None, 1)
+        if (separator and len(fields) == 2 and fields[0] == "200"
+                and fields[1].split(";", 1)[0].strip().lower() == "application/dns-message"
+                and _valid_doh_answer(body)):
             return True
     return False
 
@@ -444,14 +618,13 @@ def reconcile(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP)
 def is_global_failure(results: Mapping[str, bool]) -> bool:
     """Report whether every probed service failed in the same cycle.
 
-    Services fail independently; they do not all break at the same second.  A
-    clean sweep means the fault is local - nginx down, the resolver dead, the
-    host's uplink gone - and withdrawing every rewrite in response would only
-    push clients onto addresses this server exists to reroute, for as long as
-    they cache them.  The gate therefore holds its previous state instead.
+    A clean sweep may reflect a local fault, such as nginx or the host uplink.
+    Preserve the prior health states to avoid withdrawing every rewrite. With
+    one service this also preserves its rewrite during a remote-only outage;
+    these cases cannot be distinguished without an independent signal.
     """
 
-    return len(results) > 1 and not any(results.values())
+    return bool(results) and not any(results.values())
 
 
 def run_once(
@@ -463,9 +636,9 @@ def run_once(
     reconcile_func: Optional[Callable[[Any, Mapping[str, Any], str], Tuple[int, int]]] = None,
     doh_probe_func: Optional[Callable[[], Optional[bool]]] = None,
 ) -> Dict[str, int]:
-    policy = load_json(policy_path, {})
-    old = load_json(state_path, {})
     with health_lock(lock_path):
+        policy = load_policy(policy_path)
+        old = load_json(state_path, {})
         results = probe_services(policy, probe_func=probe_func)
         doh_ok = _doh_self_probe(doh_probe_func)
         global_failure = is_global_failure(results)
@@ -477,6 +650,7 @@ def run_once(
                     "successes": 0,
                     "failures": int(old.get(service_id, {}).get("failures", 0) or 0)
                     if isinstance(old, Mapping) else 0,
+                    "probe_uncertain": True,
                 }
                 for service_id in sorted(results)
             }

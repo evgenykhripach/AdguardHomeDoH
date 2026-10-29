@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optio
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _RELEASES_MODULE = None
+_HEALTHCHECK_MODULES: Dict[Path, Any] = {}
 MENU_ENTRIES = (
     "Данные доступа",
     "Сервисы и домены",
@@ -121,7 +126,24 @@ def _is_yes_answer(value: str) -> bool:
     normalized = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", normalized)
     normalized = "".join(char for char in normalized if char not in INVISIBLE_INPUT)
     return normalized.casefold() in YES_ANSWERS
-MANAGED_FILES = (
+
+
+def _front_mode(state: Mapping[str, Any]) -> str:
+    if "front" not in state:
+        return "standard"
+    if state["front"] == "mtproxyl":
+        return "mtproxyl"
+    raise RuntimeError("unsupported front mode")
+
+
+def _require_front_files(root: Path) -> None:
+    for relative in (MT_PROXY_SNI_MAP, PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT) + FRONT_OVERLAY_FILES:
+        path = under_root(root, relative)
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError("файл общего front отсутствует или небезопасен: %s" % relative)
+
+
+LEGACY_FULL_FILES = (
     "/opt/AdGuardHome/AdGuardHome",
     "/opt/AdGuardHome/AdGuardHome.yaml",
     "/etc/nginx/sites-enabled/adguardhome-doh",
@@ -142,6 +164,102 @@ MANAGED_FILES = (
     "/usr/local/libexec/adguardhome-doh/VERSION",
     "/usr/local/sbin/adguardhome-doh",
 )
+LEGACY_NO_BINARY_FILES = LEGACY_FULL_FILES[1:]
+
+# New snapshots record individual installer-owned files, not whole directories.
+# This preserves unrelated files added to those directories after a snapshot.
+MT_PROXY_SNI_MAP = "/etc/adguardhome-doh/mtproxyl-sni.map"
+PRIVATE_NGINX_CONFIG = "/etc/adguardhome-doh/mtproxyl-nginx.conf"
+PRIVATE_NGINX_UNIT = "/etc/systemd/system/adguardhome-doh-nginx.service"
+MTPROXY_NGINX_BINARY = "/opt/mtproxyl-nginx/sbin/nginx"
+MTPROXY_NGINX_CONFIG = "/opt/mtproxyl-nginx/conf/nginx.conf"
+FRONT_OVERLAY_FILES = (
+    "/usr/local/libexec/adguardhome-doh/mtproxyl_front.py",
+    "/etc/adguardhome-doh/mtproxyl-http.conf",
+    "/etc/systemd/system/mtproxyl-pq-nginx.service.d/adguardhome-doh.conf",
+)
+FRONT_MANAGED_FILES = (
+    MT_PROXY_SNI_MAP,
+    PRIVATE_NGINX_CONFIG,
+    PRIVATE_NGINX_UNIT,
+    "/etc/systemd/system/multi-user.target.wants/adguardhome-doh-nginx.service",
+) + FRONT_OVERLAY_FILES
+SYSTEM_NGINX_FILES = (
+    "/etc/nginx/nginx.conf",
+    "/etc/systemd/system/nginx.service.d/adguardhome-doh.conf",
+    "/etc/systemd/system/multi-user.target.wants/nginx.service",
+)
+MANAGED_FILES = tuple(
+    path for path in LEGACY_FULL_FILES
+    if path not in {
+        "/etc/adguardhome-doh/catalog", "/var/www/adguardhome-doh",
+        "/usr/local/libexec/adguardhome-doh",
+    }
+) + tuple("/etc/adguardhome-doh/catalog/" + name for name in (
+    "services.csv", "domains.csv", "service-domains.csv", "service-probes.csv",
+)) + tuple("/usr/local/libexec/adguardhome-doh/" + name for name in (
+    "healthcheck.py", "render_config.py", "render_runtime.py", "releases.py",
+    "certbot_renewal.py",
+)) + (
+    "/usr/local/sbin/adguardhome-doh-diag",
+    "/var/lib/adguardhome-doh/install-complete",
+    "/etc/nginx/nginx.conf",
+    "/etc/systemd/system/nginx.service.d/adguardhome-doh.conf",
+    "/etc/sysctl.d/90-adguardhome-doh.conf",
+    "/etc/modules-load.d/adguardhome-doh.conf",
+    "/etc/logrotate.d/adguardhome-doh",
+    "/etc/letsencrypt/renewal-hooks/deploy/adguardhome-doh-reload",
+    "/etc/adguardhome-doh/compat-policy.csv",
+    "/etc/systemd/system/multi-user.target.wants/adguardhome-doh.service",
+    "/etc/systemd/system/multi-user.target.wants/nginx.service",
+    "/etc/systemd/system/timers.target.wants/adguardhome-doh-health.timer",
+) + FRONT_MANAGED_FILES
+HEALTH_LOCK = "/run/lock/adguardhome-doh-health.lock"
+OPERATION_LOCK = "/run/lock/adguardhome-doh-operations.lock"
+BACKUP_VERSION = 4
+BACKUP_WITH_OWNERS_VERSION = 3
+BACKUP_WITHOUT_OWNERS_VERSION = 2
+BACKUP_OPERATIONS = {"update", "service-change", "recovery", "manual"}
+
+
+class _FileRecoveryError(RuntimeError):
+    """Previous files could not be restored and runtime may be inconsistent."""
+
+
+class _StopBeforeRestoreError(_FileRecoveryError):
+    """AdGuard may still be running, so the saved files were not restored."""
+
+
+class _FrontRecoveryError(_FileRecoveryError):
+    """The previously active MTProxy map could not be reloaded."""
+
+
+@contextlib.contextmanager
+def health_lock(root: Path = Path("/")):
+    """Serialize mutations with the health worker and installer."""
+
+    path = under_root(Path(root), HEALTH_LOCK)
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with path.open("a+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def operation_lock(root: Path = Path("/")):
+    """Serialize the whole manager operation with installer activation."""
+
+    path = under_root(Path(root), OPERATION_LOCK)
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with path.open("a+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def under_root(root: Path, path: str) -> Path:
@@ -167,7 +285,6 @@ def _write_json(path: Path, value: Any) -> None:
             json.dump(value, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
         os.replace(temporary, path)
-        os.chmod(path, 0o600)
     finally:
         try:
             os.unlink(temporary)
@@ -183,6 +300,19 @@ def _copy_path(source: Path, destination: Path) -> None:
         shutil.copytree(source, destination, symlinks=True)
     else:
         shutil.copy2(source, destination, follow_symlinks=False)
+    _preserve_owners(source, destination)
+
+
+def _preserve_owners(source: Path, destination: Path) -> None:
+    source_stat = source.lstat()
+    destination_stat = destination.lstat()
+    if (source_stat.st_uid, source_stat.st_gid) != (destination_stat.st_uid, destination_stat.st_gid):
+        os.chown(destination, source_stat.st_uid, source_stat.st_gid, follow_symlinks=False)
+        # chown can clear permission bits; restore the source metadata.
+        shutil.copystat(source, destination, follow_symlinks=False)
+    if source.is_dir() and not source.is_symlink():
+        for child in source.iterdir():
+            _preserve_owners(child, destination / child.name)
 
 
 def _remove_path(path: Path) -> None:
@@ -195,24 +325,105 @@ def _remove_path(path: Path) -> None:
             pass
 
 
-def create_backup(root: Path = Path("/"), backup_dir: Optional[Path] = None) -> Path:
-    """Copy every managed file and record absent paths before activation."""
+def _valid_domain(domain: str) -> bool:
+    labels = domain.split(".")
+    return bool(domain and len(domain) <= 253 and all(
+        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    ))
+
+
+def _managed_paths(domain: str = "", *, include_pre_webroot: bool = True,
+                   include_front_map: bool = True) -> Tuple[str, ...]:
+    managed = MANAGED_FILES if include_front_map else tuple(
+        path for path in MANAGED_FILES if path not in FRONT_MANAGED_FILES
+    )
+    if not domain:
+        return managed
+    if not _valid_domain(domain):
+        raise RuntimeError("invalid backup domain")
+    paths = managed + (
+        "/etc/letsencrypt/renewal/%s.conf" % domain,
+        "/var/www/adguardhome-doh/%s.mobileconfig" % domain,
+    )
+    if include_pre_webroot:
+        paths += ("/etc/letsencrypt/renewal/%s.conf.pre-webroot" % domain,)
+    return paths
+
+
+def _path_digest(path: Path, *, include_owners: bool = True) -> str:
+    """Hash file bytes, directory members, symlinks, permissions and owners."""
+
+    digest = hashlib.sha256()
+
+    def visit(current: Path, name: str) -> None:
+        stat = current.lstat()
+        digest.update((name + "\0" + oct(stat.st_mode & 0o7777) + "\0").encode())
+        if include_owners:
+            digest.update(("%d:%d\0" % (stat.st_uid, stat.st_gid)).encode())
+        if current.is_symlink():
+            digest.update(b"link\0" + os.fsencode(os.readlink(current)))
+        elif current.is_dir():
+            digest.update(b"directory\0")
+            for child in sorted(current.iterdir(), key=lambda item: item.name):
+                visit(child, name + "/" + child.name)
+        elif current.is_file():
+            digest.update(b"file\0")
+            with current.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            raise RuntimeError("unsupported backup file type: %s" % current)
+
+    visit(Path(path), "")
+    return digest.hexdigest()
+
+
+def create_backup(
+    root: Path = Path("/"), backup_dir: Optional[Path] = None, *,
+    operation: str = "manual", target_version: str = "", domain: str = "",
+) -> Path:
+    """Copy installer-owned paths and record integrity and operation metadata."""
 
     root = Path(root)
+    if operation not in BACKUP_OPERATIONS:
+        raise RuntimeError("invalid backup operation")
+    if not domain:
+        state = _read_json(under_root(root, "/var/lib/adguardhome-doh/install.json"), {})
+        domain = str(state.get("domain", "")) if isinstance(state, Mapping) else ""
+    paths = _managed_paths(domain)
     if backup_dir is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup_dir = under_root(root, "/var/backups/adguardhome-doh") / timestamp
     backup_dir = Path(backup_dir)
     backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     manifest = []
-    for index, relative in enumerate(MANAGED_FILES):
+    for index, relative in enumerate(paths):
         source = under_root(root, relative)
         destination = backup_dir / ("%03d-%s" % (index, Path(relative).name))
         present = source.exists() or source.is_symlink()
-        manifest.append({"path": relative, "backup": destination.name, "present": present})
+        entry = {"path": relative, "backup": destination.name, "present": present}
         if present:
+            if source.is_dir() and not source.is_symlink():
+                raise RuntimeError("managed file is a directory: %s" % relative)
             _copy_path(source, destination)
-    _write_json(backup_dir / "manifest.json", manifest)
+            entry["sha256"] = _path_digest(destination)
+            if entry["sha256"] != _path_digest(source):
+                raise RuntimeError("backup source changed while copying: %s" % relative)
+        manifest.append(entry)
+    version_path = under_root(root, "/usr/local/libexec/adguardhome-doh/VERSION")
+    try:
+        version_before = version_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        version_before = ""
+    document = {
+        "version": BACKUP_VERSION, "operation": operation, "domain": domain,
+        "version_before": version_before, "version_after": target_version,
+        "files": manifest,
+    }
+    if operation == "update":
+        document["status"] = "pending"
+    _write_json(backup_dir / "manifest.json", document)
     return backup_dir
 
 
@@ -221,19 +432,44 @@ def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
     if not manifest_path.is_file():
         raise RuntimeError("backup manifest is missing")
     manifest = _read_json(manifest_path, None)
-    if not isinstance(manifest, list) or not manifest:
+    legacy = isinstance(manifest, list)
+    if legacy:
+        items = manifest
+        expected = None
+        version = 0
+    elif isinstance(manifest, Mapping):
+        version = manifest.get("version")
+        if (version not in (BACKUP_VERSION, BACKUP_WITH_OWNERS_VERSION, BACKUP_WITHOUT_OWNERS_VERSION)
+                or manifest.get("operation") not in BACKUP_OPERATIONS
+                or not isinstance(manifest.get("domain"), str)
+                or not isinstance(manifest.get("version_before"), str)
+                or not isinstance(manifest.get("version_after"), str)):
+            raise RuntimeError("backup manifest is invalid")
+        if manifest.get("operation") == "update":
+            allowed = ({"pending", "applied"} if version >= BACKUP_WITH_OWNERS_VERSION
+                       else {None, "pending", "applied"})
+            if manifest.get("status") not in allowed:
+                raise RuntimeError("backup manifest is invalid")
+        expected = set(_managed_paths(
+            manifest["domain"], include_pre_webroot=version >= BACKUP_WITH_OWNERS_VERSION,
+            include_front_map=version >= BACKUP_VERSION,
+        ))
+        items = manifest.get("files")
+    else:
+        raise RuntimeError("backup manifest is invalid")
+    if not isinstance(items, list) or not items:
         raise RuntimeError("backup manifest is invalid")
 
     entries = []
     seen_paths = set()
     seen_backups = set()
-    for item in manifest:
+    for item in items:
         if not isinstance(item, Mapping):
             raise RuntimeError("backup manifest is invalid")
         relative = item.get("path")
         if (
             not isinstance(relative, str)
-            or relative not in MANAGED_FILES
+            or relative not in (set(LEGACY_FULL_FILES) if legacy else expected)
             or relative in seen_paths
         ):
             raise RuntimeError("backup manifest is invalid")
@@ -256,17 +492,56 @@ def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
         backup = Path(backup_dir) / backup_name
         if present and not (backup.exists() or backup.is_symlink()):
             raise RuntimeError("backup manifest is incomplete")
+        if present:
+            try:
+                actual = _path_digest(backup, include_owners=version >= BACKUP_WITH_OWNERS_VERSION)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("backup data is unreadable") from exc
+            if not legacy and (not isinstance(item.get("sha256"), str)
+                               or actual != item["sha256"]):
+                raise RuntimeError("backup checksum mismatch: %s" % relative)
+        elif not legacy and "sha256" in item:
+            raise RuntimeError("backup manifest is invalid")
         entries.append((relative, backup_name, present))
-    if seen_paths != set(MANAGED_FILES):
+    known_legacy = (set(LEGACY_FULL_FILES), set(LEGACY_NO_BINARY_FILES))
+    previous_v4 = (version == BACKUP_VERSION and seen_paths == expected - set(FRONT_OVERLAY_FILES))
+    if (legacy and seen_paths not in known_legacy) or (not legacy and seen_paths != expected and not previous_v4):
         raise RuntimeError("backup manifest is incomplete")
     return entries
 
 
-def _restore_backup(backup_dir: Path, root: Path = Path("/")) -> None:
+def _restore_targets(backup_dir: Path, root: Path) -> list[Tuple[Path, Path, bool]]:
     entries = _validated_backup_manifest(backup_dir)
+    legacy = isinstance(_read_json(Path(backup_dir) / "manifest.json", None), list)
+    targets = []
     for relative, backup_name, present in entries:
         target = under_root(root, relative)
         backup = Path(backup_dir) / backup_name
+        legacy_directory = legacy and relative in {
+            "/etc/adguardhome-doh/catalog", "/var/www/adguardhome-doh",
+            "/usr/local/libexec/adguardhome-doh",
+        }
+        if legacy_directory and not present:
+            continue
+        if legacy_directory and backup.is_dir() and not backup.is_symlink():
+            # Only overwrite files actually recorded in the old snapshot;
+            # later additions and unrelated files survive.
+            for child in sorted(backup.rglob("*")):
+                if child.is_symlink() or not child.is_dir():
+                    targets.append((target / child.relative_to(backup), child, True))
+        else:
+            targets.append((target, backup, present))
+    return targets
+
+
+def _restore_backup(backup_dir: Path, root: Path = Path("/"), *,
+                    skip_targets: Iterable[Path] = ()) -> None:
+    skipped = set(skip_targets)
+    for target, backup, present in _restore_targets(backup_dir, root):
+        if target in skipped:
+            continue
+        if target.is_dir() and not target.is_symlink():
+            raise RuntimeError("refusing to replace a directory with a managed file: %s" % target)
         if present:
             _remove_path(target)
             _copy_path(backup, target)
@@ -280,7 +555,7 @@ def _atomic_copy(source: Path, target: Path) -> None:
     os.close(fd)
     temporary_path = Path(temporary)
     try:
-        shutil.copy2(source, temporary_path)
+        _copy_path(source, temporary_path)
         os.replace(temporary_path, target)
     finally:
         try:
@@ -289,11 +564,53 @@ def _atomic_copy(source: Path, target: Path) -> None:
             pass
 
 
+def _check_incomplete_transactions(root: Path) -> None:
+    backup_root = under_root(root, "/var/backups/adguardhome-doh")
+    if not backup_root.is_dir():
+        return
+    for marker in backup_root.glob("*/transaction.json"):
+        transaction = _read_json(marker, None)
+        # Historical transaction.json lists were left behind even after
+        # success, so they cannot establish whether an operation completed.
+        if isinstance(transaction, list):
+            continue
+        if not isinstance(transaction, Mapping) or transaction.get("version") != 1:
+            raise RuntimeError("unrecognised transaction marker: %s" % marker)
+        if transaction.get("state") not in {"committed", "restored"}:
+            raise RuntimeError("unfinished transaction requires manual recovery: %s" % marker)
+
+
+def _restore_transaction_entries(entries: Sequence[Tuple[Path, Path, bool]]) -> None:
+    for target, backup, present in reversed(entries):
+        if target.is_dir() and not target.is_symlink() and not (present and backup.is_dir()):
+            raise RuntimeError("refusing to replace a directory with a managed file: %s" % target)
+        if present:
+            if backup.is_dir() and not backup.is_symlink():
+                if target.is_symlink() or (target.exists() and not target.is_dir()):
+                    _remove_path(target)
+                shutil.copytree(backup, target, symlinks=True, dirs_exist_ok=True)
+                _preserve_owners(backup, target)
+            else:
+                _remove_path(target)
+                _copy_path(backup, target)
+        else:
+            _remove_path(target)
+
+
+def _transaction_marker(path: Path, state: str, entries: Sequence[Tuple[Path, Path, bool]]) -> None:
+    _write_json(path, {
+        "version": 1, "state": state,
+        "entries": [{"target": str(target), "backup": backup.name, "present": present}
+                    for target, backup, present in entries],
+    })
+
+
 def activate_transaction(
     targets: Mapping[Path, Path],
     backup_dir: Path,
     *,
     validate: Optional[Callable[[], None]] = None,
+    on_failure: Optional[Callable[[], None]] = None,
     root: Path = Path("/"),
 ) -> Path:
     """Back up, atomically activate staged files, validate, and restore on error."""
@@ -311,23 +628,30 @@ def activate_transaction(
         entries.append((target, stage, backup, present))
         if present:
             _copy_path(target, backup)
-    _write_json(
-        backup_dir / "transaction.json",
-        [{"target": str(target), "backup": backup.name, "present": present}
-         for target, _stage, backup, present in entries],
-    )
+    saved = [(target, backup, present) for target, _stage, backup, present in entries]
+    marker = backup_dir / "transaction.json"
+    _transaction_marker(marker, "prepared", saved)
     try:
         for target, stage, _backup, _present in entries:
             _atomic_copy(stage, target)
         if validate is not None:
             validate()
-    except Exception:
-        for target, _stage, backup, present in reversed(entries):
-            if present:
-                _remove_path(target)
-                _copy_path(backup, target)
-            else:
-                _remove_path(target)
+        _transaction_marker(marker, "committed", saved)
+    except BaseException as original:
+        if on_failure is not None:
+            try:
+                on_failure()
+            except BaseException as stop_error:
+                raise _StopBeforeRestoreError(
+                    "activation failed; cannot stop AdGuard before restoring files: %s; "
+                    "transaction remains pending at %s" % (stop_error, marker)
+                ) from original
+        try:
+            _restore_transaction_entries(saved)
+            _transaction_marker(marker, "restored", saved)
+        except BaseException as restore_error:
+            raise _FileRecoveryError("activation failed; restoring previous files also failed: %s"
+                                     % restore_error) from original
         raise
     return backup_dir
 
@@ -339,7 +663,7 @@ def smoke_https_sni(
     """Verify the local public TLS path using the installation domain as SNI."""
 
     command = [
-        "curl", "--fail", "--silent", "--show-error",
+        "curl", "--fail", "--silent", "--show-error", "--noproxy", "*",
         "--resolve", "%s:443:127.0.0.1" % domain,
         "--connect-timeout", "3", "--max-time", "8",
         "--output", "/dev/null", "https://%s/" % domain,
@@ -358,6 +682,40 @@ def smoke_https_sni(
     ) from last_error
 
 
+def _load_healthcheck(root: Path) -> Any:
+    """Keep the current probe in memory across a rollback of its installed file."""
+
+    path = under_root(root, "/usr/local/libexec/adguardhome-doh/healthcheck.py")
+    if path in _HEALTHCHECK_MODULES:
+        return _HEALTHCHECK_MODULES[path]
+    if not path.is_file():
+        raise RuntimeError("DoH health probe is unavailable")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("adguardhome_doh_health_probe", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("DoH health probe is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, "probe_doh", None)):
+        raise RuntimeError("DoH health probe is unavailable")
+    _HEALTHCHECK_MODULES[path] = module
+    return module
+
+
+def smoke_doh(
+    root: Path, domain: str, *, runner: Callable[..., Any] = subprocess.run,
+    attempts: int = 3, delay: int = 2,
+) -> None:
+    try:
+        token = _runtime_paths(root)["token"].read_text(encoding="utf-8").strip()
+        probe = _load_healthcheck(root).probe_doh
+        ok = probe(domain, token, runner=runner, attempts=attempts, delay=delay)
+    except Exception:
+        raise RuntimeError("DoH smoke check failed") from None
+    if not ok:
+        raise RuntimeError("DoH smoke check failed")
+
+
 def reload_runtime_services(
     root: Path = Path("/"), domain: str = "",
     runner: Callable[..., Any] = subprocess.run,
@@ -369,36 +727,242 @@ def reload_runtime_services(
         return
     if not domain:
         raise RuntimeError("installation domain is unavailable")
+    state = _read_json(_runtime_paths(Path(root))["install"], {})
+    if not isinstance(state, Mapping):
+        raise RuntimeError("install state is unavailable")
+    front = _front_mode(state)
     runner(["systemctl", "restart", "adguardhome-doh"], check=True)
-    runner(["systemctl", "reload", "nginx"], check=True)
-    smoke_https_sni(
-        domain, runner=runner, attempts=smoke_attempts, delay=smoke_delay
-    )
+    if front == "mtproxyl":
+        runner(["systemctl", "reload", "adguardhome-doh-nginx"], check=True)
+        smoke_doh(root, domain, runner=runner, attempts=smoke_attempts, delay=smoke_delay)
+    else:
+        runner(["systemctl", "reload", "nginx"], check=True)
+        smoke_https_sni(
+            domain, runner=runner, attempts=smoke_attempts, delay=smoke_delay
+        )
+
+
+def _stop_adguard(root: Path, runner: Optional[Callable[..., Any]] = None) -> None:
+    if Path(root) == Path("/"):
+        (runner or subprocess.run)(["systemctl", "stop", "adguardhome-doh"], check=True)
+
+
+def _recover_runtime_after_failure(
+    root: Path, domain: str, original: BaseException,
+    runner: Optional[Callable[..., Any]] = None,
+) -> None:
+    if Path(root) != Path("/"):
+        return
+    if isinstance(original, _StopBeforeRestoreError):
+        raise RuntimeError("%s; AdGuard may still be running and previous files were not restored"
+                           % original) from original
+    if isinstance(original, _FrontRecoveryError):
+        raise RuntimeError("%s; AdGuard left stopped because MTProxy recovery failed"
+                           % original) from original
+    if isinstance(original, _FileRecoveryError):
+        raise RuntimeError("%s; AdGuard left stopped because files could not be restored"
+                           % original) from original
+    runner = runner or subprocess.run
+    try:
+        if domain:
+            reload_runtime_services(root, domain, runner=runner)
+        else:
+            runner(["systemctl", "start", "adguardhome-doh"], check=True)
+    except BaseException as recovery_error:
+        raise RuntimeError("operation failed; restoring previous runtime also failed: %s"
+                           % recovery_error) from original
+
+
+def _validate_staged_adguard(
+    root: Path, yaml_path: Path, binary_path: Path,
+    runner: Callable[..., Any] = subprocess.run,
+) -> None:
+    if not yaml_path.is_file():
+        raise RuntimeError("staged AdGuard configuration is missing")
+    if Path(root) != Path("/"):
+        # Isolated roots do not contain runnable production binaries.
+        return
+    runner([str(binary_path), "--check-config", "-c", str(yaml_path),
+            "-w", str(under_root(root, "/var/lib/AdGuardHome"))],
+           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _verify_mtproxyl_active_config(root: Path, runner: Callable[..., Any]) -> Optional[int]:
+    """Require a stable MTProxy nginx master using the supported generated config."""
+
+    if Path(root) != Path("/"):
+        return None
+
+    def main_pid() -> int:
+        result = runner(["systemctl", "show", "--property=MainPID", "--value", "mtproxyl-pq-nginx"],
+                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if getattr(result, "returncode", 1) != 0:
+            raise ValueError("MainPID unavailable")
+        raw = getattr(result, "stdout", b"")
+        text = raw.decode("ascii") if isinstance(raw, bytes) else raw
+        if not isinstance(text, str) or not re.fullmatch(r"[1-9][0-9]*", text.strip()):
+            raise ValueError("invalid MainPID")
+        return int(text.strip())
+
+    try:
+        pid = main_pid()
+        raw = under_root(root, "/proc/%d/cmdline" % pid).read_bytes()
+        executable = os.readlink(under_root(root, "/proc/%d/exe" % pid))
+        checked_pid = main_pid()
+        if not raw.endswith(b"\0"):
+            raise ValueError("unterminated command line")
+        arguments = raw.rstrip(b"\0").split(b"\0")
+        prefix = b"nginx: master process "
+        if len(arguments) == 1 and arguments[0].startswith(prefix):
+            argv = shlex.split(arguments[0][len(prefix):].decode("utf-8"), comments=False, posix=True)
+        else:
+            argv = [os.fsdecode(arg) for arg in arguments]
+        if (pid != checked_pid or len(argv) < 3 or any(not arg for arg in argv)
+                or executable != MTPROXY_NGINX_BINARY
+                or argv[:3] != [MTPROXY_NGINX_BINARY, "-c", MTPROXY_NGINX_CONFIG]
+                or any(arg.startswith("-c") for arg in argv[3:])):
+            raise ValueError("active config is custom or ambiguous")
+        return pid
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        raise RuntimeError("активная конфигурация MTProxy не подтверждена; custom mode не поддерживается") from None
+
+
+def _reload_mtproxyl_map(root: Path, runner: Callable[..., Any]) -> None:
+    if Path(root) != Path("/"):
+        return
+    pid = _verify_mtproxyl_active_config(root, runner)
+    runner([MTPROXY_NGINX_BINARY, "-t", "-c", MTPROXY_NGINX_CONFIG],
+           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if _verify_mtproxyl_active_config(root, runner) != pid:
+        raise RuntimeError("процесс MTProxy изменился перед reload")
+    runner(["systemctl", "reload", "mtproxyl-pq-nginx"], check=True)
+
+
+def _reload_restored_runtime(root: Path, domain: str, runner: Callable[..., Any], *,
+                             reload_front: Optional[Callable[[], None]] = None) -> None:
+    if root != Path("/"):
+        return
+    runner(["systemctl", "daemon-reload"], check=False)
+    # nginx includes the whole host configuration; it cannot be checked in
+    # isolation. A failed live check triggers restoration of pre-rollback files.
+    state = _read_json(_runtime_paths(root)["install"], {})
+    if not isinstance(state, Mapping):
+        raise RuntimeError("install state is unavailable")
+    command = (["/usr/sbin/nginx", "-t", "-c", PRIVATE_NGINX_CONFIG]
+               if _front_mode(state) == "mtproxyl" else ["nginx", "-t"])
+    runner(command, check=True)
+    if reload_front is not None:
+        reload_front()
+    reload_runtime_services(root, domain, runner=runner)
+    runner(["systemctl", "restart", "adguardhome-doh-health.timer"], check=True)
 
 
 def restore_backup_runtime(
     backup_dir: Path, root: Path, domain: str,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] = subprocess.run, *, files_only: bool = False,
+    preserve_new_certbot_lineage: bool = False,
+    restart_on_failure: bool = True,
+    reload_front_map: bool = False,
 ) -> None:
-    """Restore managed files and load the restored runtime configuration."""
+    """Validate a snapshot before restoring, retaining an emergency reversal."""
 
-    root = Path(root)
-    backup_dir = Path(backup_dir)
-    _restore_backup(backup_dir, root)
-    if root != Path("/"):
-        return
-    runner(["systemctl", "daemon-reload"], check=False)
-    runner(
-        [
-            "/opt/AdGuardHome/AdGuardHome", "--check-config",
-            "-c", "/opt/AdGuardHome/AdGuardHome.yaml",
-            "-w", "/var/lib/AdGuardHome",
-        ],
-        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    runner(["nginx", "-t"], check=True)
-    reload_runtime_services(root, domain, runner=runner)
-    runner(["systemctl", "restart", "adguardhome-doh-health.timer"], check=True)
+    root, backup_dir = Path(root), Path(backup_dir)
+    _check_incomplete_transactions(root)
+    entries = _validated_backup_manifest(backup_dir)
+    by_path = {relative: (backup_dir / name, present) for relative, name, present in entries}
+    skipped = set()
+    current_state = _read_json(_runtime_paths(root)["install"], {})
+    saved_install, saved_present = by_path.get("/var/lib/adguardhome-doh/install.json", (None, False))
+    saved_state = _read_json(saved_install, None) if saved_present else None
+    if (isinstance(current_state, Mapping) and isinstance(saved_state, Mapping)
+            and _front_mode(current_state) == "mtproxyl" and _front_mode(saved_state) == "mtproxyl"):
+        skipped.update(under_root(root, path) for path in SYSTEM_NGINX_FILES)
+    if preserve_new_certbot_lineage:
+        manifest = _read_json(backup_dir / "manifest.json", None)
+        if not _valid_domain(domain) or not isinstance(manifest, Mapping) or manifest.get("domain") != domain:
+            raise RuntimeError("cannot establish the Certbot lineage domain")
+        renewal = "/etc/letsencrypt/renewal/%s.conf" % domain
+        recorded = by_path.get(renewal)
+        if recorded is None:
+            raise RuntimeError("backup does not record the Certbot renewal profile")
+        live = under_root(root, "/etc/letsencrypt/live/%s" % domain)
+        if not recorded[1] and (live / "fullchain.pem").is_file() and (live / "privkey.pem").is_file():
+            skipped.add(under_root(root, renewal))
+    yaml_path, yaml_present = by_path["/opt/AdGuardHome/AdGuardHome.yaml"]
+    if yaml_present:
+        binary, binary_present = by_path.get(
+            "/opt/AdGuardHome/AdGuardHome", (Path(""), False)
+        )
+        if not binary_present:
+            binary = under_root(root, "/opt/AdGuardHome/AdGuardHome")
+        _validate_staged_adguard(root, yaml_path, binary, runner)
+
+    targets = [entry for entry in _restore_targets(backup_dir, root) if entry[0] not in skipped]
+    backup_root = under_root(root, "/var/backups/adguardhome-doh")
+    backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safety = Path(tempfile.mkdtemp(prefix=".restore-", dir=str(backup_root)))
+    saved = []
+    for index, (target, _source, _present) in enumerate(targets):
+        if target.is_dir() and not target.is_symlink():
+            raise RuntimeError("refusing to replace a directory with a managed file: %s" % target)
+        prior = safety / ("%03d-%s" % (index, target.name))
+        exists = target.exists() or target.is_symlink()
+        if exists:
+            _copy_path(target, prior)
+            if _path_digest(target) != _path_digest(prior):
+                raise RuntimeError("current file changed while preparing restore: %s" % target)
+        saved.append((target, prior, exists))
+    marker = safety / "transaction.json"
+    _transaction_marker(marker, "prepared", saved)
+    runtime_may_be_running = False
+    front_reload_attempted = False
+
+    def reload_front() -> None:
+        nonlocal front_reload_attempted
+        front_reload_attempted = True
+        _reload_mtproxyl_map(root, runner)
+
+    try:
+        if skipped:
+            _restore_backup(backup_dir, root, skip_targets=skipped)
+        else:
+            _restore_backup(backup_dir, root)
+        if not files_only and yaml_present:
+            # Reload can start AdGuard and then fail at nginx or smoke.
+            runtime_may_be_running = True
+            if reload_front_map:
+                _reload_restored_runtime(root, domain, runner, reload_front=reload_front)
+            else:
+                _reload_restored_runtime(root, domain, runner)
+        _transaction_marker(marker, "committed", saved)
+    except BaseException as original:
+        if runtime_may_be_running:
+            try:
+                _stop_adguard(root, runner=runner)
+            except BaseException as stop_error:
+                raise _StopBeforeRestoreError(
+                    "restore failed; cannot stop AdGuard before restoring files: %s; "
+                    "transaction remains pending at %s" % (stop_error, marker)
+                ) from original
+        try:
+            _restore_transaction_entries(saved)
+        except BaseException as restore_error:
+            raise _FileRecoveryError("restore failed; returning to previous state also failed: %s"
+                                     % restore_error) from original
+        if front_reload_attempted:
+            try:
+                _reload_mtproxyl_map(root, runner)
+            except BaseException as restore_error:
+                raise _FrontRecoveryError("restore failed; returning to previous MTProxy map also failed: %s"
+                                          % restore_error) from original
+        try:
+            if restart_on_failure and not files_only and root == Path("/"):
+                _reload_restored_runtime(root, domain, runner)
+            _transaction_marker(marker, "restored", saved)
+        except BaseException as restore_error:
+            raise RuntimeError("restore failed; returning to previous state also failed: %s"
+                               % restore_error) from original
+        raise
 
 
 def _domain_set(catalog: Any, services: Iterable[str]) -> set:
@@ -504,6 +1068,48 @@ def _active_domain_count(policy: Any, health_state: Mapping[str, Any]) -> int:
     return active
 
 
+def _active_probe_ids(paths: Mapping[str, Path], policy: Any) -> Optional[set[str]]:
+    """Identify current probes without treating old state entries as enabled."""
+
+    rows = None
+    if isinstance(policy, list):
+        rows = policy
+    if isinstance(policy, Mapping):
+        services = policy.get("services", {})
+        if services in ({}, []) and "domains" in policy:
+            rows = policy["domains"]
+    if isinstance(rows, list):
+        # Compatibility policies probe domain rows instead of catalog IDs.
+        result = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            owners = row.get("services", row.get("service_ids"))
+            if owners is None and row.get("service_id") is not None:
+                owners = [row["service_id"]]
+            if isinstance(owners, str):
+                owners = [owners]
+            if not owners:
+                owners = [row.get("domain")]
+            if isinstance(owners, list):
+                result.update(item for item in owners if isinstance(item, str) and item)
+        return result
+    enabled = _read_json(paths["enabled"], None)
+    if isinstance(enabled, list):
+        return {item for item in enabled if isinstance(item, str)}
+    if isinstance(policy, Mapping) and isinstance(policy.get("enabled_services"), list):
+        return {item for item in policy["enabled_services"] if isinstance(item, str)}
+    return None
+
+
+def _probe_uncertain(health_state: Mapping[str, Any], active_ids: Optional[set[str]]) -> bool:
+    return bool(active_ids is not None and any(
+        isinstance(health_state.get(service_id), Mapping)
+        and health_state[service_id].get("probe_uncertain") is True
+        for service_id in active_ids
+    ))
+
+
 def _endpoint_files(root: Path, paths: Mapping[str, Path], domain: str) -> Dict[str, bool]:
     certificate_root = Path("/etc/letsencrypt/live") / domain if domain else Path("/")
     certificate = under_root(root, str(certificate_root)) / "fullchain.pem"
@@ -548,8 +1154,49 @@ def _latest_valid_backup(root: Path = Path("/")) -> Optional[Path]:
                 _validated_backup_manifest(manifest_dir)
             except RuntimeError:
                 continue
-            return manifest_dir
+            if _backup_operation(manifest_dir) == "update":
+                return manifest_dir
     return None
+
+
+def _backup_operation(backup_dir: Path) -> str:
+    manifest = _read_json(Path(backup_dir) / "manifest.json", None)
+    if isinstance(manifest, Mapping):
+        if manifest.get("operation") == "update" and manifest.get("status") != "applied":
+            return "unknown"
+        return str(manifest.get("operation", ""))
+    if (isinstance(manifest, list)
+            and re.fullmatch(r"\d{8}T\d{12}Z", Path(backup_dir).name)):
+        # Known legacy managers wrote update snapshots at timestamp roots.
+        # timestamp/full was used by service changes and is not an update.
+        return "update"
+    return "unknown"
+
+
+def _snapshot_under_root(root: Path, backup_dir: Path) -> Path:
+    backup_root = under_root(root, "/var/backups/adguardhome-doh").resolve()
+    selected = Path(backup_dir).resolve()
+    if selected == backup_root or backup_root not in selected.parents:
+        raise RuntimeError("backup path is outside the backup directory")
+    return selected
+
+
+def finalize_update_backup(backup_dir: Path, root: Path, domain: str) -> None:
+    """Publish a verified pending update snapshot; caller holds the lock."""
+
+    root = Path(root)
+    _check_incomplete_transactions(root)
+    backup_dir = _snapshot_under_root(root, backup_dir)
+    if backup_dir.parent != under_root(root, "/var/backups/adguardhome-doh").resolve():
+        raise RuntimeError("update backup is not at the backup root")
+    _validated_backup_manifest(backup_dir)
+    manifest_path = backup_dir / "manifest.json"
+    manifest = _read_json(manifest_path, None)
+    if (not isinstance(manifest, dict) or manifest.get("operation") != "update"
+            or manifest.get("status") != "pending" or manifest.get("domain") != domain):
+        raise RuntimeError("backup is not a pending update for this domain")
+    manifest["status"] = "applied"
+    _write_json(manifest_path, manifest)
 
 
 def collect_menu_status(
@@ -564,7 +1211,12 @@ def collect_menu_status(
     if not isinstance(install, Mapping):
         install = {}
     domain = str(install.get("domain", ""))
-    enabled = _load_enabled(paths, catalog) if catalog is not None else []
+    front = _front_mode(install)
+    saved_enabled = _read_json(paths["enabled"], None)
+    if isinstance(saved_enabled, list):
+        enabled = [item for item in saved_enabled if isinstance(item, str)]
+    else:
+        enabled = _load_enabled(paths, catalog) if catalog is not None else []
     if catalog is not None:
         known = {service.id for service in catalog.services}
         enabled = [item for item in enabled if item in known]
@@ -572,27 +1224,42 @@ def collect_menu_status(
     if not isinstance(health_state, Mapping):
         health_state = {}
     policy = _read_json(paths["health_policy"], {})
+    uncertain = _probe_uncertain(health_state, _active_probe_ids(paths, policy))
     units = {}
-    for unit in (
-        "adguardhome-doh.service",
-        "nginx.service",
-        "adguardhome-doh-health.timer",
-    ):
+    runtime_units = ["adguardhome-doh.service",
+                     "adguardhome-doh-nginx.service" if front == "mtproxyl" else "nginx.service",
+                     "adguardhome-doh-health.timer"]
+    if front == "mtproxyl":
+        runtime_units.append("mtproxyl-pq-nginx.service")
+    for unit in runtime_units:
         units[unit] = _command_ok(
             ["systemctl", "is-active", "--quiet", unit], runner
         )
     if all(units.values()):
         overall = "running"
-    elif units["adguardhome-doh.service"] or units["nginx.service"]:
+    elif units["adguardhome-doh.service"] or units[runtime_units[1]]:
         overall = "attention"
     else:
         overall = "stopped"
+    front_config_supported = True
+    if front == "mtproxyl" and root == Path("/"):
+        try:
+            _verify_mtproxyl_active_config(root, runner)
+        except RuntimeError:
+            front_config_supported = False
+            if overall == "running":
+                overall = "attention"
+    if uncertain and overall == "running":
+        overall = "attention"
     endpoints = _endpoint_files(root, paths, domain)
     return {
         "version": _installed_version_text(paths, install),
         "domain": domain,
+        "front": front,
+        "front_config_supported": front_config_supported,
         "units": units,
         "overall": overall,
+        "probe_uncertain": uncertain,
         "enabled_services": len(enabled),
         "healthy_services": sum(
             1 for service_id in enabled
@@ -651,6 +1318,9 @@ def render_main_screen(
     width = width or _terminal_width(output)
     _render_banner(str(status.get("version", "0.0.0")), output, width)
     overall = str(status.get("overall", "stopped"))
+    uncertain = status.get("probe_uncertain") is True
+    if uncertain and overall == "running":
+        overall = "attention"
     overall_values = {
         "running": ("● РАБОТАЕТ", ANSI_GREEN),
         "attention": ("! ТРЕБУЕТ ВНИМАНИЯ", ANSI_YELLOW),
@@ -663,11 +1333,15 @@ def render_main_screen(
     if not isinstance(units, Mapping):
         units = {}
     adguard = _status_value(bool(units.get("adguardhome-doh.service")))
-    nginx = _status_value(bool(units.get("nginx.service")))
+    front = str(status.get("front", "standard"))
+    nginx_unit = "adguardhome-doh-nginx.service" if front == "mtproxyl" else "nginx.service"
+    nginx = _status_value(bool(units.get(nginx_unit)))
     timer = _status_value(bool(units.get("adguardhome-doh-health.timer")))
     enabled = int(status.get("enabled_services", 0) or 0)
     healthy = int(status.get("healthy_services", 0) or 0)
-    if enabled > 0 and healthy == enabled:
+    if uncertain:
+        service_tone = ANSI_YELLOW
+    elif enabled > 0 and healthy == enabled:
         service_tone = ANSI_GREEN
     elif healthy > 0:
         service_tone = ANSI_YELLOW
@@ -686,24 +1360,36 @@ def render_main_screen(
         ("Домен", str(status.get("domain") or "не настроен"),
          ANSI_GREEN if status.get("domain") else ANSI_YELLOW),
         ("AdGuard Home", adguard[0], adguard[1]),
-        ("nginx", nginx[0], nginx[1]),
+        ("nginx DoH" if front == "mtproxyl" else "nginx", nginx[0], nginx[1]),
         ("Health timer", timer[0], timer[1]),
-        ("Сервисы", "%d / %d здоровы" % (enabled, healthy), service_tone),
-        ("Домены", "%d активны" % active_domains,
-         ANSI_GREEN if active_domains else ANSI_YELLOW),
+        ("Сервисы", "состояние неизвестно" if uncertain else "%d / %d здоровы" % (enabled, healthy), service_tone),
+        ("Домены", "%d по оценке" % active_domains if uncertain else "%d активны" % active_domains,
+         ANSI_YELLOW if uncertain or not active_domains else ANSI_GREEN),
         ("Сертификат", certificate[0], certificate[1]),
         ("Профиль", profile[0], profile[1]),
         ("Откат", rollback[0], rollback[1]),
     ]
+    if front == "mtproxyl":
+        mtproxy = _status_value(bool(units.get("mtproxyl-pq-nginx.service")))
+        if units.get("mtproxyl-pq-nginx.service") and status.get("front_config_supported") is False:
+            mtproxy = ("! конфиг не подтверждён", ANSI_YELLOW)
+        metrics.append(("MTProxy front", mtproxy[0], mtproxy[1]))
     if width >= 72:
         cell_width = (width - 2) // 2
         for index in range(0, len(metrics), 2):
             left = _metric_cell(*metrics[index], output, cell_width)
-            right = _metric_cell(*metrics[index + 1], output, cell_width)
+            right = (_metric_cell(*metrics[index + 1], output, cell_width)
+                     if index + 1 < len(metrics) else "")
             print(left + "  " + right, file=output)
     else:
         for metric in metrics:
             print(_metric_cell(*metric, output, width), file=output)
+    if uncertain:
+        print(file=output)
+        _print_wrapped("! ", "Текущее состояние неизвестно. Прежние DNS-правила сохранены.", output, width)
+    if front == "mtproxyl" and status.get("front_config_supported") is False:
+        print(file=output)
+        _print_wrapped("! ", "Активная конфигурация MTProxy не подтверждена. Изменения заблокированы.", output, width)
     print(file=output)
     print(_style("─" * min(width, 56), ANSI_DIM, output), file=output)
     print(file=output)
@@ -741,20 +1427,36 @@ def apply_service_change(
     """Render selected services to staging, validate, then atomically activate."""
 
     root = Path(root)
+    with operation_lock(root), health_lock(root):
+        _check_incomplete_transactions(root)
+        state = _read_json(_runtime_paths(root)["install"], {})
+        domain = str(state.get("domain", "")) if isinstance(state, Mapping) else ""
+        if isinstance(state, Mapping) and _front_mode(state) == "mtproxyl" and root == Path("/"):
+            _require_front_files(root)
+            _load_healthcheck(root)
+            _verify_mtproxyl_active_config(root, subprocess.run)
+        try:
+            _stop_adguard(root)
+            return _apply_service_change_locked(selected, root=root, catalog=catalog,
+                                                renderer=renderer, validator=validator)
+        except BaseException as original:
+            _recover_runtime_after_failure(root, domain, original)
+            raise
+
+
+def _apply_service_change_locked(
+    selected: Sequence[str], *, root: Path, catalog: Any,
+    renderer: Optional[Callable[[Path, Sequence[str]], None]],
+    validator: Optional[Callable[[], None]],
+) -> Path:
     paths = _runtime_paths(root)
     catalog = catalog or _load_catalog(paths["catalog"])
     state = _read_json(paths["install"], {})
     if not isinstance(state, Mapping):
         raise RuntimeError("install state is unavailable")
-    token = paths["token"].read_text(encoding="utf-8").strip()
-    old_yaml = paths["agh"].read_text(encoding="utf-8")
-    password_hash = ""
-    for line in old_yaml.splitlines():
-        if line.strip().startswith("password:"):
-            password_hash = line.split(":", 1)[1].strip()
-            break
-    if not password_hash:
-        raise RuntimeError("AdGuard administrator hash is unavailable")
+    front = _front_mode(state)
+    if not paths["agh"].is_file():
+        raise RuntimeError("AdGuard configuration is unavailable")
     stage = Path(tempfile.mkdtemp(prefix=".services.", dir=str(paths["config"])))
     try:
         if renderer is None:
@@ -763,10 +1465,15 @@ def apply_service_change(
                 runtime = Path("/usr/local/libexec/adguardhome-doh/render_runtime.py")
             command = [sys.executable, str(runtime), "--config-dir", str(paths["catalog"]),
                        "--services", ",".join(selected), "--public-ip", str(state["public_ip"]),
-                       "--doh-host", str(state["domain"]), "--doh-token", token,
-                       "--password-hash", password_hash,
+                       "--doh-host", str(state["domain"]), "--doh-token-file", str(paths["token"]),
+                       "--existing-config", str(paths["agh"]),
+                       "--existing-public-ip", str(state["public_ip"]),
                        "--certificate-root", "/etc/letsencrypt/live/%s" % state["domain"],
                        "--webroot", str(paths["webroot"]), "--output", str(stage)]
+            if paths["health_policy"].is_file():
+                command.extend(["--existing-policy", str(paths["health_policy"])])
+            if front == "mtproxyl":
+                command.extend(["--front", "mtproxyl"])
             # A relay host forwards routed services to one exit host; the
             # stream map has to keep doing so after a service change.
             if state.get("relay"):
@@ -783,6 +1490,11 @@ def apply_service_change(
             subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
             renderer(stage, selected)
+        # The generated YAML includes password hashes and may contain private
+        # user settings. Its staging directory is private, but copy2 also
+        # propagates the file mode when activating it under /opt/AdGuardHome.
+        os.chmod(stage / "AdGuardHome.yaml", 0o600)
+        os.chmod(stage / "health-policy.json", 0o600)
         enabled_stage = stage / "enabled-services.json"
         _write_json(enabled_stage, list(selected))
         targets = {
@@ -791,30 +1503,35 @@ def apply_service_change(
             paths["health_policy"]: stage / "health-policy.json",
             paths["enabled"]: enabled_stage,
         }
+        if state.get("policy"):
+            updated_state = dict(state)
+            updated_state.pop("policy", None)
+            install_stage = stage / "install.json"
+            _write_json(install_stage, updated_state)
+            targets[paths["install"]] = install_stage
+        _validate_staged_adguard(
+            root, targets[paths["agh"]], under_root(root, "/opt/AdGuardHome/AdGuardHome")
+        )
         backup_dir = paths["backup"] / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        full_backup = create_backup(root, backup_dir / "full")
+        create_backup(root, backup_dir / "full", operation="service-change")
 
         def validate() -> None:
             if validator is not None:
                 validator()
-                return
-            subprocess.run(["/opt/AdGuardHome/AdGuardHome", "--check-config",
-                            "-c", str(paths["agh"]),
-                            "-w", str(under_root(root, "/var/lib/AdGuardHome"))], check=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            subprocess.run(["nginx", "-t"], check=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        try:
-            activated = activate_transaction(targets, backup_dir, validate=validate, root=root)
+            elif root == Path("/"):
+                # nginx cannot validate a staged stream map without staging
+                # the entire host configuration; validate immediately after
+                # activation and roll back if the live check fails.
+                command = (["/usr/sbin/nginx", "-t", "-c", PRIVATE_NGINX_CONFIG]
+                           if front == "mtproxyl" else ["nginx", "-t"])
+                subprocess.run(command, check=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             reload_runtime_services(root, str(state["domain"]))
-            return activated
-        except Exception:
-            try:
-                restore_backup_runtime(full_backup, root, str(state["domain"]))
-            except Exception:
-                pass
-            raise
+
+        return activate_transaction(
+            targets, backup_dir, validate=validate,
+            on_failure=lambda: _stop_adguard(root), root=root,
+        )
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
@@ -868,23 +1585,38 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
 
     root = Path(root)
     paths = _runtime_paths(root)
+    install = _read_json(paths["install"], {})
+    if not isinstance(install, Mapping):
+        install = {}
+    front = _front_mode(install)
     units = {}
-    for unit in ("adguardhome-doh.service", "nginx.service",
-                 "adguardhome-doh-health.timer"):
+    runtime_units = ["adguardhome-doh.service",
+                     "adguardhome-doh-nginx.service" if front == "mtproxyl" else "nginx.service",
+                     "adguardhome-doh-health.timer"]
+    if front == "mtproxyl":
+        runtime_units.append("mtproxyl-pq-nginx.service")
+    for unit in runtime_units:
         units[unit] = _command_ok(["systemctl", "is-active", "--quiet", unit], runner)
     units["adguardhome-doh-health.service"] = _oneshot_last_run_ok(
         "adguardhome-doh-health.service", runner
     )
-    install = _read_json(paths["install"], {})
     domain = str(install.get("domain", "")) if isinstance(install, Mapping) else ""
     health_state = _read_json(paths["health_state"], {})
     if not isinstance(health_state, Mapping):
         health_state = {}
     policy = _read_json(paths["health_policy"], {})
+    active_ids = _active_probe_ids(paths, policy)
+    tracked = (health_state.values() if active_ids is None else
+               (health_state.get(service_id) for service_id in active_ids))
+    healthy = sum(1 for item in tracked if isinstance(item, Mapping) and item.get("healthy", False))
     endpoints = _endpoint_files(root, paths, domain)
     report = {
+        "front": front,
         "units": units,
-        "nginx": _command_ok(["nginx", "-t"], runner),
+        "nginx": _command_ok(
+            ["/usr/sbin/nginx", "-t", "-c", PRIVATE_NGINX_CONFIG]
+            if front == "mtproxyl" else ["nginx", "-t"], runner,
+        ),
         "adguard_config": _command_ok(["/opt/AdGuardHome/AdGuardHome", "--check-config",
                                         "-c", str(paths["agh"]),
                                         "-w", str(under_root(root, "/var/lib/AdGuardHome"))], runner),
@@ -895,13 +1627,20 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
             "mobileconfig": endpoints["profile"],
         },
         "health_state": {
-            "services": len(health_state) if isinstance(health_state, Mapping) else 0,
-            "healthy": sum(1 for item in health_state.values()
-                            if isinstance(item, Mapping) and item.get("healthy", False))
-            if isinstance(health_state, Mapping) else 0,
+            "services": len(health_state) if active_ids is None else len(active_ids),
+            "healthy": healthy,
+            "probe_uncertain": _probe_uncertain(health_state, active_ids),
         },
         "active_domain_count": _active_domain_count(policy, health_state),
     }
+    if front == "mtproxyl":
+        try:
+            _verify_mtproxyl_active_config(root, runner)
+            report["mtproxyl_config"] = _command_ok(
+                [MTPROXY_NGINX_BINARY, "-t", "-c", MTPROXY_NGINX_CONFIG], runner,
+            )
+        except RuntimeError:
+            report["mtproxyl_config"] = False
     return report
 
 
@@ -910,10 +1649,13 @@ def _unhealthy_service_names(root: Path = Path("/")) -> list[str]:
     health_state = _read_json(paths["health_state"], {})
     if not isinstance(health_state, Mapping):
         return []
+    policy = _read_json(paths["health_policy"], {})
+    active_ids = _active_probe_ids(paths, policy)
     unhealthy_ids = {
         str(service_id)
         for service_id, state in health_state.items()
-        if isinstance(state, Mapping) and not state.get("healthy", False)
+        if (active_ids is None or service_id in active_ids)
+        and isinstance(state, Mapping) and not state.get("healthy", False)
     }
     if not unhealthy_ids:
         return []
@@ -936,21 +1678,30 @@ def _render_system_check(
 ) -> None:
     width = _terminal_width(output)
     _section_title("ДИАГНОСТИКА СИСТЕМЫ", output, width)
-    checks = (
+    front = str(report.get("front", "standard"))
+    nginx_unit = "adguardhome-doh-nginx.service" if front == "mtproxyl" else "nginx.service"
+    checks = [
         ("AdGuard Home", report["units"].get("adguardhome-doh.service", False), "готов", "ошибка"),
-        ("nginx", report["units"].get("nginx.service", False), "готов", "ошибка"),
+        ("nginx DoH" if front == "mtproxyl" else "nginx", report["units"].get(nginx_unit, False), "готов", "ошибка"),
         ("Health service", report["units"].get("adguardhome-doh-health.service", False),
          "последняя проверка успешна", "последняя проверка: ошибка"),
         ("Health timer", report["units"].get("adguardhome-doh-health.timer", False), "готов", "ошибка"),
         ("Конфигурация AdGuard Home", report["adguard_config"], "готов", "ошибка"),
-        ("Конфигурация nginx", report["nginx"], "готов", "ошибка"),
+        ("Конфигурация nginx DoH" if front == "mtproxyl" else "Конфигурация nginx", report["nginx"], "готов", "ошибка"),
         ("Сертификат", report["certificate"], "готов", "ошибка"),
         ("Панель администратора", report["endpoints"].get("admin", False), "готов", "ошибка"),
         ("Private DoH", report["endpoints"].get("doh", False), "готов", "ошибка"),
         ("Apple-профиль", report["endpoints"].get("mobileconfig", False), "готов", "ошибка"),
-    )
+    ]
+    if front == "mtproxyl":
+        checks.extend([
+            ("MTProxy front", report["units"].get("mtproxyl-pq-nginx.service", False), "готов", "ошибка"),
+            ("Конфигурация MTProxy", report.get("mtproxyl_config", False), "готов", "ошибка"),
+        ])
     for label, ok, success_text, error_text in checks:
         text, tone = _status_value(bool(ok), success_text, error_text)
+        if label == "Health service" and ok and report["health_state"].get("probe_uncertain") is True:
+            text, tone = "! результат неопределён", ANSI_YELLOW
         prefix = "%-30s " % (label + ":")
         if len(prefix) + len(text) <= width:
             print(prefix + _style(text, tone, output), file=output)
@@ -958,15 +1709,23 @@ def _render_system_check(
             print(label + ":", file=output)
             print("  " + _style(text, tone, output), file=output)
     print(file=output)
-    print("Здоровые сервисы: %d/%d" % (
-        report["health_state"].get("healthy", 0),
-        report["health_state"].get("services", 0),
-    ), file=output)
+    uncertain = report["health_state"].get("probe_uncertain") is True
+    if uncertain:
+        _print_wrapped("! ", "Текущее состояние неизвестно. Прежние DNS-правила сохранены.", output, width)
+        _print_wrapped("", "Здоровые по прежней оценке: %d/%d" % (
+            report["health_state"].get("healthy", 0), report["health_state"].get("services", 0),
+        ), output, width)
+    else:
+        print("Здоровые сервисы: %d/%d" % (
+            report["health_state"].get("healthy", 0),
+            report["health_state"].get("services", 0),
+        ), file=output)
     if unhealthy_services:
         _print_wrapped(
             "Требуют внимания: ", ", ".join(unhealthy_services), output, width
         )
-    print("Активные домены: %d" % report.get("active_domain_count", 0), file=output)
+    print(("Домены по прежней оценке: %d" if uncertain else "Активные домены: %d")
+          % report.get("active_domain_count", 0), file=output)
 
 
 def print_system_check(root: Path = Path("/"), output: TextIO = sys.stdout) -> None:
@@ -1337,12 +2096,14 @@ def install_update(
     *, root: Path = Path("/"), release: Any = None,
     downloader: Optional[Callable[[str, Path], None]] = None,
     runner: Callable[..., Any] = subprocess.run,
+    output: TextIO = sys.stdout,
 ) -> bool:
     """Download, verify, and run a stable release installer preserving state."""
 
     root = Path(root)
     paths = _runtime_paths(root)
     state = _current_install_state(root)
+    front = _front_mode(state)
     releases = _load_releases()
     release = release or releases.latest_release(str(state.get("repository", "evgenykhripach/AdguardHomeDoH")))
     if release is None:
@@ -1350,7 +2111,8 @@ def install_update(
     current = _installed_project_version(root, state)
     if release.version <= current:
         return False
-    backup_dir = create_backup(root)
+    with health_lock(root):
+        _check_incomplete_transactions(root)
     with tempfile.TemporaryDirectory(prefix=".adguardhome-doh-update-") as directory:
         work = Path(directory)
         archive = work / releases.ARCHIVE_NAME
@@ -1361,6 +2123,12 @@ def install_update(
         releases.verify_archive(archive, checksum, version=release.version.text())
         source = _safe_extract(archive, work / "source")
         catalog = _load_catalog(source / "config")
+        try:
+            previous_catalog = _load_catalog(paths["catalog"])
+            added_domains = ({row.domain for row in catalog.full_policy()}
+                             - {row.domain for row in previous_catalog.full_policy()})
+        except (OSError, ValueError, RuntimeError):
+            added_domains = None
         old_services = _read_json(paths["enabled"], list(catalog.default_service_ids))
         if not isinstance(old_services, list):
             old_services = list(catalog.default_service_ids)
@@ -1371,34 +2139,110 @@ def install_update(
         command = ["bash", str(source / "deploy" / "install.sh"),
                    "--domain", str(state["domain"]), "--public-ip", str(state["public_ip"]),
                    "--email", str(state.get("email", "admin@example.com")),
-                   "--services", ",".join(selected), "--yes", "--update"]
+                   "--yes", "--update"]
+        if state.get("policy"):
+            policy = str(state["policy"])
+            if policy != "/etc/adguardhome-doh/compat-policy.csv":
+                raise RuntimeError("saved compatibility policy path is invalid")
+            policy_path = under_root(root, policy)
+            if not policy_path.is_file():
+                raise RuntimeError("saved compatibility policy is missing")
+            command.extend(["--policy", str(policy_path)])
+        else:
+            command.extend(["--services", ",".join(selected)])
+        if front == "mtproxyl":
+            command.extend(["--front", "mtproxyl"])
         if state.get("relay"):
             command.extend(["--relay", str(state["relay"])])
         for item in state.get("local_sites") or []:
             command.extend(["--local-site", str(item)])
-        try:
-            result = runner(command, check=False)
-            if getattr(result, "returncode", 1) != 0:
-                raise RuntimeError("обновление не прошло активацию")
-        except Exception:
-            restore_backup_runtime(
-                backup_dir, root, str(state["domain"]), runner=runner
-            )
-            raise
+        environment = os.environ.copy()
+        environment["ADGUARDHOME_DOH_REPOSITORY"] = str(
+            state.get("repository", "evgenykhripach/AdguardHomeDoH")
+        )
+        environment["ADGUARDHOME_DOH_MANAGER_UPDATE"] = "1"
+        # The installer acquires the shared lock and creates/restores its own
+        # snapshot. Holding the lock around the child would deadlock it.
+        result = runner(command, check=False, env=environment)
+        if getattr(result, "returncode", 1) != 0:
+            raise RuntimeError("обновление не прошло активацию; проверьте журнал установщика")
+        if added_domains:
+            print("В каталоге появились новые домены. Скачайте и заново установите "
+                  "Apple-профиль на устройствах, чтобы они использовали DoH для этих доменов.",
+                  file=output)
+        elif added_domains is None:
+            print("Не удалось сравнить домены профиля. Проверьте необходимость повторной "
+                  "установки Apple-профиля на устройствах.", file=output)
     return True
 
 
-def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run) -> bool:
-    root = Path(root)
-    selected = _latest_valid_backup(root)
-    if selected is None:
+def _rollback_front_map_changed(root: Path, backup_dir: Path,
+                                entries: Sequence[Tuple[str, str, bool]],
+                                runner: Callable[..., Any]) -> bool:
+    paths = _runtime_paths(root)
+    current = _read_json(paths["install"], {})
+    if not isinstance(current, Mapping):
+        raise RuntimeError("install state is unavailable")
+    current_front = _front_mode(current)
+    by_path = {relative: (Path(backup_dir) / name, present) for relative, name, present in entries}
+    saved_install, present = by_path.get("/var/lib/adguardhome-doh/install.json", (None, False))
+    saved_state = _read_json(saved_install, None) if present else None
+    saved_front = _front_mode(saved_state) if isinstance(saved_state, Mapping) else None
+    if current_front == "mtproxyl" and saved_front != "mtproxyl":
+        raise RuntimeError("снимок несовместим с общим MTProxy front; требуется ручной переход")
+    if current_front != "mtproxyl" and saved_front == "mtproxyl":
+        raise RuntimeError("снимок требует MTProxy front; требуется ручной переход")
+    if current_front != "mtproxyl":
         return False
+    if saved_state.get("domain") != current.get("domain"):
+        raise RuntimeError("домен снимка несовместим с текущим MTProxy front")
+    _require_front_files(root)
+    for relative in (PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT,
+                     "/opt/AdGuardHome/AdGuardHome", "/opt/AdGuardHome/AdGuardHome.yaml",
+                     "/var/lib/adguardhome-doh/doh-token", "/usr/local/libexec/adguardhome-doh/healthcheck.py") + FRONT_OVERLAY_FILES:
+        saved, saved_present = by_path.get(relative, (None, False))
+        if not saved_present or saved is None or not saved.is_file() or saved.is_symlink():
+            raise RuntimeError("снимок не содержит необходимые файлы DoH для MTProxy: %s" % relative)
+    saved_map, map_present = by_path.get(MT_PROXY_SNI_MAP, (None, False))
+    current_map = under_root(root, MT_PROXY_SNI_MAP)
+    if (not map_present or saved_map is None or not saved_map.is_file() or saved_map.is_symlink()
+            or not current_map.is_file() or current_map.is_symlink()):
+        raise RuntimeError("снимок или текущая карта MTProxy отсутствует или небезопасна")
+    changed = saved_map.read_bytes() != current_map.read_bytes()
+    if Path(root) == Path("/"):
+        _load_healthcheck(root)
+        if changed:
+            nginx_binary = under_root(root, MTPROXY_NGINX_BINARY)
+            nginx_config = under_root(root, MTPROXY_NGINX_CONFIG)
+            if not nginx_binary.is_file() or not os.access(nginx_binary, os.X_OK) or not nginx_config.is_file():
+                raise RuntimeError("проверка MTProxy недоступна; откат карты невозможен")
+        _verify_mtproxyl_active_config(root, runner)
+    return changed
 
-    domain = ""
-    if root == Path("/"):
-        domain = str(_current_install_state(root)["domain"])
-    restore_backup_runtime(selected, root, domain, runner=runner)
-    return True
+
+def rollback_last(root: Path = Path("/"), runner: Callable[..., Any] = subprocess.run,
+                  *, selected: Optional[Path] = None) -> bool:
+    root = Path(root)
+    with operation_lock(root), health_lock(root):
+        _check_incomplete_transactions(root)
+        selected = Path(selected) if selected is not None else _latest_valid_backup(root)
+        if selected is None:
+            return False
+        entries = _validated_backup_manifest(selected)
+        if _backup_operation(selected) != "update":
+            raise RuntimeError("backup is not an update snapshot")
+        map_changed = _rollback_front_map_changed(root, selected, entries, runner)
+        domain = ""
+        if root == Path("/"):
+            domain = str(_current_install_state(root)["domain"])
+        try:
+            _stop_adguard(root, runner=runner)
+            restore_backup_runtime(selected, root, domain, runner=runner,
+                                   restart_on_failure=False, reload_front_map=map_changed)
+        except BaseException as original:
+            _recover_runtime_after_failure(root, domain, original, runner=runner)
+            raise
+        return True
 
 
 def _load_enabled(paths: Mapping[str, Path], catalog: Any) -> list:
@@ -1443,9 +2287,14 @@ def _fallback_menu_status(root: Path) -> Dict[str, Any]:
     install = _read_json(paths["install"], {})
     if not isinstance(install, Mapping):
         install = {}
+    try:
+        front = _front_mode(install)
+    except RuntimeError:
+        front = "unknown"
     return {
         "version": _installed_version_text(paths, install),
         "domain": str(install.get("domain", "")),
+        "front": front,
         "units": {},
         "overall": "stopped",
         "enabled_services": 0,
@@ -1522,6 +2371,8 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                     preview = preview_service_change(catalog, current, selected)
                     _clear_screen(output)
                     _print_service_change_preview(catalog, preview, output)
+                    print("Во время применения AdGuard Home остановится; DoH временно недоступен.",
+                          file=output)
                     print("Применить изменения? [y/N]: ", end="", file=output, flush=True)
                     if not _is_yes_answer(input_stream.readline()):
                         notice = "Изменения отменены."
@@ -1534,7 +2385,7 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                     detail = _process_error_detail(exc)
                     suffix = ": " + detail.splitlines()[-1] if detail else ""
                     notice = "Изменения не применены: %s%s" % (
-                        type(exc).__name__, suffix,
+                        str(exc) or type(exc).__name__, suffix,
                     )
             elif choice == "3":
                 _clear_screen(output)
@@ -1565,11 +2416,13 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                         print("Доступна версия %s (текущая %s)." % (
                             update["latest"], update["current"],
                         ), file=output)
+                        print("Во время обновления AdGuard Home остановится; DoH временно недоступен.",
+                              file=output)
                         print("Установить? [y/N]: ", end="", file=output, flush=True)
                         if _is_yes_answer(input_stream.readline()):
                             print(_style("Скачиваем и проверяем обновление…", ANSI_CYAN, output),
                                   file=output, flush=True)
-                            if install_update(root=root):
+                            if install_update(root=root, output=output):
                                 print(
                                     "Обновление установлено. Запустите менеджер заново "
                                     "для применения нового интерфейса.",
@@ -1581,25 +2434,42 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                             print("Обновление отменено.", file=output)
                 except Exception as exc:
                     print(_style(
-                        "Обновление не применено: %s" % type(exc).__name__,
+                        "Обновление не применено: %s" % (str(exc) or type(exc).__name__),
                         ANSI_RED, output,
                     ), file=output)
                 _pause(input_stream, output)
             elif choice == "5":
                 _clear_screen(output)
                 _section_title("ОТКАТ ОБНОВЛЕНИЯ", output)
-                print(_style(
-                    "Будет восстановлена последняя корректная резервная копия.",
-                    ANSI_RED, output,
-                ), file=output)
                 try:
+                    selected = _latest_valid_backup(root)
+                    if selected is None:
+                        print("Резервная копия обновления не найдена.", file=output)
+                        _pause(input_stream, output)
+                        continue
+                    manifest = _read_json(selected / "manifest.json", None)
+                    print("Снимок обновления: %s" % selected, file=output)
+                    if isinstance(manifest, Mapping):
+                        print("Версии: %s → %s" % (
+                            manifest.get("version_before") or "неизвестна",
+                            manifest.get("version_after") or "неизвестна",
+                        ), file=output)
+                    else:
+                        print("Старый снимок без контрольных сумм; тип операции "
+                              "определён по расположению.", file=output)
+                        if not any(item.get("path") == "/opt/AdGuardHome/AdGuardHome"
+                                   for item in manifest if isinstance(item, Mapping)):
+                            print("В снимке нет бинарника AdGuard; текущий бинарник "
+                                  "останется на месте.", file=output)
+                    print("Во время отката AdGuard Home остановится; DoH временно недоступен.",
+                          file=output)
                     print("Продолжить откат? [y/N]: ", end="", file=output, flush=True)
                     if _is_yes_answer(input_stream.readline()):
                         print(_style("Восстанавливаем резервную копию…", ANSI_CYAN, output),
                               file=output, flush=True)
                         print(
                             "Откат выполнен."
-                            if rollback_last(root)
+                            if rollback_last(root, selected=selected)
                             else "Резервная копия не найдена.",
                             file=output,
                         )
@@ -1607,7 +2477,7 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
                         print("Откат отменён.", file=output)
                 except Exception as exc:
                     print(_style(
-                        "Откат не применён: %s" % type(exc).__name__,
+                        "Откат не применён: %s" % (str(exc) or type(exc).__name__),
                         ANSI_RED, output,
                     ), file=output)
                 _pause(input_stream, output)
@@ -1626,10 +2496,46 @@ def run_menu(root: Path = Path("/"), input_stream: TextIO = sys.stdin, output: T
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--help", action="store_true")
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--create-update-backup", action="store_true")
+    operation.add_argument("--restore-update-backup", type=Path)
+    operation.add_argument("--finalize-update-backup", type=Path)
+    parser.add_argument("--root", type=Path, default=Path("/"))
+    parser.add_argument("--domain", default="")
+    parser.add_argument("--target-version", default="")
+    parser.add_argument("--snapshot-operation", choices=("update", "recovery"), default="update")
+    parser.add_argument("--files-only", action="store_true")
+    parser.add_argument("--preserve-new-certbot-lineage", action="store_true")
     args = parser.parse_args(argv)
     if args.help:
         print("adguardhome-doh: root-only interactive manager")
         return 0
+    if args.create_update_backup or args.restore_update_backup or args.finalize_update_backup:
+        if not args.root.is_absolute():
+            print("ошибка: root должен быть абсолютным путём", file=sys.stderr)
+            return 1
+        if args.root == Path("/") and getattr(os, "geteuid", lambda: 1)() != 0:
+            print("ошибка: команда доступна только root", file=sys.stderr)
+            return 1
+        try:
+            if args.create_update_backup:
+                # Caller owns the shared lock; acquiring it again here would
+                # deadlock the installer holding a separate file descriptor.
+                _check_incomplete_transactions(args.root)
+                print(create_backup(args.root, operation=args.snapshot_operation,
+                                    target_version=args.target_version, domain=args.domain))
+            elif args.finalize_update_backup:
+                finalize_update_backup(args.finalize_update_backup, args.root, args.domain)
+            else:
+                selected = _snapshot_under_root(args.root, args.restore_update_backup)
+                restore_backup_runtime(
+                    selected, args.root, args.domain, files_only=args.files_only,
+                    preserve_new_certbot_lineage=args.preserve_new_certbot_lineage,
+                )
+            return 0
+        except (Exception, KeyboardInterrupt) as exc:
+            print("ошибка резервной копии: %s" % (str(exc) or type(exc).__name__), file=sys.stderr)
+            return 1
     if getattr(os, "geteuid", lambda: 1)() != 0:
         print("ошибка: команда доступна только root", file=sys.stderr)
         return 1
