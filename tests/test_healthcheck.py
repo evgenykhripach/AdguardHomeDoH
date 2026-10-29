@@ -23,6 +23,26 @@ def load_healthcheck():
     return module
 
 
+class RewriteApi:
+    """In-memory AdGuard rewrite API for exercising the full health cycle."""
+
+    def __init__(self, records):
+        self.records = {(item["domain"], item["answer"]): dict(item) for item in records}
+        self.calls = []
+
+    def __call__(self, method, path, cookie, body=None):
+        self.calls.append((method, path, body))
+        if path == "/control/rewrite/list":
+            return [dict(item) for item in self.records.values()]
+        if path == "/control/rewrite/add":
+            self.records[(body["domain"], body["answer"])] = dict(body)
+        elif path == "/control/rewrite/update":
+            target = body["target"]
+            self.records[(target["domain"], target["answer"])].update(body["update"])
+        elif path == "/control/rewrite/delete":
+            del self.records[(body["domain"], body["answer"])]
+
+
 class HealthcheckTests(unittest.TestCase):
     def test_service_health_requires_all_probes_and_limits_concurrency(self):
         health = load_healthcheck()
@@ -87,6 +107,21 @@ class HealthcheckTests(unittest.TestCase):
         )
         self.assertEqual(["chatgpt"], transitions)
         self.assertFalse(state["chatgpt"]["healthy"])
+
+    def test_first_successful_probe_does_not_raise_uncertain_warning(self):
+        health = load_healthcheck()
+        state, _ = health.update_health_state({}, {"example": True}, success_threshold=3)
+        self.assertIsNone(state["example"]["healthy"])
+        self.assertFalse(state["example"].get("probe_uncertain", False))
+        state, _ = health.update_health_state(state, {"example": False}, success_threshold=3)
+        self.assertTrue(state["example"]["probe_uncertain"])
+        for _ in range(2):
+            state, _ = health.update_health_state(state, {"example": True}, success_threshold=3)
+            self.assertIsNone(state["example"]["healthy"])
+            self.assertTrue(state["example"]["probe_uncertain"])
+        state, _ = health.update_health_state(state, {"example": True}, success_threshold=3)
+        self.assertIs(state["example"]["healthy"], True)
+        self.assertFalse(state["example"].get("probe_uncertain", False))
 
     def test_non_overlapping_lock_rejects_second_health_run(self):
         health = load_healthcheck()
@@ -362,7 +397,7 @@ class HealthcheckTests(unittest.TestCase):
         )
 
     def test_a_total_probe_sweep_keeps_the_previous_state(self):
-        """A fault that takes out every service at once is local, not remote."""
+        """A total probe failure preserves the last known service states."""
 
         health = load_healthcheck()
         policy = {
@@ -469,6 +504,181 @@ class HealthcheckTests(unittest.TestCase):
             state = json.loads((root / "state.json").read_text(encoding="utf-8"))
             self.assertTrue(state["example"]["healthy"])
             self.assertFalse(state["example"].get("probe_uncertain", False))
+
+    def test_missing_or_corrupt_state_keeps_only_existing_enabled_rules_until_proven(self):
+        health = load_healthcheck()
+        ip = "203.0.113.10"
+        payloads = [None, "{", "null", '{"example":{}}',
+                    '{"example":{"healthy":"false"}}',
+                    '{"example":{"healthy":true,"successes":"broken"}}']
+        for payload in payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                policy = {
+                    "services": {"example": ["example.com"]},
+                    "domains": [
+                        {"domain": "example.com", "kind": "suffix", "services": ["example"]},
+                        {"domain": "disabled.example", "kind": "fqdn", "services": ["example"]},
+                        {"domain": "missing.example", "kind": "fqdn", "services": ["example"]},
+                    ],
+                }
+                (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+                if payload is not None:
+                    (root / "state.json").write_text(payload, encoding="utf-8")
+                api = RewriteApi([
+                    {"domain": "example.com", "answer": ip, "enabled": True},
+                    {"domain": "disabled.example", "answer": ip, "enabled": False},
+                ])
+                args = dict(policy_path=root / "policy.json", state_path=root / "state.json",
+                            lock_path=root / "health.lock", doh_probe_func=lambda: None)
+
+                def run(success):
+                    summary = health.run_once(**args, probe_func=lambda host: success)
+                    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+                    return summary, state["example"]
+
+                with mock.patch.object(health, "PUBLIC_IP", ip), \
+                        mock.patch.object(health, "login", return_value="sid=x"), \
+                        mock.patch.object(health, "api", side_effect=api):
+                    for _ in range(health.FAILURE_THRESHOLD + 2):
+                        summary, item = run(False)
+                        self.assertEqual(1, summary["global_failure"])
+                        self.assertEqual(1, summary["active_rules"])
+                        self.assertIsNone(item["healthy"])
+                        self.assertTrue(item["probe_uncertain"])
+                    for _ in range(health.SUCCESS_THRESHOLD - 1):
+                        _, item = run(True)
+                        self.assertIsNone(item["healthy"])
+                    _, item = run(False)
+                    self.assertIsNone(item["healthy"])
+                    self.assertEqual(0, item["successes"])
+                    for _ in range(health.SUCCESS_THRESHOLD - 1):
+                        _, item = run(True)
+                        self.assertIsNone(item["healthy"])
+                    self.assertEqual([], [call for call in api.calls if call[0] != "GET"])
+                    self.assertTrue(api.records[("example.com", ip)]["enabled"])
+                    self.assertFalse(api.records[("disabled.example", ip)]["enabled"])
+                    self.assertNotIn(("*.example.com", ip), api.records)
+                    self.assertNotIn(("missing.example", ip), api.records)
+
+                    summary, item = run(True)
+                self.assertIs(item["healthy"], True)
+                self.assertFalse(item.get("probe_uncertain", False))
+                self.assertEqual(4, summary["active_rules"])
+                self.assertTrue(all(item["enabled"] for item in api.records.values()))
+                self.assertEqual({("example.com", ip), ("*.example.com", ip),
+                                  ("disabled.example", ip), ("missing.example", ip)},
+                                 set(api.records))
+
+    def test_partial_state_preserves_unknown_owners_but_not_known_unhealthy(self):
+        health = load_healthcheck()
+        ip = "203.0.113.10"
+        services = {name: [name + ".example"] for name in
+                    ("good", "bad", "missing", "invalid", "partial", "counter")}
+        policy = {
+            "services": services,
+            "domains": [
+                {"domain": "good.example", "kind": "fqdn", "services": ["good"]},
+                {"domain": "bad.example", "kind": "fqdn", "services": ["bad"]},
+                {"domain": "missing.example", "kind": "fqdn", "services": ["missing"]},
+                {"domain": "invalid.example", "kind": "fqdn", "services": ["invalid"]},
+                {"domain": "partial.example", "kind": "fqdn", "services": ["partial"]},
+                {"domain": "counter.example", "kind": "fqdn", "services": ["counter"]},
+                {"domain": "disabled.example", "kind": "fqdn", "services": ["partial"]},
+                {"domain": "absent.example", "kind": "fqdn", "services": ["partial"]},
+                {"domain": "shared.example", "kind": "suffix", "services": ["bad", "missing"]},
+                {"domain": "healthy-shared.example", "kind": "fqdn", "services": ["good", "invalid"]},
+            ],
+        }
+        records = [{"domain": name, "answer": ip, "enabled": name != "disabled.example"}
+                   for name in ("good.example", "bad.example", "missing.example", "invalid.example",
+                                "partial.example", "counter.example", "disabled.example",
+                                "shared.example", "*.shared.example")]
+        api = RewriteApi(records)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+            (root / "state.json").write_text(json.dumps({
+                "good": {"healthy": True}, "bad": {"healthy": False},
+                "invalid": "not-an-object", "partial": {"successes": 2},
+                "counter": {"healthy": True, "failures": -1},
+            }), encoding="utf-8")
+            recovery = set()
+            args = dict(policy_path=root / "policy.json", state_path=root / "state.json",
+                        lock_path=root / "health.lock", doh_probe_func=lambda: None,
+                        probe_func=lambda host: host == "good.example" or host in recovery)
+            with mock.patch.object(health, "PUBLIC_IP", ip), \
+                    mock.patch.object(health, "login", return_value="sid=x"), \
+                    mock.patch.object(health, "api", side_effect=api):
+                for _ in range(health.FAILURE_THRESHOLD + 2):
+                    summary = health.run_once(**args)
+                    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+                    self.assertEqual(0, summary["global_failure"])
+                    self.assertIs(state["good"]["healthy"], True)
+                    self.assertIs(state["bad"]["healthy"], False)
+                    for service in ("missing", "invalid", "partial", "counter"):
+                        self.assertIsNone(state[service]["healthy"])
+                        self.assertTrue(state[service]["probe_uncertain"])
+                self.assertFalse(api.records[("bad.example", ip)]["enabled"])
+                self.assertFalse(api.records[("disabled.example", ip)]["enabled"])
+                self.assertNotIn(("absent.example", ip), api.records)
+                for name in ("missing.example", "invalid.example", "partial.example",
+                             "counter.example", "shared.example", "*.shared.example"):
+                    self.assertTrue(api.records[(name, ip)]["enabled"])
+                self.assertTrue(api.records[("healthy-shared.example", ip)]["enabled"])
+                updates = [body for method, path, body in api.calls if path == "/control/rewrite/update"]
+                self.assertEqual([{"target": {"domain": "bad.example", "answer": ip},
+                                   "update": {"enabled": False}}], updates)
+
+                recovery.add("partial.example")
+                for _ in range(health.SUCCESS_THRESHOLD - 1):
+                    health.run_once(**args)
+                    state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+                    self.assertIsNone(state["partial"]["healthy"])
+                    self.assertFalse(api.records[("disabled.example", ip)]["enabled"])
+                    self.assertNotIn(("absent.example", ip), api.records)
+                health.run_once(**args)
+                state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+                self.assertIs(state["partial"]["healthy"], True)
+                self.assertTrue(api.records[("disabled.example", ip)]["enabled"])
+                self.assertTrue(api.records[("absent.example", ip)]["enabled"])
+                self.assertIsNone(state["missing"]["healthy"])
+                self.assertTrue(api.records[("shared.example", ip)]["enabled"])
+
+    def test_known_unhealthy_still_disables_existing_rule_in_global_failure(self):
+        health = load_healthcheck()
+        ip = "203.0.113.10"
+        policy = {"services": {"example": ["example.com"]},
+                  "domains": [{"domain": "example.com", "kind": "fqdn", "services": ["example"]}]}
+        api = RewriteApi([{"domain": "example.com", "answer": ip, "enabled": True}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+            (root / "state.json").write_text('{"example":{"healthy":false}}', encoding="utf-8")
+            with mock.patch.object(health, "PUBLIC_IP", ip), \
+                    mock.patch.object(health, "login", return_value="sid=x"), \
+                    mock.patch.object(health, "api", side_effect=api):
+                health.run_once(policy_path=root / "policy.json", state_path=root / "state.json",
+                                lock_path=root / "health.lock", probe_func=lambda host: False,
+                                doh_probe_func=lambda: None)
+        self.assertFalse(api.records[("example.com", ip)]["enabled"])
+
+    def test_unknown_compatibility_domain_preserves_existing_rule(self):
+        health = load_healthcheck()
+        ip = "203.0.113.10"
+        policy = [{"domain": "example.com", "kind": "fqdn", "probe": "example.com"}]
+        api = RewriteApi([{"domain": "example.com", "answer": ip, "enabled": True}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+            with mock.patch.object(health, "PUBLIC_IP", ip), \
+                    mock.patch.object(health, "login", return_value="sid=x"), \
+                    mock.patch.object(health, "api", side_effect=api):
+                health.run_once(policy_path=root / "policy.json", state_path=root / "state.json",
+                                lock_path=root / "health.lock", probe_func=lambda host: False,
+                                doh_probe_func=lambda: None)
+        self.assertTrue(api.records[("example.com", ip)]["enabled"])
+        self.assertEqual([], [call for call in api.calls if call[0] != "GET"])
 
     def test_tls_probe_requires_verified_chain_and_hostname(self):
         health = load_healthcheck()

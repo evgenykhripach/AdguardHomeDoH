@@ -3,7 +3,8 @@
 
 The policy file contains the enabled service set and the effective domain
 union. Health is persisted by service ID, or by domain for compatibility
-policies. Shared domains remain active while any healthy owner remains.
+policies. Shared domains remain active while any owner is healthy, and an
+unknown owner protects an existing active rewrite.
 """
 
 from __future__ import annotations
@@ -437,6 +438,22 @@ def probe_services(
     }
 
 
+def _health_record(value: Any) -> Tuple[Optional[bool], int, int]:
+    """Read a prior service record; missing or malformed health is unknown."""
+
+    if not isinstance(value, Mapping) or "healthy" not in value:
+        return None, 0, 0
+    healthy = value["healthy"]
+    successes = value.get("successes", 0)
+    failures = value.get("failures", 0)
+    if ((healthy is not None and not isinstance(healthy, bool))
+            or type(successes) is not int or successes < 0
+            or type(failures) is not int or failures < 0
+            or ("probe_uncertain" in value and not isinstance(value["probe_uncertain"], bool))):
+        return None, 0, 0
+    return healthy, successes, failures
+
+
 def update_health_state(
     old_state: Mapping[str, Any],
     results: Mapping[str, bool],
@@ -449,23 +466,24 @@ def update_health_state(
     state: Dict[str, Dict[str, Any]] = {}
     transitions = []
     for service_id in sorted(results):
-        previous = old_state.get(service_id, {}) if isinstance(old_state, Mapping) else {}
-        healthy = bool(previous.get("healthy", False))
-        successes = int(previous.get("successes", 0) or 0)
-        failures = int(previous.get("failures", 0) or 0)
+        previous = old_state.get(service_id) if isinstance(old_state, Mapping) else None
+        healthy, successes, failures = _health_record(previous)
         if results[service_id]:
             successes += 1
             failures = 0
-            if not healthy and successes >= success_threshold:
+            if healthy is not True and successes >= success_threshold:
                 healthy = True
                 transitions.append(service_id)
         else:
             failures += 1
             successes = 0
-            if healthy and failures >= failure_threshold:
+            if healthy is True and failures >= failure_threshold:
                 healthy = False
                 transitions.append(service_id)
         state[service_id] = {"healthy": healthy, "successes": successes, "failures": failures}
+        if healthy is None and (not results[service_id] or (
+                isinstance(previous, Mapping) and previous.get("probe_uncertain") is True)):
+            state[service_id]["probe_uncertain"] = True
     return state, transitions
 
 
@@ -477,30 +495,38 @@ def _domain_rows(policy: Any) -> Iterable[Mapping[str, Any]]:
     return (row for row in rows if isinstance(row, Mapping))
 
 
-def desired_rules(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP) -> list:
-    """Return desired managed rewrite keys from selected healthy services."""
+def _rules_by_health(policy: Any, state: Mapping[str, Any], public_ip: str) -> Tuple[set, set]:
+    """Separate desired rules from rules protected by an unknown owner."""
 
-    result = []
+    desired, unknown = set(), set()
     for row in _domain_rows(policy):
         service_ids = row.get("services", row.get("service_ids"))
         if service_ids is None and row.get("service_id") is not None:
             service_ids = [row["service_id"]]
         if isinstance(service_ids, str):
             service_ids = [service_ids]
-        if service_ids:
-            active = any(bool(state.get(str(service_id), {}).get("healthy", False)) for service_id in service_ids)
-        else:
+        if not service_ids:
             # Compatibility policy has one state key per domain.
-            active = bool(state.get(str(row.get("domain", "")), {}).get("healthy", False))
-        if not active:
-            continue
+            service_ids = [row.get("domain", "")]
+        health = [_health_record(state.get(str(service_id)))[0] for service_id in service_ids]
         domain = str(row.get("domain", ""))
         if not domain:
             continue
-        result.append((domain, public_ip))
+        keys = {(domain, public_ip)}
         if str(row.get("kind", "")) == "suffix":
-            result.append(("*." + domain, public_ip))
-    return sorted(set(result))
+            keys.add(("*." + domain, public_ip))
+        if any(value is True for value in health):
+            desired.update(keys)
+        if any(value is None for value in health):
+            unknown.update(keys)
+    return desired, unknown
+
+
+def desired_rules(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP) -> list:
+    """Return desired managed rewrite keys from selected healthy services."""
+
+    desired, _unknown = _rules_by_health(policy, state, public_ip)
+    return sorted(desired)
 
 
 def credentials() -> Dict[str, str]:
@@ -578,7 +604,7 @@ def reconcile(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP)
     for item in current:
         if isinstance(item, Mapping):
             by_key[(str(item.get("domain", "")), str(item.get("answer", "")))] = item
-    desired = set(desired_rules(policy, state, public_ip))
+    desired, unknown = _rules_by_health(policy, state, public_ip)
     managed = set()
     for row in _domain_rows(policy):
         domain = str(row.get("domain", ""))
@@ -606,22 +632,24 @@ def reconcile(policy: Any, state: Mapping[str, Any], public_ip: str = PUBLIC_IP)
                 {"domain": key[0], "answer": key[1]})
             changes += 1
             continue
-        if key in managed and key not in desired and item.get("enabled", True):
+        if key in managed and key not in desired and key not in unknown and item.get("enabled", True):
             api("PUT", "/control/rewrite/update", cookie,
                 {"target": {"domain": key[0], "answer": key[1]}, "update": {"enabled": False}})
             changes += 1
     if changes:
         api("POST", "/control/cache_clear", cookie)
-    return changes, len(desired)
+    preserved = {key for key, item in by_key.items()
+                 if key in managed and key in unknown and item.get("enabled", True)}
+    return changes, len(desired | preserved)
 
 
 def is_global_failure(results: Mapping[str, bool]) -> bool:
     """Report whether every probed service failed in the same cycle.
 
     A clean sweep may reflect a local fault, such as nginx or the host uplink.
-    Preserve the prior health states to avoid withdrawing every rewrite. With
-    one service this also preserves its rewrite during a remote-only outage;
-    these cases cannot be distinguished without an independent signal.
+    Preserve the prior health states to avoid withdrawing every rewrite. This
+    also preserves rewrites during a remote-only outage. These cases
+    cannot be distinguished without an independent signal.
     """
 
     return bool(results) and not any(results.values())
@@ -643,17 +671,12 @@ def run_once(
         doh_ok = _doh_self_probe(doh_probe_func)
         global_failure = is_global_failure(results)
         if global_failure:
-            state = {
-                service_id: {
-                    "healthy": bool(old.get(service_id, {}).get("healthy", False))
-                    if isinstance(old, Mapping) else False,
-                    "successes": 0,
-                    "failures": int(old.get(service_id, {}).get("failures", 0) or 0)
-                    if isinstance(old, Mapping) else 0,
-                    "probe_uncertain": True,
-                }
-                for service_id in sorted(results)
-            }
+            state = {}
+            for service_id in sorted(results):
+                previous = old.get(service_id) if isinstance(old, Mapping) else None
+                healthy, _successes, failures = _health_record(previous)
+                state[service_id] = {"healthy": healthy, "successes": 0,
+                                     "failures": failures, "probe_uncertain": True}
             transitions: list = []
         else:
             state, transitions = update_health_state(old, results)
