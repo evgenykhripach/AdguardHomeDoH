@@ -15,14 +15,19 @@ class FakeSystemd:
         self.states['adguardhome-doh-health.service'] = {'load': 'loaded', 'active': False, 'enabled': 'static', 'auto_restart': False, 'degraded': ''}
         self.commands = []
         self.current_override = {}
+        self.jobs = ''
 
     def __call__(self, argv, **kwargs):
         self.commands.append(argv)
         action = argv[1]
+        if action == 'list-jobs':
+            return SimpleNamespace(stdout=self.jobs)
         if action == 'show':
             state = self.states[argv[2]]
             if 'MainPID' in argv[3]:
                 current = self.current_override.get(argv[2], 'activating' if state['auto_restart'] else ('active' if state['active'] else 'inactive'))
+                if argv[2].endswith('.timer'):
+                    return SimpleNamespace(stdout='LoadState=%s\nActiveState=%s\n' % (state['load'], current))
                 return SimpleNamespace(stdout='LoadState=%s\nActiveState=%s\nMainPID=0\nControlGroup=\n' % (state['load'], current))
             return SimpleNamespace(stdout='LoadState=%s\nActiveState=%s\nSubState=%s\nUnitFileState=%s\n' %
                 (state['load'], 'activating' if state['auto_restart'] else ('failed' if state['degraded'] == 'failed' else ('active' if state['active'] else 'inactive')),
@@ -173,6 +178,19 @@ class MaintenanceSnapshotTests(unittest.TestCase):
             self.assertIn(unit, stopped)
         self.assertTrue(self.systemd.states['adguardhome-doh.service']['active'])
         self.assertTrue(self.systemd.states['mtproxyl-pq-nginx.service']['active'])
+
+    def test_pending_timer_job_prevents_restore(self):
+        self.yaml.write_text('changed\n')
+        self.systemd.jobs = '42 adguardhome-doh-health.timer start waiting\n'
+        with self.assertRaisesRegex(RuntimeError, 'pending systemd job'):
+            maintenance.restore(self.root, self.snapshot, self.systemd)
+        self.assertEqual(self.yaml.read_text(), 'changed\n')
+
+    def test_timer_show_only_load_and_active(self):
+        state, pid = maintenance._stoppable_state('adguardhome-doh-health.timer', self.systemd)
+        self.assertEqual(pid, 0)
+        self.assertEqual(state['ControlGroup'], '')
+        self.assertEqual(state['ActiveState'], 'active')
 
     def test_populated_cgroup_prevents_restore(self):
         self.yaml.write_text('changed\n')

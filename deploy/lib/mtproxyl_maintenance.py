@@ -84,7 +84,10 @@ def _stoppable_state(unit, runner):
                     check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=30)
     values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
-    if set(values) != {'LoadState', 'ActiveState', 'MainPID', 'ControlGroup'}:
+    if unit.endswith('.timer') and set(values) == {'LoadState', 'ActiveState'}:
+        # Timers have no process or cgroup properties in systemd.
+        values.update(MainPID='0', ControlGroup='')
+    elif set(values) != {'LoadState', 'ActiveState', 'MainPID', 'ControlGroup'}:
         raise RuntimeError('cannot read current systemd state')
     if values['LoadState'] not in ('loaded', 'not-found'):
         raise RuntimeError('unknown current systemd unit state')
@@ -263,6 +266,11 @@ def restore(root, dest, runner=subprocess.run):
         if current['LoadState'] == 'loaded':
             runner(['systemctl', 'stop', unit], check=True, stdout=subprocess.PIPE,
                    stderr=subprocess.PIPE, timeout=45)
+    jobs = runner(['systemctl', 'list-jobs', '--no-legend', '--plain'], check=True,
+                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    for line in jobs.stdout.splitlines():
+        if any(unit in line.split() for unit in UNITS):
+            raise RuntimeError('unit still has a pending systemd job')
     for unit in UNITS:
         current, pid = _stoppable_state(unit, runner)
         if (current['ActiveState'] not in ('inactive', 'failed') or pid != 0
