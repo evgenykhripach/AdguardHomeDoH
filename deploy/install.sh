@@ -456,6 +456,29 @@ adguardhome_doh_update_summary() {
     printf 'Если в каталоге появились новые домены, скачайте и переустановите Apple-профиль.\n'
 }
 
+# Prepare only transaction inputs in a private directory. The transaction owns
+# publication, listener takeover, certificates, restart and rollback. In
+# particular, mtproxyl_runtime.stage/publish must run while its lifecycle lock
+# is held; it must never rewrite the vendor source nginx.conf.
+adguardhome_doh_stage_shared_front() {
+    local stage="$1" domain="$2" admin_host="$3"
+    [[ -d "$stage" && ! -L "$stage" ]] || return 1
+    [[ -n "$admin_host" ]] || return 1
+    install -m 600 "$PROJECT_ROOT/deploy/templates/mtproxyl-nginx.conf" "$stage/mtproxyl-nginx.conf" || return 1
+    install -m 644 "$PROJECT_ROOT/deploy/templates/adguardhome-doh-nginx.service" "$stage/adguardhome-doh-nginx.service" || return 1
+    python3 "$SCRIPT_DIR/lib/mtproxyl_front.py" render-http --domain "$domain" \
+        --output "$stage/mtproxyl-http.conf" || return 1
+    python3 "$SCRIPT_DIR/lib/mtproxyl_front.py" render-admin-http --admin-host "$admin_host" \
+        --root /var/www/adguardhome-doh-acme --output "$stage/mtproxyl-admin-acme.conf"
+}
+
+# Integration boundary: maintenance prepare must stage and validate every file,
+# including the runtime overlay and both certificate paths, before its start
+# arms autonomous rollback. It must capture and restore system nginx state,
+# and stop/disable that unit only inside the armed transaction when it conflicts.
+# commit is permitted only after independent live DoH, admin and MTProxy checks.
+# Until that interface is wired end-to-end, the early guard stays in place.
+
 adguardhome_doh_render_dry_run() {
     local output status use_existing="${1:-0}"
     local -a existing_args=()
@@ -466,6 +489,7 @@ adguardhome_doh_render_dry_run() {
         [[ -n "$EXISTING_PUBLIC_IP" ]] && existing_args+=(--existing-public-ip "$EXISTING_PUBLIC_IP")
     fi
     output="$(mktemp -d)"
+    output="$(cd -- "$output" && pwd -P)"
     if ((POLICY_ARGUMENT)); then
         if python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py"             --policy "$POLICY" ${POLICY_CATALOG_ARGS[@]+"${POLICY_CATALOG_ARGS[@]}"} --front "$FRONT" ${ADMIN_HOST_ARGS[@]+"${ADMIN_HOST_ARGS[@]}"} --public-ip "$PUBLIC_IP" ${RELAY_ARGS[@]+"${RELAY_ARGS[@]}"} ${LOCAL_SITE_ARGS[@]+"${LOCAL_SITE_ARGS[@]}"} ${existing_args[@]+"${existing_args[@]}"} --doh-host "$DOMAIN"             --doh-token "$(printf '%048d' 0 | tr 0 a)" --password-hash 'dry-run-hash'             --certificate-root "/etc/letsencrypt/live/$DOMAIN" --webroot "$WEBROOT" --output "$output"; then
             status=0
@@ -478,6 +502,9 @@ adguardhome_doh_render_dry_run() {
         else
             status=$?
         fi
+    fi
+    if ((status == 0)) && [[ "$FRONT" == mtproxyl && -n "$ADMIN_HOST" ]]; then
+        adguardhome_doh_stage_shared_front "$output" "$DOMAIN" "$ADMIN_HOST" || status=$?
     fi
     rm -rf -- "$output"
     return "$status"

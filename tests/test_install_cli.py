@@ -281,6 +281,28 @@ class InstallerCliTests(unittest.TestCase):
             self.assertEqual(0, manager.returncode, manager.stderr)
             self.assertIn("Front: mtproxyl", manager.stdout)
 
+    def test_shared_front_staging_renders_private_files_only(self):
+        source = INSTALL.read_text(encoding="utf-8")
+        start = source.index("adguardhome_doh_stage_shared_front() {")
+        end = source.index("\n# Integration boundary:", start)
+        function = source[start:end]
+        with tempfile.TemporaryDirectory(dir="/private/tmp" if sys.platform == "darwin" else None) as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir(mode=0o700)
+            result = subprocess.run(
+                ["bash", "-c", function + '\nadguardhome_doh_stage_shared_front "$1" '
+                 'dns.example.com admin.example.com',
+                 "bash", str(stage)], cwd=ROOT, text=True, capture_output=True,
+                env={**os.environ, "PROJECT_ROOT": str(ROOT), "SCRIPT_DIR": str(ROOT / "deploy")},
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual({"mtproxyl-nginx.conf", "adguardhome-doh-nginx.service",
+                              "mtproxyl-http.conf", "mtproxyl-admin-acme.conf"},
+                             {p.name for p in stage.iterdir()})
+            self.assertIn("admin.example.com", (stage / "mtproxyl-admin-acme.conf").read_text())
+            self.assertIn("127.0.0.1:4443", (stage / "mtproxyl-http.conf").read_text())
+            self.assertEqual(0o600, (stage / "mtproxyl-http.conf").stat().st_mode & 0o777)
+
     def test_shared_front_real_install_is_rejected_before_system_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
