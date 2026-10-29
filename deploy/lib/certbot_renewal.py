@@ -18,11 +18,15 @@ edited line by line and left untouched unless it really needs the change.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
+import secrets
 import stat
 import sys
 import tempfile
+import time
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -31,6 +35,252 @@ OLD_NGINX_HOOKS = {
     "post_hook": re.compile(r"^(?:/usr/bin/)?systemctl\s+start\s+nginx(?:\.service)?$") ,
 }
 HOOK_MARKER = "# Managed by adguardhome-doh"
+
+
+class ReloadUnit(Enum):
+    """Units allowed in a new per-lineage hook."""
+
+    SHARED_NGINX = "adguardhome-doh-nginx"
+
+
+class HookPartialCommitError(OSError):
+    """A hook may have been published, but its durable state is unknown."""
+
+
+def _hook_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _open_trusted_hook_directory(directory):
+    """Open a root-owned directory through root-owned, non-symlink parents."""
+    raw = os.fspath(directory)
+    if not isinstance(raw, str) or not raw or ".." in raw.split(os.sep):
+        raise ValueError("invalid Certbot hook directory")
+    parts = [part for part in os.path.abspath(raw).split(os.sep) if part]
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(os.sep, flags)
+    try:
+        def check(terminal):
+            info = os.fstat(fd)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                    or (info.st_mode & 0o022 and
+                        (terminal or not info.st_mode & stat.S_ISVTX))):
+                raise ValueError("unsafe Certbot hook directory: %s" % directory)
+
+        check(not parts)
+        for index, part in enumerate(parts):
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            check(index == len(parts) - 1)
+        return fd
+    except OSError as exc:
+        os.close(fd)
+        raise ValueError("unsafe or inaccessible Certbot hook directory: %s" % directory) from exc
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _check_hook_directory_identity(directory, original):
+    fd = _open_trusted_hook_directory(directory)
+    try:
+        current = os.fstat(fd)
+        fields = lambda info: (info.st_dev, info.st_ino, info.st_mode,
+                               info.st_uid, info.st_gid)
+        if fields(current) != fields(original):
+            raise ValueError("Certbot hook directory changed: %s" % directory)
+    finally:
+        os.close(fd)
+
+
+def _check_deploy_directory_entry(staging_fd, directory_info):
+    named = os.stat("deploy", dir_fd=staging_fd, follow_symlinks=False)
+    fields = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid)
+    if fields(named) != fields(directory_info):
+        raise ValueError("Certbot deploy directory changed")
+
+
+class _HookHasHardlink(ValueError):
+    pass
+
+
+def _check_existing_lineage_hook(directory_fd, name, expected):
+    """Accept only the exact file opened and still named in the directory."""
+    def check(info):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o755):
+            raise ValueError("unsafe or conflicting Certbot lineage hook: %s" % name)
+        if info.st_nlink != 1:
+            raise _HookHasHardlink("Certbot lineage hook has hardlinks: %s" % name)
+
+    try:
+        named_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        check(named_before)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ValueError("unsafe or inaccessible Certbot lineage hook: %s" % name) from exc
+    try:
+        before = os.fstat(fd)
+        check(before)
+        if _hook_identity(named_before) != _hook_identity(before):
+            raise ValueError("Certbot lineage hook changed during verification: %s" % name)
+        # Limit the read even if an unexpected regular file is very large.
+        data = bytearray()
+        while len(data) <= len(expected):
+            chunk = os.read(fd, len(expected) + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        os.fsync(fd)
+        after = os.fstat(fd)
+        named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        check(after)
+        check(named_after)
+        if (_hook_identity(before) != _hook_identity(after)
+                or _hook_identity(after) != _hook_identity(named_after)
+                or bytes(data) != expected):
+            raise ValueError("Certbot lineage hook changed or conflicts: %s" % name)
+    finally:
+        os.close(fd)
+
+
+def _check_existing_lineage_hook_with_retry(directory_fd, name, expected):
+    # A concurrent creator briefly has both its temporary and final hardlinks.
+    # Never accept that state; wait briefly for its temporary link to disappear.
+    for attempt in range(50):
+        try:
+            _check_existing_lineage_hook(directory_fd, name, expected)
+            return
+        except _HookHasHardlink:
+            if attempt == 49:
+                raise
+            time.sleep(0.01)
+
+
+def ensure_lineage_reload_hook(directory: Path, domain: str, unit: ReloadUnit) -> Path:
+    """Create, or verify, one root-owned reload hook without overwriting anything.
+
+    The directory must be ``.../renewal-hooks/deploy``. Its trusted parent is
+    used for staging because Certbot scans executable dotfiles in deploy too.
+    Both directories and their ancestors must already exist and be trusted;
+    both directories must be on the same filesystem. A root process that
+    changes paths or files after our checks cannot be excluded.
+    This does not inspect the legacy hook for a conflicting lineage block,
+    remove the new hook on rollback, or integrate service/supervisor actions.
+    Callers must handle those operations and a possible partial commit.
+    """
+    if (not isinstance(domain, str) or len(domain) > 253 or domain != domain.lower()
+            or len(domain.split(".")) < 2
+            or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                   for label in domain.split("."))):
+        raise ValueError("invalid canonical domain for renewal hook")
+    if unit is not ReloadUnit.SHARED_NGINX:
+        raise ValueError("invalid unit for renewal hook")
+    directory = Path(directory)
+    if directory.name != "deploy" or directory.parent.name != "renewal-hooks":
+        raise ValueError("Certbot hook directory must be renewal-hooks/deploy")
+    staging_directory = directory.parent
+    name = "adguardhome-doh-reload-" + hashlib.sha256(domain.encode("ascii")).hexdigest()
+    path = directory / name
+    content = ("#!/bin/sh\n" + HOOK_MARKER + "\n"
+               + 'if [ "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/' + domain + '" ]; then\n'
+               + "    systemctl reload " + unit.value + "\nfi\n").encode("ascii")
+    staging_fd = _open_trusted_hook_directory(staging_directory)
+    try:
+        directory_fd = _open_trusted_hook_directory(directory)
+    except BaseException:
+        os.close(staging_fd)
+        raise
+    temporary_fd = None
+    temporary_name = None
+    published = False
+    try:
+        directory_info = os.fstat(directory_fd)
+        staging_info = os.fstat(staging_fd)
+        if directory_info.st_dev != staging_info.st_dev:
+            raise ValueError("Certbot hook and staging directories must share a filesystem")
+        _check_deploy_directory_entry(staging_fd, directory_info)
+        _check_hook_directory_identity(staging_directory, staging_info)
+        for _ in range(10):
+            temporary_name = ".adguardhome-doh-reload-" + secrets.token_hex(16)
+            try:
+                temporary_fd = os.open(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                       | os.O_NOFOLLOW, 0o600, dir_fd=staging_fd)
+                break
+            except FileExistsError:
+                temporary_name = None
+        else:
+            raise FileExistsError("cannot create temporary Certbot lineage hook")
+
+        remaining = memoryview(content)
+        while remaining:
+            count = os.write(temporary_fd, remaining)
+            if not count:
+                raise OSError("short write to temporary Certbot lineage hook")
+            remaining = remaining[count:]
+        os.fchmod(temporary_fd, 0o755)
+        os.fsync(temporary_fd)
+        temporary_info = os.fstat(temporary_fd)
+        if (not stat.S_ISREG(temporary_info.st_mode) or temporary_info.st_uid != 0
+                or stat.S_IMODE(temporary_info.st_mode) != 0o755 or temporary_info.st_nlink != 1
+                or _hook_identity(temporary_info) != _hook_identity(
+                    os.stat(temporary_name, dir_fd=staging_fd, follow_symlinks=False))):
+            raise ValueError("unsafe or changed temporary Certbot lineage hook")
+        _check_hook_directory_identity(staging_directory, staging_info)
+        _check_hook_directory_identity(directory, directory_info)
+        _check_deploy_directory_entry(staging_fd, directory_info)
+        try:
+            os.link(temporary_name, name, src_dir_fd=staging_fd, dst_dir_fd=directory_fd,
+                    follow_symlinks=False)
+            published = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            # Some filesystems can report an error after the namespace operation.
+            raise HookPartialCommitError(
+                "Certbot lineage hook link failed; the target may already exist: %s" % path
+            ) from exc
+        os.unlink(temporary_name, dir_fd=staging_fd)
+        temporary_name = None
+        if published and _hook_identity(os.fstat(temporary_fd)) != _hook_identity(
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)):
+            raise ValueError("published Certbot lineage hook changed: %s" % path)
+        _check_existing_lineage_hook_with_retry(directory_fd, name, content)
+        os.fsync(directory_fd)
+        os.fsync(staging_fd)
+        _check_hook_directory_identity(staging_directory, staging_info)
+        _check_hook_directory_identity(directory, directory_info)
+        _check_deploy_directory_entry(staging_fd, directory_info)
+        _check_existing_lineage_hook_with_retry(directory_fd, name, content)
+    except Exception as exc:
+        if published:
+            raise HookPartialCommitError(
+                "Certbot lineage hook may already exist; publication or durability is uncertain: %s"
+                % path
+            ) from exc
+        raise
+    finally:
+        try:
+            if temporary_name is not None and temporary_fd is not None:
+                try:
+                    named = os.stat(temporary_name, dir_fd=staging_fd, follow_symlinks=False)
+                    opened = os.fstat(temporary_fd)
+                    if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise ValueError("temporary Certbot hook changed; refusing cleanup")
+                    os.unlink(temporary_name, dir_fd=staging_fd)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    error = (HookPartialCommitError if published else OSError)
+                    raise error("temporary Certbot hook may remain; hook may already exist: %s" % path) from exc
+        finally:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            os.close(directory_fd)
+            os.close(staging_fd)
+    return path
 
 
 def _key(line: str) -> Optional[str]:
