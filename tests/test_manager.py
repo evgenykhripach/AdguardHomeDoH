@@ -989,9 +989,34 @@ class BackupSafetyTests(unittest.TestCase):
             manifest_path = backup / "manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["files"] = [item for item in manifest["files"]
-                                 if item["path"] not in manager.FRONT_OVERLAY_FILES]
+                                 if item["path"] not in manager.FRONT_OVERLAY_FILES + manager.FRONT_SITE_FILES]
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             self.assertTrue(manager._validated_backup_manifest(backup))
+
+    def test_previous_v4_snapshot_with_overlay_without_private_sites_remains_readable(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, root / "backup", operation="recovery", domain="dns.example.com")
+            manifest_path = backup / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files"] = [item for item in manifest["files"]
+                                 if item["path"] not in manager.FRONT_SITE_FILES]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertTrue(manager._validated_backup_manifest(backup))
+
+    def test_v4_snapshot_missing_only_one_private_site_is_invalid(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, root / "backup", operation="recovery", domain="dns.example.com")
+            manifest_path = backup / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files"] = [item for item in manifest["files"]
+                                 if item["path"] != manager.PRIVATE_NGINX_HTTP_SITE]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "backup manifest is incomplete"):
+                manager._validated_backup_manifest(backup)
 
     def test_backup_copy_preserves_owner_and_group_or_fails_closed(self):
         manager = load_manager()
@@ -1257,6 +1282,125 @@ class BackupSafetyTests(unittest.TestCase):
                                               "--files-only"]))
             self.assertEqual("old", binary.read_text())
 
+    def test_files_only_preserve_system_nginx_on_standard_to_shared_rollback(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text('{"domain":"dns.example.com"}', encoding="utf-8")
+            system = root / "etc/nginx/nginx.conf"
+            system.parent.mkdir(parents=True)
+            system.write_text("old system")
+            system_site = root / "etc/nginx/sites-enabled/adguardhome-doh"
+            system_site.parent.mkdir(parents=True)
+            system_site.write_text("old system site")
+            system_stream = root / "etc/nginx/stream.d/adguardhome-doh.conf"
+            system_stream.parent.mkdir(parents=True)
+            system_stream.write_text("old system stream")
+            dropin = root / "etc/systemd/system/nginx.service.d/adguardhome-doh.conf"
+            dropin.parent.mkdir(parents=True)
+            dropin.write_text("old dropin")
+            enabled = root / "etc/systemd/system/multi-user.target.wants/nginx.service"
+            enabled.parent.mkdir(parents=True)
+            enabled.symlink_to("/usr/lib/systemd/system/nginx.service")
+            runtime = root / "etc/adguardhome-doh/runtime.env"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text("old runtime")
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            system.write_text("user changed system")
+            system_site.write_text("user changed system site")
+            system_stream.write_text("user changed system stream")
+            dropin.write_text("user changed dropin")
+            enabled.unlink()
+            enabled.symlink_to("/some/other/unit")
+            runtime.write_text("new runtime")
+            state_file.write_text('{"domain":"dns.example.com","front":"mtproxyl"}', encoding="utf-8")
+            for path in manager.FRONT_SITE_FILES:
+                manager.under_root(root, path).write_text("new private site")
+            result = manager.main(["--restore-update-backup", str(backup), "--root", str(root),
+                                   "--domain", "dns.example.com", "--files-only", "--preserve-system-nginx"])
+            self.assertEqual(0, result)
+            self.assertEqual("user changed system", system.read_text())
+            self.assertEqual("user changed system site", system_site.read_text())
+            self.assertEqual("user changed system stream", system_stream.read_text())
+            self.assertEqual("user changed dropin", dropin.read_text())
+            self.assertEqual("/some/other/unit", str(enabled.readlink()))
+            self.assertEqual("old runtime", runtime.read_text())
+            self.assertNotIn("front", json.loads(state_file.read_text()))
+            for path in manager.FRONT_SITE_FILES:
+                self.assertFalse(manager.under_root(root, path).exists())
+
+    def test_preserve_system_nginx_requires_files_only_restore_and_valid_manifest(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            system = root / "etc/nginx/nginx.conf"
+            system.parent.mkdir(parents=True)
+            system.write_text("old system")
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            system.write_text("current system")
+            manifest = json.loads((backup / "manifest.json").read_text())
+            entry = next(item for item in manifest["files"] if item["path"] == "/etc/nginx/nginx.conf")
+            (backup / entry["backup"]).write_text("tampered")
+            with mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(1, manager.main(["--create-update-backup", "--root", str(root),
+                                                  "--preserve-system-nginx"]))
+                self.assertEqual(1, manager.main(["--restore-update-backup", str(backup), "--root", str(root),
+                                                  "--preserve-system-nginx"]))
+                self.assertEqual(1, manager.main(["--restore-update-backup", str(backup), "--root", str(root),
+                                                  "--files-only", "--preserve-system-nginx"]))
+            self.assertEqual("current system", system.read_text())
+
+    def test_skipped_system_site_backups_still_require_valid_hashes(self):
+        manager = load_manager()
+        for relative in ("/etc/nginx/sites-enabled/adguardhome-doh", "/etc/nginx/stream.d/adguardhome-doh.conf"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                system = manager.under_root(root, relative)
+                system.parent.mkdir(parents=True)
+                system.write_text("old system")
+                backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+                system.write_text("current system")
+                manifest = json.loads((backup / "manifest.json").read_text())
+                entry = next(item for item in manifest["files"] if item["path"] == relative)
+                (backup / entry["backup"]).write_text("tampered")
+                with mock.patch("sys.stderr", io.StringIO()):
+                    self.assertEqual(1, manager.main(["--restore-update-backup", str(backup), "--root", str(root),
+                                                      "--files-only", "--preserve-system-nginx"]))
+                self.assertEqual("current system", system.read_text())
+
+    def test_standard_restore_still_restores_system_nginx_sites(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = [manager.under_root(root, path) for path in (
+                "/etc/nginx/sites-enabled/adguardhome-doh",
+                "/etc/nginx/stream.d/adguardhome-doh.conf",
+            )]
+            for path in files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("old system config")
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            for path in files:
+                path.write_text("changed system config")
+            manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True)
+            for path in files:
+                self.assertEqual("old system config", path.read_text())
+
+    def test_absent_private_files_are_removed_on_restore(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            for relative in manager.FRONT_SITE_FILES:
+                target = manager.under_root(root, relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("created after snapshot")
+            manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True)
+            for relative in manager.FRONT_SITE_FILES:
+                self.assertFalse(manager.under_root(root, relative).exists())
+
 
 class ServiceChangeSeedingTests(unittest.TestCase):
     """Changing services must not drop a working service for a probe cycle."""
@@ -1293,6 +1437,17 @@ class ServiceChangeSeedingTests(unittest.TestCase):
             manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
             adguard = root / "opt/AdGuardHome/AdGuardHome.yaml"
             self.assertEqual(0, adguard.stat().st_mode & 0o007)
+
+    def test_standard_service_change_uses_system_stream_not_private_stream(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            private = root / "etc/adguardhome-doh/mtproxyl-stream-site.conf"
+            private.write_text("unchanged private stream")
+            manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+            stream = (root / "etc/nginx/stream.d/adguardhome-doh.conf").read_text()
+            self.assertIn("listen 443", stream)
+            self.assertEqual("unchanged private stream", private.read_text())
 
     def test_render_command_passes_healthy_services_as_a_complete_pair(self):
         manager = load_manager()
@@ -1906,17 +2061,12 @@ class ServiceChangeSeedingTests(unittest.TestCase):
                 self.assertTrue(manager.install_update(
                     root=root, release=release, downloader=downloader, runner=runner, output=warning
                 ))
-                state["front"] = "mtproxyl"
-                state_file.write_text(json.dumps(state), encoding="utf-8")
-                self.assertTrue(manager.install_update(
-                    root=root, release=release, downloader=downloader, runner=runner, output=warning
-                ))
             policy_command = commands[-1]
             self.assertEqual(str(policy), policy_command[policy_command.index("--policy") + 1])
             self.assertNotIn("--services", policy_command)
-            self.assertEqual("mtproxyl", policy_command[policy_command.index("--front") + 1])
+            self.assertEqual(2, len(commands))
             self.assertNotIn("--front", commands[0])
-            self.assertEqual("mtproxyl", json.loads(state_file.read_text())["front"])
+            self.assertNotIn("--front", policy_command)
             self.assertIn("заново установите Apple-профиль", warning.getvalue())
             self.assertEqual("custom-owner/private-doh", environments[0]["ADGUARDHOME_DOH_REPOSITORY"])
             self.assertEqual("1", environments[0]["ADGUARDHOME_DOH_MANAGER_UPDATE"])
@@ -1929,6 +2079,24 @@ class ServiceChangeSeedingTests(unittest.TestCase):
         self.assertIn("--update", install)
         self.assertEqual(2, install.count("--local-site"))
         self.assertIn("*=127.0.0.1:9443", install)
+
+    def test_shared_update_is_blocked_before_release_lookup_download_or_installer(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            state_file = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_file.read_text())
+            state["front"] = "mtproxyl"
+            state_file.write_text(json.dumps(state))
+            for release in (None, object()):
+                with self.subTest(release=release), mock.patch.object(manager, "_load_releases") as loader:
+                    downloader = mock.Mock()
+                    runner = mock.Mock()
+                    with self.assertRaisesRegex(RuntimeError, "обновление с общим front MTProxyL временно отключено"):
+                        manager.install_update(root=root, release=release, downloader=downloader, runner=runner)
+                    loader.assert_not_called()
+                    downloader.assert_not_called()
+                    runner.assert_not_called()
 
     def test_healthy_services_ignores_unselected_and_unproven_services(self):
         manager = load_manager()
@@ -1957,6 +2125,8 @@ class MTProxyFrontTests(unittest.TestCase):
             ("etc/adguardhome-doh/mtproxyl-sni.map", "old map"),
             ("etc/adguardhome-doh/mtproxyl-nginx.conf", "old dedicated config"),
             ("etc/systemd/system/adguardhome-doh-nginx.service", "old dedicated unit"),
+            ("etc/adguardhome-doh/mtproxyl-http-site.conf", "old private http"),
+            ("etc/adguardhome-doh/mtproxyl-stream-site.conf", "old private stream"),
             ("opt/AdGuardHome/AdGuardHome", "binary"),
             ("usr/local/libexec/adguardhome-doh/healthcheck.py", "helper"),
             ("usr/local/libexec/adguardhome-doh/mtproxyl_front.py", "front helper"),
@@ -1985,6 +2155,9 @@ class MTProxyFrontTests(unittest.TestCase):
             state["policy"] = "/etc/adguardhome-doh/compat-policy.csv"
             state_file.write_text(json.dumps(state), encoding="utf-8")
             map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+            system_stream = root / "etc/nginx/stream.d/adguardhome-doh.conf"
+            system_stream.parent.mkdir(parents=True)
+            system_stream.write_text("unrelated system nginx stream")
             calls = []
 
             def render(command, **_kwargs):
@@ -2002,6 +2175,8 @@ class MTProxyFrontTests(unittest.TestCase):
             self.assertEqual("mtproxyl", command[command.index("--front") + 1])
             self.assertNotIn("a" * 48, command)
             self.assertEqual("old map", map_path.read_text())
+            self.assertEqual("loopback", (root / "etc/adguardhome-doh/mtproxyl-stream-site.conf").read_text())
+            self.assertEqual("unrelated system nginx stream", system_stream.read_text())
             state = json.loads(state_file.read_text())
             self.assertEqual("mtproxyl", state["front"])
             self.assertNotIn("policy", state)
@@ -2013,10 +2188,46 @@ class MTProxyFrontTests(unittest.TestCase):
             root = self.build_root(directory)
             map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
             manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
-            stream = (root / "etc/nginx/stream.d/adguardhome-doh.conf").read_text()
+            stream = (root / "etc/adguardhome-doh/mtproxyl-stream-site.conf").read_text()
             self.assertIn("listen 127.0.0.1:24443 proxy_protocol", stream)
             self.assertNotIn("listen 443", stream)
             self.assertEqual("old map", map_path.read_text())
+            self.assertFalse((root / "etc/nginx/stream.d/adguardhome-doh.conf").exists())
+
+    def test_shared_activation_failure_restores_private_stream_only(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            private = root / "etc/adguardhome-doh/mtproxyl-stream-site.conf"
+            system = root / "etc/nginx/stream.d/adguardhome-doh.conf"
+            system.parent.mkdir(parents=True)
+            system.write_text("unrelated system stream")
+
+            def renderer(stage, _selected):
+                (stage / "AdGuardHome.yaml").write_text("dns: {}\n")
+                (stage / "nginx-stream.conf").write_text("new private stream")
+                (stage / "health-policy.json").write_text("{}")
+
+            def validator():
+                self.assertEqual("new private stream", private.read_text())
+                raise RuntimeError("validation failed")
+
+            with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                manager.apply_service_change(["chatgpt"], root=root, renderer=renderer, validator=validator)
+            self.assertEqual("old private stream", private.read_text())
+            self.assertEqual("unrelated system stream", system.read_text())
+
+    def test_shared_service_change_rejects_missing_site_before_rendering(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            private = root / "etc/adguardhome-doh/mtproxyl-stream-site.conf"
+            private.unlink()
+            renderer = mock.Mock()
+            with self.assertRaisesRegex(RuntimeError, "файл общего front отсутствует"):
+                manager.apply_service_change(["chatgpt"], root=root, renderer=renderer, validator=lambda: None)
+            renderer.assert_not_called()
+            self.assertFalse(private.exists())
 
     def test_front_runtime_reloads_only_private_nginx_and_probes_doh(self):
         manager = load_manager()
@@ -2114,6 +2325,52 @@ class MTProxyFrontTests(unittest.TestCase):
                         with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
                             manager._verify_mtproxyl_active_config(Path("/"), runner)
 
+    def test_unverified_runtime_front_and_degraded_fallback_block_changes(self):
+        from deploy.lib.mtproxyl_front import patch
+        from tests.test_mtproxyl_front import DOMAIN, REALISTIC
+
+        manager = load_manager()
+        for condition, content in (("prepared_overlay", patch(REALISTIC, DOMAIN)),
+                                   ("degraded_fallback", REALISTIC)):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                runtime = root / "run/adguardhome-doh/mtproxyl-nginx.conf"
+                runtime.parent.mkdir(parents=True)
+                runtime.write_text(content)
+                runtime.chmod(0o600)
+                backup = manager.create_backup(root, operation="update", domain=DOMAIN)
+                manager.finalize_update_backup(backup, root, DOMAIN)
+                map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+                map_path.write_text("current map")
+                (root / "proc/123/cmdline").write_bytes(
+                    b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0"
+                    b"/run/adguardhome-doh/mtproxyl-nginx.conf\0-g\0daemon off;\0"
+                )
+                commands = []
+
+                def runner(command, **_kwargs):
+                    commands.append(command)
+                    stdout = b"123\n" if command[:2] == ["systemctl", "show"] else b""
+                    return subprocess.CompletedProcess(command, 0, stdout, b"")
+
+                under_root = manager.under_root
+                with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                     mock.patch.object(manager, "_load_healthcheck"), \
+                     mock.patch.object(manager.subprocess, "run", side_effect=runner), \
+                     mock.patch.object(manager, "_stop_adguard") as stop:
+                    status = manager.collect_menu_status(Path("/"), runner=runner)
+                    report = manager.collect_system_check(Path("/"), runner=runner)
+                    with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                        manager.apply_service_change(["chatgpt"], root=Path("/"))
+                    with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                        manager.rollback_last(Path("/"), selected=backup, runner=runner)
+                stop.assert_not_called()
+                self.assertFalse(status["front_config_supported"])
+                self.assertEqual("attention", status["overall"])
+                self.assertFalse(report["mtproxyl_config"])
+                self.assertNotIn(["systemctl", "reload", "mtproxyl-pq-nginx"], commands)
+                self.assertEqual("current map", map_path.read_text())
+
     def test_custom_mode_blocks_live_service_change_before_stop(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:
@@ -2208,6 +2465,12 @@ class MTProxyFrontTests(unittest.TestCase):
             system_config = root / "etc/nginx/nginx.conf"
             system_config.parent.mkdir(parents=True)
             system_config.write_text("system config", encoding="utf-8")
+            system_site = root / "etc/nginx/sites-enabled/adguardhome-doh"
+            system_site.parent.mkdir(parents=True)
+            system_site.write_text("old system site")
+            system_stream = root / "etc/nginx/stream.d/adguardhome-doh.conf"
+            system_stream.parent.mkdir(parents=True)
+            system_stream.write_text("old system stream")
             backup = manager.create_backup(root, operation="update", domain="dns.example.com")
             manager.finalize_update_backup(backup, root, "dns.example.com")
             manifest = json.loads((backup / "manifest.json").read_text())
@@ -2218,15 +2481,293 @@ class MTProxyFrontTests(unittest.TestCase):
             (root / "etc/adguardhome-doh/mtproxyl-sni.map").write_text("new map")
             (root / "etc/adguardhome-doh/mtproxyl-nginx.conf").write_text("new dedicated config")
             (root / "etc/systemd/system/adguardhome-doh-nginx.service").write_text("new dedicated unit")
+            (root / "etc/adguardhome-doh/mtproxyl-http-site.conf").write_text("new private http")
+            (root / "etc/adguardhome-doh/mtproxyl-stream-site.conf").write_text("new private stream")
             external.write_text("user changed config", encoding="utf-8")
             system_config.write_text("system changed config", encoding="utf-8")
+            system_site.write_text("user changed system site")
+            system_stream.write_text("user changed system stream")
             self.assertTrue(manager.rollback_last(root))
             self.assertEqual("old map", (root / "etc/adguardhome-doh/mtproxyl-sni.map").read_text())
             self.assertEqual("old dedicated config", (root / "etc/adguardhome-doh/mtproxyl-nginx.conf").read_text())
             self.assertEqual("old dedicated unit", (root / "etc/systemd/system/adguardhome-doh-nginx.service").read_text())
+            self.assertEqual("old private http", (root / "etc/adguardhome-doh/mtproxyl-http-site.conf").read_text())
+            self.assertEqual("old private stream", (root / "etc/adguardhome-doh/mtproxyl-stream-site.conf").read_text())
             self.assertEqual("user changed config", external.read_text())
             self.assertEqual("system changed config", system_config.read_text())
+            self.assertEqual("user changed system site", system_site.read_text())
+            self.assertEqual("user changed system stream", system_stream.read_text())
             self.assertEqual("mtproxyl", json.loads((root / "var/lib/adguardhome-doh/install.json").read_text())["front"])
+
+    def test_files_only_shared_restore_preserves_system_nginx_sites(self):
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            system_site = root / "etc/nginx/sites-enabled/adguardhome-doh"
+            system_site.parent.mkdir(parents=True)
+            system_site.write_text("old system site")
+            system_stream = root / "etc/nginx/stream.d/adguardhome-doh.conf"
+            system_stream.parent.mkdir(parents=True)
+            system_stream.write_text("old system stream")
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            system_site.write_text("user changed system site")
+            system_stream.write_text("user changed system stream")
+            private = root / "etc/adguardhome-doh/mtproxyl-stream-site.conf"
+            private.write_text("changed private stream")
+            result = manager.main(["--restore-update-backup", str(backup), "--root", str(root),
+                                   "--domain", "dns.example.com", "--files-only", "--preserve-system-nginx"])
+            self.assertEqual(0, result)
+            self.assertEqual("user changed system site", system_site.read_text())
+            self.assertEqual("user changed system stream", system_stream.read_text())
+            self.assertEqual("old private stream", private.read_text())
+
+    def test_files_only_shared_reload_is_transactional(self):
+        manager = load_manager()
+        cases = (
+            ("success", set(), set(), "committed"),
+            ("reload_fails_once", set(), {1}, "restored"),
+            ("recovery_reload_fails", set(), {1, 2}, "prepared"),
+            ("daemon_reload_fails_once", {1}, set(), "restored"),
+            ("recovery_daemon_reload_fails", {1, 2}, set(), "prepared"),
+            ("recovery_daemon_reload_after_front_failure", {2}, {1}, "prepared"),
+        )
+        for name, daemon_failures, front_failures, final_state in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                overlay = root / "etc/adguardhome-doh/mtproxyl-http.conf"
+                map_path = root / "etc/adguardhome-doh/mtproxyl-sni.map"
+                system_site = root / "etc/nginx/sites-enabled/adguardhome-doh"
+                system_site.parent.mkdir(parents=True)
+                system_site.write_text("snapshot system site")
+                backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+                overlay.write_text("current front http")
+                system_site.write_text("current system site")
+                self.assertEqual("old map", map_path.read_text())
+                events = []
+                daemon_calls = 0
+                front_calls = 0
+                under_root = manager.under_root
+                original_restore = manager._restore_backup
+                original_reverse = manager._restore_transaction_entries
+                original_marker = manager._transaction_marker
+
+                def runner(command, **_kwargs):
+                    nonlocal daemon_calls, front_calls
+                    if command[:2] == ["systemctl", "show"]:
+                        return subprocess.CompletedProcess(command, 0, b"123\n", b"")
+                    if command == ["systemctl", "daemon-reload"]:
+                        daemon_calls += 1
+                        events.append(("daemon", overlay.read_text()))
+                        if daemon_calls in daemon_failures:
+                            raise subprocess.CalledProcessError(1, command)
+                    elif command[0] == manager.MTPROXY_NGINX_BINARY:
+                        events.append(("test", overlay.read_text()))
+                    elif command == ["systemctl", "reload", "mtproxyl-pq-nginx"]:
+                        front_calls += 1
+                        events.append(("reload", overlay.read_text()))
+                        if front_calls in front_failures:
+                            raise subprocess.CalledProcessError(1, command)
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+
+                def restore(*args, **kwargs):
+                    events.append(("restore", overlay.read_text()))
+                    return original_restore(*args, **kwargs)
+
+                def reverse(*args, **kwargs):
+                    result = original_reverse(*args, **kwargs)
+                    events.append(("reverse", overlay.read_text()))
+                    return result
+
+                def marker(path, state, entries):
+                    events.append((state, overlay.read_text()))
+                    return original_marker(path, state, entries)
+
+                with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                     mock.patch.object(manager, "_validate_staged_adguard"), \
+                     mock.patch.object(manager, "_restore_backup", side_effect=restore), \
+                     mock.patch.object(manager, "_restore_transaction_entries", side_effect=reverse), \
+                     mock.patch.object(manager, "_transaction_marker", side_effect=marker):
+                    call = lambda: manager.restore_backup_runtime(
+                        backup, Path("/"), "dns.example.com", runner=runner,
+                        files_only=True, preserve_system_nginx=True, reload_shared_front=True,
+                    )
+                    if name == "success":
+                        call()
+                    elif final_state == "prepared":
+                        with self.assertRaisesRegex(manager._FrontRecoveryError, "previous MTProxy front"):
+                            call()
+                    else:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            call()
+                marker_paths = list((root / "var/backups/adguardhome-doh").glob(".restore-*/transaction.json"))
+                self.assertEqual(1, len(marker_paths))
+                self.assertEqual(final_state, json.loads(marker_paths[0].read_text())["state"])
+                self.assertEqual("current system site", system_site.read_text())
+                self.assertEqual("old map", map_path.read_text())
+                self.assertEqual("front http" if name == "success" else "current front http", overlay.read_text())
+                self.assertEqual(["prepared", "restore"], [event[0] for event in events[:2]])
+                if name == "success":
+                    self.assertEqual(["prepared", "restore", "daemon", "test", "reload", "committed"],
+                                     [event[0] for event in events])
+                    self.assertEqual(("reload", "front http"), events[-2])
+                else:
+                    reversal = events.index(("reverse", "current front http"))
+                    self.assertEqual(("daemon", "current front http"), events[reversal + 1])
+                    attempted = ["daemon"] if 1 in daemon_failures else ["daemon", "test", "reload"]
+                    recovery = ["daemon"] if 2 in daemon_failures else ["daemon", "test", "reload"]
+                    expected = ["prepared", "restore"] + attempted + ["reverse"] + recovery
+                    if final_state == "restored":
+                        expected.append("restored")
+                    self.assertEqual(expected, [event[0] for event in events])
+                    if final_state == "restored":
+                        self.assertEqual("restored", events[-1][0])
+                        self.assertEqual(("reload", "current front http"), events[-2])
+                    else:
+                        self.assertEqual("daemon" if daemon_failures else "reload", events[-1][0])
+                        with self.assertRaisesRegex(RuntimeError, "unfinished transaction"):
+                            manager._check_incomplete_transactions(root)
+
+    def test_reload_shared_front_cli_requires_files_only_and_preserve_system_nginx(self):
+        manager = load_manager()
+        invalid = (
+            ["--reload-shared-front"],
+            ["--create-update-backup", "--reload-shared-front"],
+            ["--finalize-update-backup", "/snapshot", "--reload-shared-front"],
+            ["--restore-update-backup", "/snapshot", "--reload-shared-front"],
+            ["--restore-update-backup", "/snapshot", "--files-only", "--reload-shared-front"],
+            ["--restore-update-backup", "/snapshot", "--preserve-system-nginx", "--reload-shared-front"],
+        )
+        with mock.patch("sys.stderr", io.StringIO()), \
+             mock.patch.object(manager, "restore_backup_runtime") as restore:
+            for args in invalid:
+                with self.subTest(args=args):
+                    self.assertEqual(1, manager.main(args))
+            restore.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+            with mock.patch.object(manager, "_reload_mtproxyl_map") as reload_front:
+                self.assertEqual(0, manager.main([
+                    "--restore-update-backup", str(backup), "--root", str(root), "--domain", "dns.example.com",
+                    "--files-only", "--preserve-system-nginx", "--reload-shared-front",
+                ]))
+            reload_front.assert_called_once()
+
+    def test_files_only_shared_reload_rejects_front_and_domain_mismatch_before_restore(self):
+        manager = load_manager()
+        for mismatch in ("current_front", "saved_front", "current_domain", "saved_domain", "argument_domain"):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                state_file = root / "var/lib/adguardhome-doh/install.json"
+                state = json.loads(state_file.read_text())
+                if mismatch == "saved_front":
+                    state.pop("front")
+                    state_file.write_text(json.dumps(state))
+                elif mismatch == "saved_domain":
+                    state["domain"] = "other.example.com"
+                    state_file.write_text(json.dumps(state))
+                backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+                if mismatch == "current_front":
+                    state.pop("front")
+                elif mismatch == "saved_front":
+                    state["front"] = "mtproxyl"
+                elif mismatch == "current_domain":
+                    state["domain"] = "other.example.com"
+                elif mismatch == "saved_domain":
+                    state["domain"] = "dns.example.com"
+                state_file.write_text(json.dumps(state))
+                domain = "other.example.com" if mismatch == "argument_domain" else "dns.example.com"
+                with mock.patch.object(manager, "_restore_backup") as restore:
+                    with self.assertRaisesRegex(RuntimeError, "front|domain"):
+                        manager.restore_backup_runtime(backup, root, domain, files_only=True,
+                                                       preserve_system_nginx=True, reload_shared_front=True)
+                restore.assert_not_called()
+                self.assertEqual([], list((root / "var/backups/adguardhome-doh").glob(".restore-*")))
+
+    def test_files_only_shared_reload_validates_active_front_before_restore(self):
+        manager = load_manager()
+        for condition in ("missing_binary", "missing_config", "custom_config", "pid_race"):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+                if condition == "missing_binary":
+                    (root / "opt/mtproxyl-nginx/sbin/nginx").unlink()
+                elif condition == "missing_config":
+                    (root / "opt/mtproxyl-nginx/conf/nginx.conf").unlink()
+                elif condition == "custom_config":
+                    (root / "proc/123/cmdline").write_bytes(
+                        b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0/opt/mtproxyl/nginx-custom.conf\0"
+                    )
+                commands = []
+                pids = iter((b"123\n", b"456\n" if condition == "pid_race" else b"123\n"))
+
+                def runner(command, **_kwargs):
+                    commands.append(command)
+                    return subprocess.CompletedProcess(command, 0, next(pids), b"")
+
+                under_root = manager.under_root
+                with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                     mock.patch.object(manager, "_restore_backup") as restore:
+                    with self.assertRaises(RuntimeError):
+                        manager.restore_backup_runtime(backup, Path("/"), "dns.example.com", runner=runner,
+                                                       files_only=True, preserve_system_nginx=True,
+                                                       reload_shared_front=True)
+                restore.assert_not_called()
+                self.assertTrue(all(command[:2] == ["systemctl", "show"] for command in commands))
+                self.assertEqual([], list((root / "var/backups/adguardhome-doh").glob(".restore-*")))
+
+    def test_files_only_shared_reload_requires_all_safe_current_and_saved_front_files(self):
+        manager = load_manager()
+        required = ((manager.MT_PROXY_SNI_MAP, manager.PRIVATE_NGINX_CONFIG, manager.PRIVATE_NGINX_UNIT)
+                    + manager.FRONT_OVERLAY_FILES + manager.FRONT_SITE_FILES)
+        for relative in required:
+            for missing in ("current", "snapshot"):
+                with self.subTest(relative=relative, missing=missing), tempfile.TemporaryDirectory() as directory:
+                    root = self.build_root(directory)
+                    backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+                    if missing == "current":
+                        manager.under_root(root, relative).unlink()
+                    else:
+                        manifest_path = backup / "manifest.json"
+                        manifest = json.loads(manifest_path.read_text())
+                        entry = next(item for item in manifest["files"] if item["path"] == relative)
+                        entry["present"] = False
+                        entry.pop("sha256")
+                        manifest_path.write_text(json.dumps(manifest))
+                    with mock.patch.object(manager, "_restore_backup") as restore:
+                        with self.assertRaisesRegex(RuntimeError, "отсутствует|не содержит"):
+                            manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True,
+                                                           preserve_system_nginx=True, reload_shared_front=True)
+                    restore.assert_not_called()
+                    self.assertEqual([], list((root / "var/backups/adguardhome-doh").glob(".restore-*")))
+
+    def test_files_only_shared_reload_rejects_tampered_or_symlink_front_files(self):
+        manager = load_manager()
+        for condition in ("tampered_snapshot", "symlink_snapshot", "symlink_current"):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                backup = manager.create_backup(root, operation="recovery", domain="dns.example.com")
+                current = manager.under_root(root, manager.MT_PROXY_SNI_MAP)
+                manifest_path = backup / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                entry = next(item for item in manifest["files"] if item["path"] == manager.MT_PROXY_SNI_MAP)
+                snapshot = backup / entry["backup"]
+                if condition == "tampered_snapshot":
+                    snapshot.write_text("tampered")
+                elif condition == "symlink_snapshot":
+                    snapshot.unlink()
+                    snapshot.symlink_to("elsewhere")
+                    entry["sha256"] = manager._path_digest(snapshot)
+                    manifest_path.write_text(json.dumps(manifest))
+                else:
+                    current.unlink()
+                    current.symlink_to(root / "etc/adguardhome-doh/mtproxyl-http.conf")
+                with mock.patch.object(manager, "_restore_backup") as restore:
+                    with self.assertRaises(RuntimeError):
+                        manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True,
+                                                       preserve_system_nginx=True, reload_shared_front=True)
+                restore.assert_not_called()
+                self.assertEqual([], list((root / "var/backups/adguardhome-doh").glob(".restore-*")))
 
     def test_mtproxy_rollback_rejects_snapshot_without_shared_front_before_stop(self):
         manager = load_manager()
@@ -2243,6 +2784,51 @@ class MTProxyFrontTests(unittest.TestCase):
                     manager.rollback_last(root)
             stop.assert_not_called()
             self.assertEqual("mtproxyl", json.loads(state_file.read_text())["front"])
+
+    def test_missing_shared_site_blocks_snapshot_and_rollback_before_mutation(self):
+        manager = load_manager()
+        for relative in manager.FRONT_SITE_FILES:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                target = manager.under_root(root, relative)
+                target.unlink()
+                with self.assertRaisesRegex(RuntimeError, "файл общего front отсутствует"):
+                    manager.create_backup(root, operation="update", domain="dns.example.com")
+                target.write_text("current site")
+                backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+                manager.finalize_update_backup(backup, root, "dns.example.com")
+                target.unlink()
+                with mock.patch.object(manager, "_stop_adguard") as stop:
+                    with self.assertRaisesRegex(RuntimeError, "файл общего front отсутствует"):
+                        manager.rollback_last(root, selected=backup)
+                stop.assert_not_called()
+                self.assertFalse(target.exists())
+
+    def test_shared_snapshot_missing_private_sites_cannot_finalize_or_restore(self):
+        manager = load_manager()
+        for missing_style in ("unrecorded", "recorded_absent"):
+            with self.subTest(missing_style=missing_style), tempfile.TemporaryDirectory() as directory:
+                root = self.build_root(directory)
+                backup = manager.create_backup(root, operation="update", domain="dns.example.com")
+                manifest_path = backup / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                if missing_style == "unrecorded":
+                    manifest["files"] = [item for item in manifest["files"]
+                                         if item["path"] not in manager.FRONT_SITE_FILES]
+                else:
+                    for item in manifest["files"]:
+                        if item["path"] == manager.PRIVATE_NGINX_STREAM_SITE:
+                            item["present"] = False
+                            item.pop("sha256")
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                self.assertTrue(manager._validated_backup_manifest(backup))
+                target = root / "etc/adguardhome-doh/mtproxyl-stream-site.conf"
+                target.write_text("current site")
+                with self.assertRaisesRegex(RuntimeError, "снимок не содержит необходимые файлы"):
+                    manager.finalize_update_backup(backup, root, "dns.example.com")
+                with self.assertRaisesRegex(RuntimeError, "снимок не содержит необходимые файлы"):
+                    manager.restore_backup_runtime(backup, root, "dns.example.com", files_only=True)
+                self.assertEqual("current site", target.read_text())
 
     def test_changed_front_map_is_tested_and_reloaded_without_system_nginx(self):
         manager = load_manager()

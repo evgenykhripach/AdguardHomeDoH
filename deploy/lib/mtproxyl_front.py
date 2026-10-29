@@ -4,9 +4,7 @@ import argparse
 import hashlib
 import os
 import re
-import secrets
 import stat
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -407,136 +405,6 @@ def _snapshot(parent, name):
             os.close(fd)
 
 
-def _includes_available():
-    for path in (MAP_PATH, HTTP_PATH):
-        try:
-            parent, name = _parent_fd(path)
-            try:
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-                try:
-                    if not stat.S_ISREG(os.fstat(fd).st_mode):
-                        return False
-                finally:
-                    os.close(fd)
-            finally:
-                os.close(parent)
-        except (OSError, ValueError):
-            return False
-    return True
-
-
-def _check_parent(path, original):
-    fd, _ = _parent_fd(path)
-    try:
-        current = os.fstat(fd)
-        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-            raise RuntimeError('source directory changed')
-    finally:
-        os.close(fd)
-
-
-def apply_or_remove(source, domain, nginx_bin, *, remove=False, best_effort=False):
-    """Validate and atomically replace one file; no service activation.
-
-    A non-cooperating writer can race between the last check and rename.
-    """
-    _domain(domain)
-    parent, name = _parent_fd(source)
-    candidate_name = None
-    candidate_identity = None
-    try:
-        parent_stat = os.fstat(parent)
-        data, metadata, digest = _snapshot(parent, name)
-        original = data.decode('utf-8')
-        if remove:
-            base, has_overlay = _strip(original)
-            if not has_overlay:
-                return
-        missing = best_effort and not _includes_available()
-        if missing:
-            try:
-                base, has_overlay = _strip(original)
-            except ValueError:
-                print('warning: overlay unchanged', file=sys.stderr)
-                return
-            if not has_overlay:
-                print('warning: overlay unchanged', file=sys.stderr)
-                return
-            remove = True
-        try:
-            result = unpatch(original, domain) if remove else patch(original, domain)
-        except ValueError:
-            if best_effort:
-                print('warning: overlay unchanged', file=sys.stderr)
-                return
-            raise
-        if result == original and remove:
-            return
-        _check_parent(source, parent_stat)
-        for _ in range(10):
-            candidate_name = '.' + name + '.doh-' + secrets.token_hex(16)
-            try:
-                fd = os.open(candidate_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600, dir_fd=parent)
-                break
-            except FileExistsError:
-                candidate_name = None
-        else:
-            raise RuntimeError('cannot create candidate')
-        candidate_created = os.fstat(fd)
-        candidate_identity = (candidate_created.st_dev, candidate_created.st_ino)
-        try:
-            candidate_data = result.encode('utf-8')
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, 'wb', closefd=False) as out:
-                out.write(candidate_data)
-                out.flush()
-            os.fsync(fd)
-            candidate_stat = os.fstat(fd)
-            candidate_path = os.path.join(os.path.dirname(os.path.abspath(os.fspath(source))), candidate_name)
-            try:
-                checked = subprocess.run([os.fspath(nginx_bin), '-t', '-c', candidate_path],
-                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, check=False)
-            except OSError:
-                if missing:
-                    print('warning: overlay unchanged', file=sys.stderr)
-                    return
-                raise
-            if checked.returncode != 0:
-                if missing:
-                    print('warning: overlay unchanged', file=sys.stderr)
-                    return
-                raise RuntimeError('nginx validation failed')
-            _check_parent(source, parent_stat)
-            current, current_stat, current_digest = _snapshot(parent, name)
-            identity = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid)
-            if identity(current_stat) != identity(metadata) or current_digest != digest or current != data:
-                raise RuntimeError('source changed')
-            candidate_now, candidate_now_stat, _ = _snapshot(parent, candidate_name)
-            if ((candidate_now_stat.st_dev, candidate_now_stat.st_ino) != (candidate_stat.st_dev, candidate_stat.st_ino)
-                    or candidate_now != candidate_data):
-                raise RuntimeError('candidate changed')
-            if result == original:
-                return
-            os.fchown(fd, metadata.st_uid, metadata.st_gid)
-            os.fchmod(fd, stat.S_IMODE(metadata.st_mode))
-            os.fsync(fd)
-            os.replace(candidate_name, name, src_dir_fd=parent, dst_dir_fd=parent)
-            candidate_name = None
-            if missing:
-                print('warning: overlay removed', file=sys.stderr)
-        finally:
-            os.close(fd)
-    finally:
-        if candidate_name is not None:
-            try:
-                candidate_current = os.stat(candidate_name, dir_fd=parent, follow_symlinks=False)
-                if (candidate_current.st_dev, candidate_current.st_ino) == candidate_identity:
-                    os.unlink(candidate_name, dir_fd=parent)
-            except FileNotFoundError:
-                pass
-        os.close(parent)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -548,21 +416,7 @@ def main():
     http = sub.add_parser('render-http')
     http.add_argument('--domain', required=True)
     http.add_argument('--output', required=True, type=Path)
-    for command in ('apply', 'remove'):
-        operation = sub.add_parser(command)
-        operation.add_argument('--source', required=True, type=Path)
-        operation.add_argument('--domain', required=True)
-        operation.add_argument('--nginx-bin', required=True, type=Path)
-        operation.add_argument('--best-effort', action='store_true')
     args = parser.parse_args()
-    if args.command in ('apply', 'remove'):
-        try:
-            apply_or_remove(args.source, args.domain, args.nginx_bin,
-                            remove=args.command == 'remove', best_effort=args.best_effort)
-        except (OSError, ValueError, UnicodeError, RuntimeError):
-            print('error: overlay operation failed', file=sys.stderr)
-            return 1
-        return 0
     if args.command == 'render':
         content = patch(_read_regular(args.source), args.domain)
     else:

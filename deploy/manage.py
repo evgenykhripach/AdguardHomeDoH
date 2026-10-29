@@ -137,7 +137,7 @@ def _front_mode(state: Mapping[str, Any]) -> str:
 
 
 def _require_front_files(root: Path) -> None:
-    for relative in (MT_PROXY_SNI_MAP, PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT) + FRONT_OVERLAY_FILES:
+    for relative in (MT_PROXY_SNI_MAP, PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT) + FRONT_OVERLAY_FILES + FRONT_SITE_FILES:
         path = under_root(root, relative)
         if not path.is_file() or path.is_symlink():
             raise RuntimeError("файл общего front отсутствует или небезопасен: %s" % relative)
@@ -171,6 +171,9 @@ LEGACY_NO_BINARY_FILES = LEGACY_FULL_FILES[1:]
 MT_PROXY_SNI_MAP = "/etc/adguardhome-doh/mtproxyl-sni.map"
 PRIVATE_NGINX_CONFIG = "/etc/adguardhome-doh/mtproxyl-nginx.conf"
 PRIVATE_NGINX_UNIT = "/etc/systemd/system/adguardhome-doh-nginx.service"
+PRIVATE_NGINX_HTTP_SITE = "/etc/adguardhome-doh/mtproxyl-http-site.conf"
+PRIVATE_NGINX_STREAM_SITE = "/etc/adguardhome-doh/mtproxyl-stream-site.conf"
+FRONT_SITE_FILES = (PRIVATE_NGINX_HTTP_SITE, PRIVATE_NGINX_STREAM_SITE)
 MTPROXY_NGINX_BINARY = "/opt/mtproxyl-nginx/sbin/nginx"
 MTPROXY_NGINX_CONFIG = "/opt/mtproxyl-nginx/conf/nginx.conf"
 FRONT_OVERLAY_FILES = (
@@ -183,9 +186,11 @@ FRONT_MANAGED_FILES = (
     PRIVATE_NGINX_CONFIG,
     PRIVATE_NGINX_UNIT,
     "/etc/systemd/system/multi-user.target.wants/adguardhome-doh-nginx.service",
-) + FRONT_OVERLAY_FILES
+) + FRONT_OVERLAY_FILES + FRONT_SITE_FILES
 SYSTEM_NGINX_FILES = (
     "/etc/nginx/nginx.conf",
+    "/etc/nginx/sites-enabled/adguardhome-doh",
+    "/etc/nginx/stream.d/adguardhome-doh.conf",
     "/etc/systemd/system/nginx.service.d/adguardhome-doh.conf",
     "/etc/systemd/system/multi-user.target.wants/nginx.service",
 )
@@ -388,9 +393,14 @@ def create_backup(
     root = Path(root)
     if operation not in BACKUP_OPERATIONS:
         raise RuntimeError("invalid backup operation")
+    state = _read_json(under_root(root, "/var/lib/adguardhome-doh/install.json"), {})
     if not domain:
-        state = _read_json(under_root(root, "/var/lib/adguardhome-doh/install.json"), {})
         domain = str(state.get("domain", "")) if isinstance(state, Mapping) else ""
+    if isinstance(state, Mapping) and state.get("front") == "mtproxyl":
+        for relative in FRONT_SITE_FILES:
+            source = under_root(root, relative)
+            if not source.is_file() or source.is_symlink():
+                raise RuntimeError("файл общего front отсутствует или небезопасен: %s" % relative)
     paths = _managed_paths(domain)
     if backup_dir is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -504,7 +514,10 @@ def _validated_backup_manifest(backup_dir: Path) -> list[Tuple[str, str, bool]]:
             raise RuntimeError("backup manifest is invalid")
         entries.append((relative, backup_name, present))
     known_legacy = (set(LEGACY_FULL_FILES), set(LEGACY_NO_BINARY_FILES))
-    previous_v4 = (version == BACKUP_VERSION and seen_paths == expected - set(FRONT_OVERLAY_FILES))
+    previous_v4 = (version == BACKUP_VERSION and seen_paths in (
+        expected - set(FRONT_SITE_FILES),
+        expected - set(FRONT_SITE_FILES + FRONT_OVERLAY_FILES),
+    ))
     if (legacy and seen_paths not in known_legacy) or (not legacy and seen_paths != expected and not previous_v4):
         raise RuntimeError("backup manifest is incomplete")
     return entries
@@ -532,6 +545,15 @@ def _restore_targets(backup_dir: Path, root: Path) -> list[Tuple[Path, Path, boo
         else:
             targets.append((target, backup, present))
     return targets
+
+
+def _require_saved_front_sites(saved_state: Any, by_path: Mapping[str, Tuple[Optional[Path], bool]]) -> None:
+    if not isinstance(saved_state, Mapping) or _front_mode(saved_state) != "mtproxyl":
+        return
+    for relative in FRONT_SITE_FILES:
+        saved, present = by_path.get(relative, (None, False))
+        if not present or saved is None or not saved.is_file() or saved.is_symlink():
+            raise RuntimeError("снимок не содержит необходимые файлы DoH для MTProxy: %s" % relative)
 
 
 def _restore_backup(backup_dir: Path, root: Path = Path("/"), *,
@@ -857,16 +879,47 @@ def _reload_restored_runtime(root: Path, domain: str, runner: Callable[..., Any]
     runner(["systemctl", "restart", "adguardhome-doh-health.timer"], check=True)
 
 
+def _validate_shared_front_restore(
+    root: Path, backup_dir: Path, domain: str, current_state: Any, saved_state: Any,
+    by_path: Mapping[str, Tuple[Optional[Path], bool]], runner: Callable[..., Any],
+) -> None:
+    manifest = _read_json(backup_dir / "manifest.json", None)
+    if (not isinstance(current_state, Mapping) or not isinstance(saved_state, Mapping)
+            or _front_mode(current_state) != "mtproxyl" or _front_mode(saved_state) != "mtproxyl"):
+        raise RuntimeError("shared-front restore requires current and saved mtproxyl front")
+    if (not _valid_domain(domain) or current_state.get("domain") != domain
+            or saved_state.get("domain") != domain or not isinstance(manifest, Mapping)
+            or manifest.get("domain") != domain):
+        raise RuntimeError("shared-front restore domain mismatch")
+    _require_front_files(root)
+    for relative in (MT_PROXY_SNI_MAP, PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT) + FRONT_OVERLAY_FILES + FRONT_SITE_FILES:
+        saved, present = by_path.get(relative, (None, False))
+        if not present or saved is None or not saved.is_file() or saved.is_symlink():
+            raise RuntimeError("снимок не содержит необходимые файлы DoH для MTProxy: %s" % relative)
+    if Path(root) == Path("/"):
+        nginx_binary = under_root(root, MTPROXY_NGINX_BINARY)
+        nginx_config = under_root(root, MTPROXY_NGINX_CONFIG)
+        if not nginx_binary.is_file() or not os.access(nginx_binary, os.X_OK) or not nginx_config.is_file():
+            raise RuntimeError("проверка MTProxy недоступна; восстановление невозможно")
+        _verify_mtproxyl_active_config(root, runner)
+
+
 def restore_backup_runtime(
     backup_dir: Path, root: Path, domain: str,
     runner: Callable[..., Any] = subprocess.run, *, files_only: bool = False,
     preserve_new_certbot_lineage: bool = False,
+    preserve_system_nginx: bool = False,
     restart_on_failure: bool = True,
     reload_front_map: bool = False,
+    reload_shared_front: bool = False,
 ) -> None:
     """Validate a snapshot before restoring, retaining an emergency reversal."""
 
     root, backup_dir = Path(root), Path(backup_dir)
+    if preserve_system_nginx and not files_only:
+        raise RuntimeError("preserve-system-nginx requires files-only restore")
+    if reload_shared_front and (not files_only or not preserve_system_nginx):
+        raise RuntimeError("reload-shared-front requires files-only and preserve-system-nginx")
     _check_incomplete_transactions(root)
     entries = _validated_backup_manifest(backup_dir)
     by_path = {relative: (backup_dir / name, present) for relative, name, present in entries}
@@ -874,8 +927,12 @@ def restore_backup_runtime(
     current_state = _read_json(_runtime_paths(root)["install"], {})
     saved_install, saved_present = by_path.get("/var/lib/adguardhome-doh/install.json", (None, False))
     saved_state = _read_json(saved_install, None) if saved_present else None
-    if (isinstance(current_state, Mapping) and isinstance(saved_state, Mapping)
-            and _front_mode(current_state) == "mtproxyl" and _front_mode(saved_state) == "mtproxyl"):
+    _require_saved_front_sites(saved_state, by_path)
+    if reload_shared_front:
+        _validate_shared_front_restore(root, backup_dir, domain, current_state, saved_state, by_path, runner)
+    if (preserve_system_nginx or
+            (isinstance(current_state, Mapping) and isinstance(saved_state, Mapping)
+             and _front_mode(current_state) == "mtproxyl" and _front_mode(saved_state) == "mtproxyl")):
         skipped.update(under_root(root, path) for path in SYSTEM_NGINX_FILES)
     if preserve_new_certbot_lineage:
         manifest = _read_json(backup_dir / "manifest.json", None)
@@ -917,16 +974,23 @@ def restore_backup_runtime(
     runtime_may_be_running = False
     front_reload_attempted = False
 
+    def reload_front_files() -> None:
+        if reload_shared_front and root == Path("/"):
+            runner(["systemctl", "daemon-reload"], check=True)
+        _reload_mtproxyl_map(root, runner)
+
     def reload_front() -> None:
         nonlocal front_reload_attempted
         front_reload_attempted = True
-        _reload_mtproxyl_map(root, runner)
+        reload_front_files()
 
     try:
         if skipped:
             _restore_backup(backup_dir, root, skip_targets=skipped)
         else:
             _restore_backup(backup_dir, root)
+        if files_only and reload_shared_front:
+            reload_front()
         if not files_only and yaml_present:
             # Reload can start AdGuard and then fail at nginx or smoke.
             runtime_may_be_running = True
@@ -951,9 +1015,9 @@ def restore_backup_runtime(
                                      % restore_error) from original
         if front_reload_attempted:
             try:
-                _reload_mtproxyl_map(root, runner)
+                reload_front_files()
             except BaseException as restore_error:
-                raise _FrontRecoveryError("restore failed; returning to previous MTProxy map also failed: %s"
+                raise _FrontRecoveryError("restore failed; returning to previous MTProxy front also failed: %s"
                                           % restore_error) from original
         try:
             if restart_on_failure and not files_only and root == Path("/"):
@@ -1037,6 +1101,8 @@ def _runtime_paths(root: Path) -> Dict[str, Path]:
         "backup": under_root(root, "/var/backups/adguardhome-doh"),
         "agh": under_root(root, "/opt/AdGuardHome/AdGuardHome.yaml"),
         "nginx_stream": under_root(root, "/etc/nginx/stream.d/adguardhome-doh.conf"),
+        "private_nginx_http": under_root(root, PRIVATE_NGINX_HTTP_SITE),
+        "private_nginx_stream": under_root(root, PRIVATE_NGINX_STREAM_SITE),
         "health_policy": under_root(root, "/etc/adguardhome-doh/health-policy.json"),
         "credentials": under_root(root, "/var/lib/adguardhome-doh/admin-credentials.json"),
         "token": under_root(root, "/var/lib/adguardhome-doh/doh-token"),
@@ -1189,7 +1255,11 @@ def finalize_update_backup(backup_dir: Path, root: Path, domain: str) -> None:
     backup_dir = _snapshot_under_root(root, backup_dir)
     if backup_dir.parent != under_root(root, "/var/backups/adguardhome-doh").resolve():
         raise RuntimeError("update backup is not at the backup root")
-    _validated_backup_manifest(backup_dir)
+    entries = _validated_backup_manifest(backup_dir)
+    by_path = {relative: (backup_dir / name, present) for relative, name, present in entries}
+    saved_install, present = by_path.get("/var/lib/adguardhome-doh/install.json", (None, False))
+    saved_state = _read_json(saved_install, None) if present else None
+    _require_saved_front_sites(saved_state, by_path)
     manifest_path = backup_dir / "manifest.json"
     manifest = _read_json(manifest_path, None)
     if (not isinstance(manifest, dict) or manifest.get("operation") != "update"
@@ -1431,10 +1501,11 @@ def apply_service_change(
         _check_incomplete_transactions(root)
         state = _read_json(_runtime_paths(root)["install"], {})
         domain = str(state.get("domain", "")) if isinstance(state, Mapping) else ""
-        if isinstance(state, Mapping) and _front_mode(state) == "mtproxyl" and root == Path("/"):
+        if isinstance(state, Mapping) and _front_mode(state) == "mtproxyl":
             _require_front_files(root)
-            _load_healthcheck(root)
-            _verify_mtproxyl_active_config(root, subprocess.run)
+            if root == Path("/"):
+                _load_healthcheck(root)
+                _verify_mtproxyl_active_config(root, subprocess.run)
         try:
             _stop_adguard(root)
             return _apply_service_change_locked(selected, root=root, catalog=catalog,
@@ -1499,7 +1570,7 @@ def _apply_service_change_locked(
         _write_json(enabled_stage, list(selected))
         targets = {
             paths["agh"]: stage / "AdGuardHome.yaml",
-            paths["nginx_stream"]: stage / "nginx-stream.conf",
+            paths["private_nginx_stream"] if front == "mtproxyl" else paths["nginx_stream"]: stage / "nginx-stream.conf",
             paths["health_policy"]: stage / "health-policy.json",
             paths["enabled"]: enabled_stage,
         }
@@ -2104,6 +2175,8 @@ def install_update(
     paths = _runtime_paths(root)
     state = _current_install_state(root)
     front = _front_mode(state)
+    if front == "mtproxyl":
+        raise RuntimeError("обновление с общим front MTProxyL временно отключено: интеграция ещё не завершена")
     releases = _load_releases()
     release = release or releases.latest_release(str(state.get("repository", "evgenykhripach/AdguardHomeDoH")))
     if release is None:
@@ -2199,7 +2272,7 @@ def _rollback_front_map_changed(root: Path, backup_dir: Path,
     _require_front_files(root)
     for relative in (PRIVATE_NGINX_CONFIG, PRIVATE_NGINX_UNIT,
                      "/opt/AdGuardHome/AdGuardHome", "/opt/AdGuardHome/AdGuardHome.yaml",
-                     "/var/lib/adguardhome-doh/doh-token", "/usr/local/libexec/adguardhome-doh/healthcheck.py") + FRONT_OVERLAY_FILES:
+                     "/var/lib/adguardhome-doh/doh-token", "/usr/local/libexec/adguardhome-doh/healthcheck.py") + FRONT_OVERLAY_FILES + FRONT_SITE_FILES:
         saved, saved_present = by_path.get(relative, (None, False))
         if not saved_present or saved is None or not saved.is_file() or saved.is_symlink():
             raise RuntimeError("снимок не содержит необходимые файлы DoH для MTProxy: %s" % relative)
@@ -2506,10 +2579,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--snapshot-operation", choices=("update", "recovery"), default="update")
     parser.add_argument("--files-only", action="store_true")
     parser.add_argument("--preserve-new-certbot-lineage", action="store_true")
+    parser.add_argument("--preserve-system-nginx", action="store_true")
+    parser.add_argument("--reload-shared-front", action="store_true")
     args = parser.parse_args(argv)
     if args.help:
         print("adguardhome-doh: root-only interactive manager")
         return 0
+    if args.preserve_system_nginx and (not args.restore_update_backup or not args.files_only):
+        print("ошибка: --preserve-system-nginx требует --restore-update-backup и --files-only", file=sys.stderr)
+        return 1
+    if args.reload_shared_front and (not args.restore_update_backup or not args.files_only
+                                     or not args.preserve_system_nginx):
+        print("ошибка: --reload-shared-front требует --restore-update-backup, --files-only "
+              "и --preserve-system-nginx", file=sys.stderr)
+        return 1
     if args.create_update_backup or args.restore_update_backup or args.finalize_update_backup:
         if not args.root.is_absolute():
             print("ошибка: root должен быть абсолютным путём", file=sys.stderr)
@@ -2531,6 +2614,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 restore_backup_runtime(
                     selected, args.root, args.domain, files_only=args.files_only,
                     preserve_new_certbot_lineage=args.preserve_new_certbot_lineage,
+                    preserve_system_nginx=args.preserve_system_nginx,
+                    reload_shared_front=args.reload_shared_front,
                 )
             return 0
         except (Exception, KeyboardInterrupt) as exc:

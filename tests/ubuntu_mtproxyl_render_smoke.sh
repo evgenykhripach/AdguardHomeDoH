@@ -33,11 +33,12 @@ python3 "$PROJECT_ROOT/deploy/lib/render_runtime.py" --front mtproxyl \
     --password-hash test-hash --certificate-root /etc/letsencrypt/live/dns.example.com \
     --webroot /var/www/adguardhome-doh --output /tmp/shared-front/rendered
 install -m 644 /tmp/shared-front/rendered/mtproxyl-sni.map /etc/adguardhome-doh/mtproxyl-sni.map
-install -m 644 /tmp/shared-front/rendered/nginx-http.conf /etc/nginx/sites-enabled/adguardhome-doh
+install -m 600 /tmp/shared-front/rendered/nginx-http.conf /etc/adguardhome-doh/mtproxyl-http-site.conf
 # Use a local synthetic TLS site for the routed service; all other renderer
 # directives, including PROXY-protocol handling, are exercised unchanged.
 sed 's/\$ssl_preread_server_name:443/127.0.0.1:15446/g' \
-    /tmp/shared-front/rendered/nginx-stream.conf > /etc/nginx/stream.d/adguardhome-doh.conf
+    /tmp/shared-front/rendered/nginx-stream.conf > /etc/adguardhome-doh/mtproxyl-stream-site.conf
+chmod 600 /etc/adguardhome-doh/mtproxyl-stream-site.conf
 chown root:www-data /var/www/adguardhome-doh
 chmod 750 /var/www/adguardhome-doh
 install -m 640 -o root -g www-data /tmp/shared-front/rendered/dns.example.com.mobileconfig \
@@ -78,10 +79,111 @@ http {
     }
 }
 NGINX
-python3 "$PROJECT_ROOT/deploy/lib/mtproxyl_front.py" render \
-    --source /tmp/shared-front/frontend.conf --domain dns.example.com --output /tmp/shared-front/patched.conf
 python3 "$PROJECT_ROOT/deploy/lib/mtproxyl_front.py" render-http \
     --domain dns.example.com --output /etc/adguardhome-doh/mtproxyl-http.conf
+source_hash="$(sha256sum /tmp/shared-front/frontend.conf)"
+[[ "$(python3 "$PROJECT_ROOT/deploy/lib/mtproxyl_runtime.py" \
+    --source /tmp/shared-front/frontend.conf --domain dns.example.com \
+    --runtime /tmp/shared-front/patched.conf --nginx-bin /usr/sbin/nginx)" == overlay ]]
+[[ "$(sha256sum /tmp/shared-front/frontend.conf)" == "$source_hash" ]]
+[[ "$(stat -c '%a' /tmp/shared-front/patched.conf)" == 600 ]]
+# If DoHDNS's include is absent, the explicitly allowed startup fallback
+# must publish a validated vendor config and report the degraded state.
+mv /etc/adguardhome-doh/mtproxyl-http.conf /tmp/shared-front/mtproxyl-http.saved
+[[ "$(python3 "$PROJECT_ROOT/deploy/lib/mtproxyl_runtime.py" \
+    --source /tmp/shared-front/frontend.conf --domain dns.example.com \
+    --runtime /tmp/shared-front/patched.conf --nginx-bin /usr/sbin/nginx --allow-fallback)" == degraded ]]
+cmp -s /tmp/shared-front/frontend.conf /tmp/shared-front/patched.conf
+mv /tmp/shared-front/mtproxyl-http.saved /etc/adguardhome-doh/mtproxyl-http.conf
+[[ "$(python3 "$PROJECT_ROOT/deploy/lib/mtproxyl_runtime.py" \
+    --source /tmp/shared-front/frontend.conf --domain dns.example.com \
+    --runtime /tmp/shared-front/patched.conf --nginx-bin /usr/sbin/nginx)" == overlay ]]
+[[ "$(sha256sum /tmp/shared-front/frontend.conf)" == "$source_hash" ]]
+# Verify that a candidate can be checked entirely in memory on Linux: production
+# configs may contain private data and need not be copied to another machine.
+python3 - <<'PY'
+import os
+import subprocess
+from pathlib import Path
+
+opened = []
+def memory_file(name, contents):
+    fd = os.memfd_create(name)
+    opened.append(fd)
+    os.write(fd, contents)
+    return f'/proc/self/fd/{fd}'
+
+try:
+    source = Path('/tmp/shared-front/patched.conf').read_text()
+    for path in ('/etc/adguardhome-doh/mtproxyl-sni.map',
+                 '/etc/adguardhome-doh/mtproxyl-http.conf'):
+        assert path in source
+        source = source.replace(path, memory_file('doh-include', Path(path).read_bytes()))
+    candidate = memory_file('doh-nginx', source.encode())
+    subprocess.run(['nginx', '-t', '-c', candidate], check=True, pass_fds=tuple(opened))
+finally:
+    for fd in opened:
+        os.close(fd)
+PY
+# Check that HUP actually loads the new generation in a new worker. This does
+# not exercise systemd or prove crash recovery; the entire nginx is disposable.
+python3 - "$PROJECT_ROOT" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from deploy.lib import mtproxyl_controller as identity
+from deploy.lib import mtproxyl_runtime as runtime
+
+root = Path('/tmp/shared-front/generation')
+root.mkdir(mode=0o700)
+source = Path('/tmp/shared-front/frontend.conf')
+before = source.read_bytes()
+target = root / 'runtime.conf'
+marker = root / 'generation.sock'
+first, second = 'a' * 32, 'b' * 32
+assert runtime.prepare(source, target, 'dns.example.com', '/usr/sbin/nginx',
+                       marker_socket=marker, generation=first) == 'overlay'
+master = subprocess.Popen(['/usr/sbin/nginx', '-c', str(target), '-g', 'daemon off;'],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def wait_generation(expected):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if master.poll() is not None:
+            raise RuntimeError('disposable nginx stopped')
+        try:
+            return runtime.probe_generation(marker, expected, timeout=0.5)
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    raise RuntimeError('generation probe timed out')
+
+try:
+    old_worker = wait_generation(first)
+    cgroup = Path('/proc/%d/cgroup' % master.pid).read_text().strip().split('::', 1)[1]
+    original = identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup)
+    assert runtime.prepare(source, target, 'dns.example.com', '/usr/sbin/nginx',
+                           marker_socket=marker, generation=second) == 'overlay'
+    assert runtime.probe_generation(marker, first) == old_worker
+    os.kill(master.pid, signal.SIGHUP)
+    new_worker = wait_generation(second)
+    assert new_worker != old_worker
+    assert identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original
+    assert source.read_bytes() == before
+    assert target.stat().st_mode & 0o777 == 0o600
+    print('nginx generation and master identity smoke: ok')
+finally:
+    master.terminate()
+    try:
+        master.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        master.kill()
+        master.wait(timeout=5)
+PY
 cat > /tmp/shared-front/faketls.conf <<'NGINX'
 worker_processes 1;
 pid /run/fake-faketls.pid;

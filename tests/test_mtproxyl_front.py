@@ -1,11 +1,7 @@
-import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest import mock
-
-from deploy.lib import mtproxyl_front as front
 
 from deploy.lib.mtproxyl_front import patch, unpatch, render_http
 
@@ -162,87 +158,12 @@ class OverlayTest(unittest.TestCase):
             with self.subTest(domain=domain), self.assertRaises(ValueError):
                 render_http(domain)
 
-    def test_apply_remove_validate_and_preserve_metadata(self):
+    def test_cli_rejects_mutating_subcommands(self):
         script = Path(__file__).resolve().parents[1] / 'deploy/lib/mtproxyl_front.py'
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp).resolve()
-            source, nginx = folder / 'nginx.conf', folder / 'nginx'
-            source.write_text(REALISTIC)
-            source.chmod(0o640)
-            nginx.write_text('#!/bin/sh\nexit 0\n')
-            nginx.chmod(0o700)
-            original = source.stat()
-            command = ['python3', str(script), 'apply', '--source', str(source),
-                       '--domain', DOMAIN, '--nginx-bin', str(nginx)]
-            self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
-            self.assertEqual(source.read_text(), patch(REALISTIC, DOMAIN))
-            after = source.stat()
-            self.assertEqual((after.st_uid, after.st_gid, after.st_mode & 0o7777),
-                             (original.st_uid, original.st_gid, original.st_mode & 0o7777))
-            self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
-            self.assertEqual(source.stat().st_ino, after.st_ino)
-            command[2] = 'remove'
-            self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
-            self.assertEqual(source.read_text(), REALISTIC)
-            after = source.stat()
-            self.assertEqual((after.st_uid, after.st_gid, after.st_mode & 0o7777),
-                             (original.st_uid, original.st_gid, original.st_mode & 0o7777))
-            self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
-            self.assertEqual(source.stat().st_ino, after.st_ino)
-            self.assertEqual(sorted(p.name for p in folder.iterdir()), ['nginx', 'nginx.conf'])
-
-    def test_apply_reject_and_concurrent_source_change(self):
-        script = Path(__file__).resolve().parents[1] / 'deploy/lib/mtproxyl_front.py'
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp).resolve()
-            source, nginx = folder / 'nginx.conf', folder / 'nginx'
-            source.write_text(REALISTIC)
-            nginx.write_text('#!/bin/sh\necho SECRET_CONFIG_CONTENT >&2\nexit 1\n')
-            nginx.chmod(0o700)
-            cmd = ['python3', str(script), 'apply', '--source', str(source),
-                   '--domain', DOMAIN, '--nginx-bin', str(nginx)]
-            result = subprocess.run(cmd, capture_output=True)
+        for command in ('apply', 'remove'):
+            result = subprocess.run(['python3', str(script), command], capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertNotIn(b'SECRET_CONFIG_CONTENT', result.stderr)
-            self.assertEqual(source.read_text(), REALISTIC)
-            nginx.write_text('#!/bin/sh\nprintf changed > ' + str(source) + '\nexit 0\n')
-            result = subprocess.run(cmd, capture_output=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(source.read_text(), 'changed')
-            self.assertEqual(sorted(p.name for p in folder.iterdir()), ['nginx', 'nginx.conf'])
-            link = folder / 'link'
-            link.symlink_to(source)
-            cmd[cmd.index(str(source))] = str(link)
-            self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode, 0)
-            self.assertEqual(source.read_text(), 'changed')
-
-    def test_best_effort_missing_includes_and_unknown_template(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp).resolve()
-            source, nginx = folder / 'nginx.conf', folder / 'nginx'
-            source.write_text(REALISTIC)
-            nginx.write_text('#!/bin/sh\nexit 0\n')
-            nginx.chmod(0o700)
-            with mock.patch.object(front, '_includes_available', return_value=False):
-                front.apply_or_remove(source, DOMAIN, nginx, best_effort=True)
-                self.assertEqual(source.read_text(), REALISTIC)
-                source.write_text(patch(REALISTIC, DOMAIN))
-                front.apply_or_remove(source, DOMAIN, nginx, best_effort=True)
-                self.assertEqual(source.read_text(), REALISTIC)
-                overlay = patch(REALISTIC, DOMAIN)
-                source.write_text(overlay)
-                nginx.write_text('#!/bin/sh\nexit 1\n')
-                front.apply_or_remove(source, DOMAIN, nginx, best_effort=True)
-                self.assertEqual(source.read_text(), overlay)
-            source.write_text('events {}')
-            with mock.patch.object(front, '_includes_available', return_value=True):
-                front.apply_or_remove(source, DOMAIN, nginx, best_effort=True)
-                self.assertEqual(source.read_text(), 'events {}')
-                with self.assertRaises(ValueError):
-                    front.apply_or_remove(source, DOMAIN, nginx)
-                # No managed overlay: removal does not depend on template support.
-                front.apply_or_remove(source, DOMAIN, nginx, remove=True)
-                self.assertEqual(source.read_text(), 'events {}')
+            self.assertIn(b'invalid choice', result.stderr)
 
     def test_cli_render_http_private_exclusive_and_deterministic(self):
         script = Path(__file__).resolve().parents[1] / 'deploy/lib/mtproxyl_front.py'
