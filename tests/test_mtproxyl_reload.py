@@ -54,6 +54,24 @@ class StartupTest(unittest.TestCase):
         self.lock = private / 'front.lock'
         self.assertEqual(self.run_prepare(), 'overlay')
 
+    def test_unmapped_archive_owner_is_normalized_but_known_user_is_not(self):
+        if os.geteuid() == 0:
+            self.skipTest('fixture needs a non-root file owner')
+        vendor = self.root / 'vendor' / 'conf' / 'nginx.conf'
+        vendor.parent.mkdir(parents=True, mode=0o755)
+        vendor.write_text(REALISTIC)
+        vendor.chmod(0o644)
+        with mock.patch.object(reload, 'VENDOR_SOURCE', vendor), \
+             mock.patch.object(reload.os, 'fchown') as chown:
+            with self.assertRaises(ValueError):
+                reload._normalize_vendor_ownership(vendor)
+            chown.assert_not_called()
+            with mock.patch.object(reload.pwd, 'getpwuid', side_effect=KeyError), \
+                 mock.patch.object(reload.os, 'listdir', return_value=[]):
+                reload._normalize_vendor_ownership(vendor)
+            self.assertEqual(3, chown.call_count)
+            self.assertTrue(all(call.args[1:] == (0, -1) for call in chown.call_args_list))
+
     def test_invalid_vendor_uses_validated_previous(self):
         old = self.target.read_bytes()
         self.source.write_text('broken')

@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import os
 from pathlib import Path
+import pwd
 import stat
 import subprocess
 import sys
@@ -23,10 +24,77 @@ except ImportError:
     import mtproxyl_front as front
     import mtproxyl_controller as controller
 
+VENDOR_SOURCE = Path('/opt/mtproxyl-nginx/conf/nginx.conf')
+
 
 def _require_root():
     if os.geteuid() != 0:
         raise ValueError('root required')
+
+
+def _normalize_vendor_ownership(source):
+    """Repair archive ownership only for MTProxyL's known vendor paths.
+
+    Some vendor archives preserve a numeric build-user UID which does not
+    exist on the host. Keep the strict root-owned runtime checks while making
+    a subsequent vendor update usable. Never take files from a real user or
+    from an owner with running processes.
+    """
+    source = Path(source)
+    if source != VENDOR_SOURCE:
+        return
+    paths = (source.parent.parent, source.parent, source)
+    opened = []
+    changed = []
+    try:
+        owners = set()
+        for index, path in enumerate(paths):
+            flags = os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if index < 2 else 0)
+            fd = os.open(path, flags)
+            info = os.fstat(fd)
+            opened.append((path, fd, info))
+            if (not (stat.S_ISDIR(info.st_mode) if index < 2 else stat.S_ISREG(info.st_mode))
+                    or info.st_mode & 0o022 or (index == 2 and info.st_nlink != 1)):
+                raise ValueError('unsafe vendor source')
+            if info.st_uid:
+                owners.add(info.st_uid)
+        if len(owners) > 1:
+            raise ValueError('ambiguous vendor ownership')
+        if not owners:
+            return
+        owner = owners.pop()
+        try:
+            pwd.getpwuid(owner)
+        except KeyError:
+            pass
+        else:
+            raise ValueError('vendor owner is a system account')
+        for name in os.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            try:
+                if os.stat('/proc/' + name).st_uid == owner:
+                    raise ValueError('vendor owner has running processes')
+            except FileNotFoundError:
+                continue
+        for path, fd, initial in opened:
+            before = os.fstat(fd)
+            named = path.lstat()
+            if (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid) != (
+                    named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid) or (
+                    before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid) != (
+                    initial.st_dev, initial.st_ino, initial.st_mode, initial.st_uid, initial.st_gid):
+                raise ValueError('vendor source changed')
+            if before.st_uid:
+                os.fchown(fd, 0, -1)
+                changed.append((fd, before.st_uid))
+    except BaseException:
+        for fd, owner in reversed(changed):
+            os.fchown(fd, owner, -1)
+        raise
+    finally:
+        for _, fd, _ in opened:
+            os.close(fd)
 
 
 def _lock_check(fd, parent, name, path, directory):
@@ -98,6 +166,7 @@ def prepare_startup(*, source, runtime_path, domain, admin_host, nginx_bin, lock
         _lock_check(fd, parent, name, lock_path, directory)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         _lock_check(fd, parent, name, lock_path, directory)
+        _normalize_vendor_ownership(source)
         previous_dir, previous = _previous(target)
         try:
             staged = runtime.stage(source, target, domain, binary, admin_host=admin_host)
@@ -143,6 +212,7 @@ def reload_running(*, source, runtime_path, domain, admin_host, nginx_bin, lock_
         _lock_check(fd, parent, name, lock_path, directory)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         _lock_check(fd, parent, name, lock_path, directory)
+        _normalize_vendor_ownership(source)
         master = controller.inspect_master(main_pid, binary, target, cgroup)
         _, previous = _previous(target)
         if previous is None:
