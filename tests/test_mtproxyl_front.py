@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from deploy.lib.mtproxyl_front import check_admin_sni, patch, unpatch, render_http
+from deploy.lib.mtproxyl_front import check_admin_sni, patch, unpatch, render_http, render_admin_http, _strip
 
 DOMAIN = 'dns.example.com'
 ADMIN = 'admin.dns.example.com'
@@ -340,6 +340,69 @@ class OverlayTest(unittest.TestCase):
                 self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode, 0)
             finally:
                 dirlink.unlink()
+
+
+class AdminHttpOverlayTest(unittest.TestCase):
+    root = '/var/www/adguardhome-doh-acme'
+
+    def test_optional_overlay_roundtrip(self):
+        result = patch(REALISTIC, DOMAIN, ADMIN)
+        self.assertEqual(patch(result, DOMAIN, ADMIN), result)
+        self.assertEqual(unpatch(result, DOMAIN, ADMIN), REALISTIC)
+        self.assertEqual(unpatch(REALISTIC, DOMAIN, ADMIN), REALISTIC)
+        self.assertEqual(result.count('include /etc/adguardhome-doh/mtproxyl-admin-acme.conf;'), 1)
+        self.assertIn('web.dns.example.com mtproxyl_web;', result)
+        self.assertIn('default mtproxyl_faketls;', result)
+        self.assertIn('listen 80 default_server; server_name _; return 444;', result)
+        with self.assertRaises(ValueError):
+            unpatch(result, DOMAIN)
+        with self.assertRaisesRegex(ValueError, 'explicit handling'):
+            _strip(result)
+        self.assertEqual(_strip(patch(REALISTIC, DOMAIN)), (REALISTIC, True))
+
+    def test_conflicts_and_unprovable_routing_fail(self):
+        for name in (ADMIN, ADMIN.upper(), ADMIN + '.', '"' + ADMIN.upper() + '"',
+                     '*.dns.example.com', '.example.com', '"~^admin"', '$hostname'):
+            source = REALISTIC.replace('server_name dns.example.com; return 301',
+                                       'server_name ' + name + '; return 301')
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                patch(source, DOMAIN, ADMIN)
+        for source in (REALISTIC.replace('listen 80;', 'listen 127.0.0.1:80;'),
+                       REALISTIC.replace('listen 80;', 'listen 80 reuseport;'),
+                       REALISTIC.replace('http {', 'http { include /tmp/other;')):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                patch(source, DOMAIN, ADMIN)
+        for name in (DOMAIN, 'web.' + DOMAIN, 'ADMIN.example.com', 'a.example.com;return 200'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                patch(REALISTIC, DOMAIN, name)
+
+    def test_admin_marker_is_strict(self):
+        result = patch(REALISTIC, DOMAIN, ADMIN)
+        for candidate in (result + '# DOHDNS MTPROXYL ADMIN HTTP\n',
+                          result.replace('ADMIN HTTP', 'ADMIN OTHER', 1),
+                          result.replace('include /etc/adguardhome-doh/mtproxyl-admin-acme.conf;',
+                                         'include /tmp/foreign;'),
+                          result.replace('    # END DOHDNS MTPROXYL ADMIN HTTP\n',
+                                         '    # END DOHDNS MTPROXYL ADMIN HTTP\n' * 2)):
+            for op in (patch, unpatch):
+                with self.subTest(op=op), self.assertRaises(ValueError):
+                    op(candidate, DOMAIN, ADMIN)
+
+    def test_render_limits_tokens_and_paths(self):
+        config = render_admin_http(ADMIN, self.root)
+        self.assertIn('server_name ' + ADMIN + ';', config)
+        self.assertIn('([A-Za-z0-9_-]+)$', config)
+        self.assertIn('alias ' + self.root + '/.well-known/acme-challenge/$1;', config)
+        self.assertIn('disable_symlinks on;', config)
+        self.assertIn('location / { return 404; }', config)
+        for root in ('/tmp/acme', '/var/www/adguardhome-doh-acme/../x',
+                     '/var/lib/adguardhome-doh/acme;', '/var/lib/adguardhome-doh/acme/',
+                     '/var/lib/adguardhome-doh/a b', '/var/lib/adguardhome-doh/$host'):
+            with self.subTest(root=root), self.assertRaises(ValueError):
+                render_admin_http(ADMIN, root)
+        for name in ('ADMIN.example.com', 'x.example.com;return 200', '*.example.com'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                render_admin_http(name, self.root)
 
 
 if __name__ == '__main__':

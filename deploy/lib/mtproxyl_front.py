@@ -11,6 +11,7 @@ from pathlib import Path
 
 MAP_PATH = '/etc/adguardhome-doh/mtproxyl-sni.map'
 HTTP_PATH = '/etc/adguardhome-doh/mtproxyl-http.conf'
+ADMIN_HTTP_PATH = '/etc/adguardhome-doh/mtproxyl-admin-acme.conf'
 CA_PATH = '/etc/ssl/certs/ca-certificates.crt'
 MAP_INSERT = ('\n        # BEGIN DOHDNS MTPROXYL MAP\n'
               '        hostnames;\n'
@@ -22,6 +23,9 @@ UPSTREAM_INSERT = ('\n    # BEGIN DOHDNS MTPROXYL UPSTREAM\n'
 HTTP_INSERT = ('\n        # BEGIN DOHDNS MTPROXYL HTTP\n'
                f'        include {HTTP_PATH};\n'
                '        # END DOHDNS MTPROXYL HTTP\n')
+ADMIN_HTTP_INSERT = ('\n    # BEGIN DOHDNS MTPROXYL ADMIN HTTP\n'
+                     f'    include {ADMIN_HTTP_PATH};\n'
+                     '    # END DOHDNS MTPROXYL ADMIN HTTP\n')
 MARKER = 'DOHDNS MTPROXYL'
 
 
@@ -404,40 +408,116 @@ def _validate(src, domain):
     return snimap.opening + 1, stream.opening + 1, target.opening + 1
 
 
-def _strip(src):
+def _admin_root(root):
+    # Dedicated ACME-only webroot; never expose the private profile directory.
+    if root != '/var/www/adguardhome-doh-acme':
+        raise ValueError('invalid private ACME root')
+    return root
+
+
+def _validate_admin_http(source, domain, admin_host):
+    admin_host = _domain(admin_host)
+    if admin_host in (domain, 'web.' + domain):
+        raise ValueError('admin host is reserved')
+    check_admin_sni(source, domain, admin_host)
+    http = _one(_parse(source), 'http', ['http'], True)
+    for server in _named(http.children, 'server'):
+        if server.children is None:
+            raise ValueError('invalid HTTP server')
+        listens = _named(server.children, 'listen')
+        names = _named(server.children, 'server_name')
+        if not listens or len(names) != 1 or names[0].children is not None or len(names[0].args) < 2:
+            raise ValueError('ambiguous HTTP server name')
+        # Reject regex and wildcard names throughout the HTTP context.  This
+        # also avoids assumptions about overlapping address-specific sockets.
+        for name in names[0].args[1:]:
+            if name == '_':
+                continue
+            if '*' in name or name.startswith(('~', '.')) or '$' in name:
+                raise ValueError('wildcard or regex HTTP server name')
+            canonical = _canonical_sni_name(name, allow_single=True)
+            if canonical == admin_host:
+                raise ValueError('admin HTTP server name conflict')
+        for listen in listens:
+            if listen.children is not None or len(listen.args) < 2:
+                raise ValueError('invalid HTTP listener')
+            address = listen.args[1]
+            if not re.fullmatch(r'(?:[0-9]+|(?:[0-9.]+|\*|localhost):[0-9]+|\[::\]:[0-9]+)', address):
+                raise ValueError('ambiguous HTTP listener')
+            port = address.rsplit(':', 1)[-1]
+            if int(port) == 80 and (address != '80' or listen.args[2:] not in ([], ['default_server'])):
+                raise ValueError('ambiguous port 80 listener')
+    return http.opening + 1
+
+
+def _strip_with_admin(src):
     fragments = (MAP_INSERT, UPSTREAM_INSERT, HTTP_INSERT)
     counts = [src.count(f) for f in fragments]
-    if counts == [0, 0, 0]:
-        if MARKER in src or MAP_PATH in src or HTTP_PATH in src:
-            raise ValueError('partial or foreign overlay')
-        return src, False
-    if counts != [1, 1, 1]:
+    admin_count = src.count(ADMIN_HTTP_INSERT)
+    if counts not in ([0, 0, 0], [1, 1, 1]) or admin_count not in (0, 1):
         raise ValueError('partial or duplicate overlay')
-    for f in fragments:
+    if admin_count and counts != [1, 1, 1]:
+        raise ValueError('partial overlay')
+    for f in fragments + (ADMIN_HTTP_INSERT,):
         src = src.replace(f, '', 1)
-    if MARKER in src or MAP_PATH in src or HTTP_PATH in src:
-        raise ValueError('partial or duplicate overlay')
-    return src, True
+    if MARKER in src or MAP_PATH in src or HTTP_PATH in src or ADMIN_HTTP_PATH in src:
+        raise ValueError('partial or foreign overlay')
+    return src, counts == [1, 1, 1], bool(admin_count)
 
 
-def patch(source, domain):
+def _strip(src):
+    base, had_overlay, had_admin = _strip_with_admin(src)
+    if had_admin:
+        raise ValueError('admin overlay requires explicit handling')
+    return base, had_overlay
+
+
+def patch(source, domain, admin_host=None):
     domain = _domain(domain)
-    base, had_overlay = _strip(source)
+    base, had_overlay, had_admin = _strip_with_admin(source)
     indices = _validate(base, domain)
+    fragments = (MAP_INSERT, UPSTREAM_INSERT, HTTP_INSERT)
+    if admin_host is not None:
+        indices += (_validate_admin_http(base, domain, admin_host),)
+        fragments += (ADMIN_HTTP_INSERT,)
+    if had_admin and admin_host is None:
+        raise ValueError('admin host required for existing overlay')
     result = base
-    for index, fragment in sorted(zip(indices, (MAP_INSERT, UPSTREAM_INSERT, HTTP_INSERT)), reverse=True):
+    for index, fragment in sorted(zip(indices, fragments), reverse=True):
         result = result[:index] + fragment + result[index:]
     if had_overlay and result != source:
         raise ValueError('overlay moved or modified')
     return result
 
 
-def unpatch(source, domain):
-    base, had_overlay = _strip(source)
-    if had_overlay and patch(base, domain) != source:
+def unpatch(source, domain, admin_host=None):
+    base, had_overlay, had_admin = _strip_with_admin(source)
+    if had_admin and admin_host is None:
+        raise ValueError('admin host required for existing overlay')
+    if had_overlay and patch(base, domain, admin_host) != source:
         raise ValueError('overlay moved or modified')
     _validate(base, _domain(domain))
+    if admin_host is not None:
+        _validate_admin_http(base, domain, admin_host)
     return base
+
+
+def render_admin_http(admin_host, root):
+    admin_host = _domain(admin_host)
+    root = _admin_root(root)
+    host_pattern = re.escape(admin_host)
+    return f'''server {{
+    listen 80;
+    server_name {admin_host};
+    if ($http_host !~* "^{host_pattern}(:80)?$") {{ return 404; }}
+    location ~ "^/\\.well-known/acme-challenge/([A-Za-z0-9_-]+)$" {{
+        alias {root}/.well-known/acme-challenge/$1;
+        autoindex off;
+        disable_symlinks on;
+    }}
+    location / {{ return 404; }}
+}}
+'''
 
 
 def render_http(domain):
@@ -544,14 +624,21 @@ def main():
     render.add_argument('--source', required=True, type=Path)
     render.add_argument('--domain', required=True)
     render.add_argument('--output', required=True, type=Path)
+    render.add_argument('--admin-host')
     http = sub.add_parser('render-http')
     http.add_argument('--domain', required=True)
     http.add_argument('--output', required=True, type=Path)
+    admin_http = sub.add_parser('render-admin-http')
+    admin_http.add_argument('--admin-host', required=True)
+    admin_http.add_argument('--root', required=True)
+    admin_http.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     if args.command == 'render':
-        content = patch(_read_regular(args.source), args.domain)
-    else:
+        content = patch(_read_regular(args.source), args.domain, args.admin_host)
+    elif args.command == 'render-http':
         content = render_http(args.domain)
+    else:
+        content = render_admin_http(args.admin_host, args.root)
     _write_private(args.output, content)
 
 
