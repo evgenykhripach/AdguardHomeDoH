@@ -37,7 +37,7 @@ jobs:
             /repo/tests/ubuntu_26_04_smoke.sh /repo
       - name: Ubuntu shared-front rendering smoke test
         run: |
-          docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
+          docker run --rm --cap-add SYS_PTRACE -v "$PWD:/repo:ro" ubuntu:26.04 \
             /repo/tests/ubuntu_mtproxyl_render_smoke.sh /repo
       - name: Test real FakeTLS through the shared front
         run: bash tests/mtproxyl_faketls_smoke.sh
