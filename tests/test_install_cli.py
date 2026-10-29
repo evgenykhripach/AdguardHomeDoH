@@ -303,6 +303,89 @@ class InstallerCliTests(unittest.TestCase):
             (proc / "11/cgroup").unlink()
             missing = self.run_common(check, listeners, str(proc))
             self.assertNotEqual(0, missing.returncode)
+
+    def test_shared_port_snapshot_checks_all_listener_owners_and_both_private_ports(self):
+        mtproxy = "/system.slice/mtproxyl-pq-nginx.service"
+        private = "/system.slice/adguardhome-doh-nginx.service"
+        system = "/system.slice/nginx.service"
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid, group in ((10, mtproxy), (11, mtproxy), (20, private), (30, system)):
+                path = proc / str(pid)
+                path.mkdir()
+                (path / "cgroup").write_text(f"0::{group}\n", encoding="utf-8")
+            public = (
+                'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=10,fd=7))\n'
+                'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=11,fd=8))\n'
+            )
+            check = 'adguardhome_doh_shared_verify_listener_snapshot "$1" "$2" "$3" "$4" "$5" "$6"'
+
+            def verify(listeners, previous="standard", private_group=""):
+                return self.run_common(check, listeners, str(proc), mtproxy, previous,
+                                       private_group, "203.0.113.10")
+
+            self.assertEqual(0, verify(public).returncode)
+            ipv6_system = 'LISTEN 0 511 [::]:443 [::]:* users:(("nginx",pid=30,fd=3))\n'
+            self.assertNotEqual(0, verify(public + ipv6_system).returncode)
+            busy_4443 = 'LISTEN 0 511 127.0.0.1:4443 0.0.0.0:* users:(("nginx",pid=30,fd=9))\n'
+            self.assertNotEqual(0, verify(public + busy_4443).returncode)
+            private_sockets = (
+                'LISTEN 0 511 127.0.0.1:4443 0.0.0.0:* users:(("nginx",pid=20,fd=9))\n'
+                'LISTEN 0 511 127.0.0.1:24443 0.0.0.0:* users:(("nginx",pid=20,fd=10))\n'
+            )
+            self.assertNotEqual(0, verify(public + private_sockets).returncode)
+            self.assertEqual(0, verify(public + private_sockets, "mtproxyl", private).returncode)
+            self.assertNotEqual(0, verify(public + private_sockets + busy_4443, "mtproxyl", private).returncode)
+            self.assertNotEqual(0, verify(public, "mtproxyl", private).returncode)
+            self.assertNotEqual(0, verify(public.replace("pid=11", "pid=99")).returncode)
+            self.assertNotEqual(0, verify(public.replace("pid=11", "pid=11,pid=bad")).returncode)
+            self.assertNotEqual(0, verify(public.replace('users:(("nginx",pid=11,fd=8))',
+                                                        'users:(("nginx",pid=bad,fd=4),("nginx",pid=11,fd=8))')).returncode)
+            self.assertNotEqual(0, verify(public.replace("0.0.0.0:443", "127.0.0.1:443")).returncode)
+            self.assertNotEqual(0, verify(public.replace('users:(("nginx",pid=11,fd=8))',
+                                                        'users:(("nginx",pid=11,fd=8),("nginx",pid=30,fd=5))')).returncode)
+            self.assertNotEqual(0, verify(public.replace(' users:(("nginx",pid=11,fd=8))', "")).returncode)
+            self.assertNotEqual(0, verify(public, "mtproxyl", "/").returncode)
+
+    def test_shared_port_preflight_queries_read_only_and_fails_closed(self):
+        listeners = (
+            'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=10,fd=7))\n'
+            'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=10,fd=8))\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            (proc / "10").mkdir()
+            (proc / "10/cgroup").write_text("0::/system.slice/mtproxyl-pq-nginx.service\n", encoding="utf-8")
+            (proc / "20").mkdir()
+            (proc / "20/cgroup").write_text("0::/system.slice/adguardhome-doh-nginx.service\n", encoding="utf-8")
+            script = r'''
+fixture="$1" scenario="$2"
+systemctl() {
+    case "$*" in
+        'is-active --quiet mtproxyl-pq-nginx.service') [[ "$scenario" != inactive ]];;
+        'show --property=ControlGroup --value mtproxyl-pq-nginx.service')
+            if [[ "$scenario" == bad_group ]]; then printf '/\n'; else printf '/system.slice/mtproxyl-pq-nginx.service\n'; fi;;
+        'is-active --quiet adguardhome-doh-nginx.service') [[ "$scenario" != private_inactive ]];;
+        'show --property=ControlGroup --value adguardhome-doh-nginx.service') printf '/system.slice/adguardhome-doh-nginx.service\n';;
+        *) printf 'unexpected systemctl action: %s\n' "$*" >&2; return 1;;
+    esac
+}
+ss() { [[ "$*" == '-H -ltnp' && "$scenario" != ss_error ]] || return 1; printf '%s' "$fixture"; }
+adguardhome_doh_shared_preflight_listeners '203.0.113.10' "$4" "$3"
+'''
+            for scenario, expected in (("ok", 0), ("inactive", 1), ("bad_group", 1), ("ss_error", 1)):
+                with self.subTest(scenario=scenario):
+                    result = self.run_common(script, listeners, scenario, str(proc), "standard")
+                    self.assertEqual(expected, result.returncode, result.stderr)
+            shared = listeners + (
+                'LISTEN 0 511 127.0.0.1:4443 0.0.0.0:* users:(("nginx",pid=20,fd=9))\n'
+                'LISTEN 0 511 127.0.0.1:24443 0.0.0.0:* users:(("nginx",pid=20,fd=10))\n'
+            )
+            for scenario, expected in (("ok", 0), ("private_inactive", 1)):
+                with self.subTest(scenario=scenario):
+                    result = self.run_common(script, shared, scenario, str(proc), "mtproxyl")
+                    self.assertEqual(expected, result.returncode, result.stderr)
+
     def test_missing_required_argument_fails(self):
         result = self.run_install("--domain", "dns.example.com")
         self.assertNotEqual(0, result.returncode)
@@ -1575,6 +1658,38 @@ class InstallerCliTests(unittest.TestCase):
                     )
                     self.assertEqual(0, retry.returncode, retry.stderr)
                     self.assertTrue((root / "etc/letsencrypt/renewal-hooks/deploy/adguardhome-doh-reload").is_file())
+
+    def test_shared_renewal_adapter_preserves_lineage_and_existing_mtproxy_hook(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "etc/letsencrypt/renewal/dns.example.com.conf"
+            profile.parent.mkdir(parents=True)
+            profile.write_text("[renewalparams]\nauthenticator = webroot\n", encoding="utf-8")
+            hooks = root / "etc/letsencrypt/renewal-hooks/deploy"
+            hooks.mkdir(parents=True)
+            existing = hooks / "mtproxyl-selfmask.sh"
+            existing.write_text("#!/bin/sh\nsystemctl reload mtproxyl-pq-nginx\n", encoding="utf-8")
+            before_profile, before_existing = profile.read_bytes(), existing.read_bytes()
+            call = ('adguardhome_doh_migrate_certbot_renewal "$1" dns.example.com '
+                    '/var/www/mtproxyl-selfmask "$2" "$3"')
+            result = self.run_common(call, str(root), str(ROOT), "mtproxyl")
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(before_profile, profile.read_bytes())
+            self.assertEqual(before_existing, existing.read_bytes())
+            own = hooks / "adguardhome-doh-reload"
+            own_before = own.read_text(encoding="utf-8")
+            self.assertIn('/etc/letsencrypt/live/dns.example.com', own_before)
+            self.assertIn('systemctl reload adguardhome-doh-nginx', own_before)
+            self.assertNotIn('systemctl reload nginx\n', own_before)
+            rejected = self.run_common(call, str(root), str(ROOT), "invalid")
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertEqual(own_before, own.read_text(encoding="utf-8"))
+            own.write_text("#!/bin/sh\n# foreign hook\n", encoding="utf-8")
+            rejected = self.run_common(call, str(root), str(ROOT), "mtproxyl")
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertEqual("#!/bin/sh\n# foreign hook\n", own.read_text(encoding="utf-8"))
+            self.assertEqual(before_profile, profile.read_bytes())
+            self.assertEqual(before_existing, existing.read_bytes())
 
     def test_preflight_rejects_symlink_that_would_modify_an_unbacked_target(self):
         with tempfile.TemporaryDirectory() as directory:

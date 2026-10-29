@@ -201,13 +201,18 @@ ROTATE
 }
 
 adguardhome_doh_migrate_certbot_renewal() {
-    local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" profile helper hook_dir
+    # The caller must take a recovery snapshot before modifying a managed hook.
+    local root="${1:-/}" domain="$2" webroot="$3" project_root="$4" front="${5:-standard}" profile helper hook_dir
     profile="$(adguardhome_doh_under_root "$root" "/etc/letsencrypt/renewal/$domain.conf")"
     helper="$project_root/deploy/lib/certbot_renewal.py"
     [[ -f "$helper" ]] || helper=/usr/local/libexec/adguardhome-doh/certbot_renewal.py
     [[ -f "$profile" && -f "$helper" ]] || { printf 'missing Certbot renewal profile or migration helper\n' >&2; return 1; }
     hook_dir="$(adguardhome_doh_under_root "$root" /etc/letsencrypt/renewal-hooks/deploy)"
-    python3 "$helper" --path "$profile" --domain "$domain" --webroot "$webroot" --hook-dir "$hook_dir"
+    case "$front" in
+        standard) python3 "$helper" --path "$profile" --domain "$domain" --webroot "$webroot" --hook-dir "$hook_dir" ;;
+        mtproxyl) python3 "$helper" --path "$profile" --domain "$domain" --webroot "$webroot" --hook-dir "$hook_dir" --front mtproxyl ;;
+        *) printf 'invalid front for Certbot renewal hook\n' >&2; return 1 ;;
+    esac
 }
 
 adguardhome_doh_load_or_create_doh_token() {
@@ -800,6 +805,91 @@ adguardhome_doh_system_nginx_owns_listeners() {
         done
     done <<< "$listeners"
     (( found ))
+}
+
+adguardhome_doh_shared_verify_listener_snapshot() {
+    # Check one ss -H -ltnp snapshot against service cgroups.  This is only
+    # listener evidence: it neither reserves ports nor verifies master/config
+    # identity, and cannot authorize activation without the lifecycle checks.
+    local listeners="$1" proc_root="$2" mtproxy_group="$3" previous_front="$4"
+    local private_group="$5" public_ip="$6" line endpoint address port rest pid fd group
+    local found_pid found80=0 found443=0 found4443=0 found24443=0
+    local pid_pattern='^([0-9]+),fd=([0-9]+)([),[:space:]]|$)'
+    adguardhome_doh_validate_ipv4 "$public_ip" || return 1
+    [[ "$mtproxy_group" == /* && "$mtproxy_group" == */mtproxyl-pq-nginx.service && "$mtproxy_group" != *'/../'* &&
+       "$mtproxy_group" != *'/./'* && "$mtproxy_group" != *'//'* ]] || return 1
+    case "$previous_front" in
+        standard) ;;
+        mtproxyl)
+            [[ "$private_group" == /* && "$private_group" == */adguardhome-doh-nginx.service && "$private_group" != *'/../'* &&
+               "$private_group" != *'/./'* && "$private_group" != *'//'* ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        endpoint="$(awk '{print $4}' <<< "$line")"
+        [[ "$endpoint" == *:* ]] || return 1
+        address="${endpoint%:*}"
+        port="${endpoint##*:}"
+        [[ "$port" =~ ^[0-9]+$ ]] || return 1
+        case "$port" in
+            80|443)
+                group="$mtproxy_group"
+                if [[ "$address" == 0.0.0.0 || "$address" == "$public_ip" ]]; then
+                    if [[ "$port" == 80 ]]; then found80=1; else found443=1; fi
+                fi
+                ;;
+            4443|24443)
+                [[ "$previous_front" == mtproxyl && "$address" == 127.0.0.1 ]] || return 1
+                group="$private_group"
+                if [[ "$port" == 4443 ]]; then found4443=1; else found24443=1; fi
+                ;;
+            *) continue ;;
+        esac
+        [[ "$line" == *'users:(('* && "$line" == *'pid='* ]] || return 1
+        found_pid=0
+        rest="$line"
+        while [[ "$rest" == *'pid='* ]]; do
+            rest="${rest#*pid=}"
+            [[ "$rest" =~ $pid_pattern ]] || return 1
+            pid="${BASH_REMATCH[1]}"
+            fd="${BASH_REMATCH[2]}"
+            [[ -r "$proc_root/$pid/cgroup" ]] || return 1
+            awk -F: -v group="$group" '
+                $3 == group || index($3, group "/") == 1 { found = 1 }
+                END { exit !found }
+            ' "$proc_root/$pid/cgroup" || return 1
+            found_pid=1
+            rest="${rest#"$pid,fd=$fd"}"
+        done
+        [[ "$found_pid" == 1 ]] || return 1
+    done <<< "$listeners"
+    [[ "$found80" == 1 && "$found443" == 1 ]] || return 1
+    [[ "$previous_front" == standard || ( "$found4443" == 1 && "$found24443" == 1 ) ]]
+}
+
+adguardhome_doh_shared_preflight_listeners() {
+    # Run immediately before private listeners are started, after the lifecycle
+    # has safely handled any conflicting system unit.  A free snapshot is not
+    # a reservation; systemd state and verified process identity are separate
+    # prerequisites, and bind/start errors must still abort the transaction.
+    local public_ip="$1" previous_front="$2" proc_root="${3:-/proc}"
+    local mtproxy_group private_group="" listeners
+    command -v ss >/dev/null 2>&1 || { printf 'ss is required for shared listener preflight\n' >&2; return 1; }
+    systemctl is-active --quiet mtproxyl-pq-nginx.service || {
+        printf 'MTProxyL must be active for shared listener preflight\n' >&2; return 1;
+    }
+    mtproxy_group="$(systemctl show --property=ControlGroup --value mtproxyl-pq-nginx.service 2>/dev/null)" || return 1
+    if [[ "$previous_front" == mtproxyl ]]; then
+        systemctl is-active --quiet adguardhome-doh-nginx.service || return 1
+        private_group="$(systemctl show --property=ControlGroup --value adguardhome-doh-nginx.service 2>/dev/null)" || return 1
+    fi
+    listeners="$(ss -H -ltnp 2>/dev/null)" || { printf 'could not inspect listener ports\n' >&2; return 1; }
+    adguardhome_doh_shared_verify_listener_snapshot "$listeners" "$proc_root" "$mtproxy_group" \
+        "$previous_front" "$private_group" "$public_ip" || {
+        printf 'shared listener ports are missing, in use by another service, or have unknown owners\n' >&2; return 1;
+    }
 }
 
 adguardhome_doh_validate_local_site() {
