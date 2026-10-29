@@ -448,7 +448,8 @@ adguardhome_doh_render_dry_run() {
     local output status use_existing="${1:-0}"
     local -a existing_args=()
     if ((use_existing && UPDATE)) && [[ -f "$(adguardhome_doh_under_root "$ROOT" /opt/AdGuardHome/AdGuardHome.yaml)" ]]; then
-        existing_args=(--existing-config "$(adguardhome_doh_under_root "$ROOT" /opt/AdGuardHome/AdGuardHome.yaml)")
+        existing_args=(--existing-config "$(adguardhome_doh_under_root "$ROOT" /opt/AdGuardHome/AdGuardHome.yaml)" \
+                       --health-state "$STATE_DIR/health-state.json")
         [[ -f "$CONFIG_DIR/health-policy.json" ]] && existing_args+=(--existing-policy "$CONFIG_DIR/health-policy.json")
         [[ -n "$EXISTING_PUBLIC_IP" ]] && existing_args+=(--existing-public-ip "$EXISTING_PUBLIC_IP")
     fi
@@ -679,7 +680,8 @@ adguardhome_doh_backup /etc/nginx/stream.d/adguardhome-doh.conf "$backup/nginx-s
 
 existing_args=()
 if ((UPDATE)) && [[ -f /opt/AdGuardHome/AdGuardHome.yaml ]]; then
-    existing_args=(--existing-config /opt/AdGuardHome/AdGuardHome.yaml)
+    existing_args=(--existing-config /opt/AdGuardHome/AdGuardHome.yaml \
+                   --health-state "$STATE_DIR/health-state.json")
     [[ -f "$CONFIG_DIR/health-policy.json" ]] && existing_args+=(--existing-policy "$CONFIG_DIR/health-policy.json")
     [[ -n "$EXISTING_PUBLIC_IP" ]] && existing_args+=(--existing-public-ip "$EXISTING_PUBLIC_IP")
 fi

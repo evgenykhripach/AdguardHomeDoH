@@ -1897,6 +1897,19 @@ class ServiceChangeSeedingTests(unittest.TestCase):
             json.dumps({"chatgpt": {"healthy": True}, "claude": {"healthy": False}}),
             encoding="utf-8",
         )
+        previous_services = ["chatgpt", "claude"]
+        (root / "var/lib/adguardhome-doh/enabled-services.json").write_text(
+            json.dumps(previous_services), encoding="utf-8",
+        )
+        catalog = Catalog.load(root / "etc/adguardhome-doh/catalog")
+        (root / "etc/adguardhome-doh/health-policy.json").write_text(
+            json.dumps(render_service_health_policy(
+                catalog, previous_services, catalog.enabled_policy(previous_services)
+            )), encoding="utf-8",
+        )
+        healthcheck = root / "usr/local/libexec/adguardhome-doh/healthcheck.py"
+        healthcheck.parent.mkdir(parents=True)
+        shutil.copy2(project / "deploy/templates/healthcheck.py", healthcheck)
         (root / "var/lib/adguardhome-doh/install.json").write_text(
             json.dumps({"domain": "dns.example.com", "public_ip": "203.0.113.10"}),
             encoding="utf-8",
@@ -1926,6 +1939,36 @@ class ServiceChangeSeedingTests(unittest.TestCase):
             stream = (root / "etc/nginx/stream.d/adguardhome-doh.conf").read_text()
             self.assertIn("listen 443", stream)
             self.assertEqual("unchanged private stream", private.read_text())
+
+    def test_missing_or_invalid_previous_policy_does_not_stop_or_change_configuration(self):
+        for content in (None, "{broken", '{"domains": {}}', '{"domains": [], "domains": []}'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                manager = load_manager()
+                root = self.build_root(directory)
+                policy = root / "etc/adguardhome-doh/health-policy.json"
+                if content is None:
+                    policy.unlink()
+                else:
+                    policy.write_text(content, encoding="utf-8")
+                stream = root / "etc/nginx/stream.d/adguardhome-doh.conf"
+                stream.parent.mkdir(parents=True)
+                stream.write_text("previous stream", encoding="utf-8")
+                protected = (
+                    root / "opt/AdGuardHome/AdGuardHome.yaml", stream,
+                    root / "var/lib/adguardhome-doh/install.json",
+                    root / "var/lib/adguardhome-doh/enabled-services.json",
+                    root / "var/lib/adguardhome-doh/health-state.json",
+                )
+                before = {path: path.read_bytes() for path in protected}
+                policy_before = policy.read_bytes() if policy.exists() else None
+                with mock.patch.object(manager, "_stop_adguard") as stop, \
+                     mock.patch.object(manager, "activate_transaction") as activate:
+                    with self.assertRaisesRegex(RuntimeError, "политика доменов недоступна или повреждена"):
+                        manager.apply_service_change(["chatgpt"], root=root, validator=lambda: None)
+                stop.assert_not_called()
+                activate.assert_not_called()
+                self.assertEqual(before, {path: path.read_bytes() for path in protected})
+                self.assertEqual(policy_before, policy.read_bytes() if policy.exists() else None)
 
     def test_render_command_passes_healthy_services_as_a_complete_pair(self):
         manager = load_manager()
@@ -2162,22 +2205,30 @@ class ServiceChangeSeedingTests(unittest.TestCase):
                  mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
                  mock.patch.object(manager, "_check_incomplete_transactions"), \
                  mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+                 mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
                  mock.patch.object(manager, "_stop_adguard") as stop, \
                  mock.patch.object(manager, "_apply_service_change_locked", side_effect=original), \
                  mock.patch.object(manager, "reload_runtime_services") as reload:
                 with self.assertRaises(type(original)):
                     manager.apply_service_change(["chatgpt"], root=Path("/"))
+                healthcheck.return_value.load_policy.assert_called_once_with(
+                    Path("/etc/adguardhome-doh/health-policy.json")
+                )
                 stop.assert_called_once()
                 reload.assert_called_once()
         with mock.patch.object(manager, "operation_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "_check_incomplete_transactions"), \
              mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+             mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
              mock.patch.object(manager, "_stop_adguard"), \
              mock.patch.object(manager, "_apply_service_change_locked", side_effect=RuntimeError("activation")), \
              mock.patch.object(manager, "reload_runtime_services", side_effect=RuntimeError("restart")):
             with self.assertRaisesRegex(RuntimeError, "restoring previous runtime also failed: restart"):
                 manager.apply_service_change(["chatgpt"], root=Path("/"))
+            healthcheck.return_value.load_policy.assert_called_once_with(
+                Path("/etc/adguardhome-doh/health-policy.json")
+            )
 
     def test_live_activation_failure_restores_yaml_before_restart(self):
         manager = load_manager()
@@ -2365,12 +2416,16 @@ class ServiceChangeSeedingTests(unittest.TestCase):
              mock.patch.object(manager, "health_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(manager, "_check_incomplete_transactions"), \
              mock.patch.object(manager, "_read_json", return_value={"domain": "dns.example.com"}), \
+             mock.patch.object(manager, "_load_healthcheck") as healthcheck, \
              mock.patch.object(manager, "_stop_adguard") as stop, \
              mock.patch.object(manager, "_apply_service_change_locked",
                                side_effect=manager._FileRecoveryError("disk error")), \
              mock.patch.object(manager, "reload_runtime_services") as reload:
             with self.assertRaisesRegex(RuntimeError, "AdGuard left stopped"):
                 manager.apply_service_change(["chatgpt"], root=Path("/"))
+            healthcheck.return_value.load_policy.assert_called_once_with(
+                Path("/etc/adguardhome-doh/health-policy.json")
+            )
             stop.assert_called_once()
             reload.assert_not_called()
 
@@ -2606,7 +2661,6 @@ class MTProxyFrontTests(unittest.TestCase):
             ("etc/adguardhome-doh/mtproxyl-http-site.conf", "old private http"),
             ("etc/adguardhome-doh/mtproxyl-stream-site.conf", "old private stream"),
             ("opt/AdGuardHome/AdGuardHome", "binary"),
-            ("usr/local/libexec/adguardhome-doh/healthcheck.py", "helper"),
             ("usr/local/libexec/adguardhome-doh/mtproxyl_front.py", "front helper"),
             ("etc/adguardhome-doh/mtproxyl-http.conf", "front http"),
             ("etc/systemd/system/mtproxyl-pq-nginx.service.d/adguardhome-doh.conf", "front dropin"),

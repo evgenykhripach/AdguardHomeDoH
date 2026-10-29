@@ -1532,6 +1532,11 @@ def apply_service_change(
             if root == Path("/"):
                 _load_healthcheck(root)
                 _verify_mtproxyl_active_config(root, subprocess.run)
+        if renderer is None:
+            try:
+                _load_healthcheck(root).load_policy(paths["health_policy"])
+            except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+                raise RuntimeError("политика доменов недоступна или повреждена") from exc
         try:
             _stop_adguard(root)
             return _apply_service_change_locked(selected, root=root, catalog=catalog,
@@ -1564,6 +1569,7 @@ def _apply_service_change_locked(
                        "--services", ",".join(selected), "--public-ip", str(state["public_ip"]),
                        "--doh-host", str(state["domain"]), "--doh-token-file", str(paths["token"]),
                        "--existing-config", str(paths["agh"]),
+                       "--health-state", str(paths["health_state"]),
                        "--existing-public-ip", str(state["public_ip"]),
                        "--certificate-root", "/etc/letsencrypt/live/%s" % state["domain"],
                        "--webroot", str(paths["webroot"]), "--output", str(stage)]

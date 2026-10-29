@@ -312,6 +312,7 @@ class HealthcheckTests(unittest.TestCase):
         health = load_healthcheck()
         invalid_policies = [
             "{", "null", "{}", '{"services": {}, "domains": "not-a-list"}',
+            '{"services": {}, "domains": [], "domains": []}',
             '{"services": {}, "domains": [{}]}',
             '{"services": {"example": [1]}, "domains": []}',
             '{"services": {}, "domains": [{"domain": "example.com", "kind": "wrong"}]}',
@@ -510,6 +511,7 @@ class HealthcheckTests(unittest.TestCase):
         ip = "203.0.113.10"
         payloads = [None, "{", "null", '{"example":{}}',
                     '{"example":{"healthy":"false"}}',
+                    '{"example":{"healthy":false,"healthy":true}}',
                     '{"example":{"healthy":true,"successes":"broken"}}']
         for payload in payloads:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:

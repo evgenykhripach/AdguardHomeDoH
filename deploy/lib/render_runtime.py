@@ -151,7 +151,29 @@ def _managed_domain_names(rows):
     return domains
 
 
-def merge_existing_adguard(existing, rendered, rows, seeded_rewrites, old_policy, public_ip, old_public_ip):
+def load_healthcheck():
+    """Use the installed health gate's policy and state validation rules."""
+
+    import importlib.util
+
+    source = Path(__file__).with_name("healthcheck.py")
+    if not source.is_file():
+        source = Path(__file__).resolve().parents[1] / "templates" / "healthcheck.py"
+    spec = importlib.util.spec_from_file_location("adguardhome_doh_healthcheck", source)
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load health state validator")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (OSError, ImportError) as exc:
+        raise ValueError("cannot load health state validator") from exc
+    if not hasattr(module, "_health_record") or not hasattr(module, "_rules_by_health"):
+        raise ValueError("health state validator is incompatible")
+    return module
+
+
+def merge_existing_adguard(existing, rendered, rows, seeded_rewrites, old_policy, public_ip, old_public_ip,
+                           unknown_names=None):
     """Preserve user settings while replacing only project-owned rewrites."""
     import yaml
 
@@ -176,13 +198,71 @@ def merge_existing_adguard(existing, rendered, rows, seeded_rewrites, old_policy
         old_rewrites = []
     if not isinstance(old_rewrites, list) or any(not isinstance(item, dict) for item in old_rewrites):
         raise ValueError("existing AdGuard rewrites must be a list of mappings")
-    names = _managed_domain_names(old_policy)
-    names.update(_managed_domain_names([{"domain": row.domain, "kind": row.kind} for row in rows]))
+    old_names = _managed_domain_names(old_policy)
+    names = old_names | _managed_domain_names([{"domain": row.domain, "kind": row.kind} for row in rows])
     managed_answers = {str(public_ip), str(old_public_ip), "127.0.0.1", "127.0.0.1:53"}
+    if unknown_names is not None:
+        return _merge_unknown_rewrites(
+            merged, old_filtering, old_rewrites, seeded_rewrites, old_names, names,
+            managed_answers, unknown_names, public_ip, old_public_ip,
+        )
     preserved = [deepcopy(item) for item in old_rewrites
                  if not (item.get("domain") in names and str(item.get("answer", "")) in managed_answers)]
     filtering["rewrites"] = preserved + deepcopy(seeded_rewrites)
     filtering["rewrites_enabled"] = True
+    return yaml.safe_dump(merged, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+
+def _merge_unknown_rewrites(merged, old_filtering, old_rewrites, seeded_rewrites,
+                            old_names, names, managed_answers, unknown_names, public_ip, old_public_ip):
+    """Preserve only existing rules whose selected owners are still unknown."""
+
+    import yaml
+
+    global_enabled = old_filtering.get("rewrites_enabled", True)
+    if not isinstance(global_enabled, bool):
+        raise ValueError("cannot determine whether rewrites are globally enabled")
+    seeded = {(item["domain"], str(item["answer"])): deepcopy(item) for item in seeded_rewrites}
+    preserved = []
+    retained = {}
+    seen_unknown = set()
+    for item in old_rewrites:
+        domain = item.get("domain")
+        answer = str(item.get("answer", ""))
+        key = (domain, answer)
+        if domain not in names or answer not in managed_answers:
+            preserved.append(deepcopy(item))
+            continue
+        if domain not in unknown_names:
+            continue
+        if key in seen_unknown:
+            raise ValueError("cannot safely preserve duplicate unknown rewrites")
+        seen_unknown.add(key)
+
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("cannot determine whether an unknown rewrite is enabled")
+        was_managed = domain in old_names
+        if answer == old_public_ip and old_public_ip != public_ip:
+            if global_enabled and enabled:
+                raise ValueError("cannot change public IP while an active rewrite has unknown health")
+            if not was_managed:
+                raise ValueError("cannot identify ownership of an old public IP rewrite")
+        if not was_managed and answer != public_ip:
+            raise ValueError("cannot identify ownership of a rewrite for a newly selected domain")
+        if answer != public_ip:
+            continue
+        if not was_managed and global_enabled is False and enabled:
+            raise ValueError("cannot preserve an enabled user rewrite while rewrites are globally disabled")
+        if (global_enabled and enabled) or (not was_managed and not enabled and key not in seeded):
+            retained[key] = deepcopy(item)
+
+    # A healthy shared owner can seed the same key. Keep the original metadata
+    # when the existing enabled rule is also protected by an unknown owner.
+    for key, item in retained.items():
+        seeded[key] = item
+    merged["filtering"]["rewrites"] = preserved + list(seeded.values())
+    merged["filtering"]["rewrites_enabled"] = True
     return yaml.safe_dump(merged, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 
@@ -200,6 +280,27 @@ def load_previous_policy(path):
     return rows
 
 
+def load_validated_previous_policy(path, healthcheck):
+    """Validate policy and reject ambiguous duplicate keys before rendering."""
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+        validated = healthcheck.load_policy(path)
+        if parsed != validated:
+            raise ValueError("policy changed during validation")
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ValueError("cannot safely read existing health policy") from exc
+    return validated["domains"] if isinstance(validated, dict) else validated
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy", type=Path)
@@ -207,6 +308,7 @@ def main(argv=None):
     parser.add_argument("--front", choices=("standard", "mtproxyl"), default="standard")
     parser.add_argument("--services", help="comma-separated service IDs")
     parser.add_argument("--healthy-services", help="comma-separated healthy service IDs")
+    parser.add_argument("--health-state", type=Path)
     parser.add_argument("--public-ip", required=True)
     parser.add_argument("--relay", help="forward routed services to this exit host")
     parser.add_argument("--local-site", action="append", default=[],
@@ -234,6 +336,8 @@ def main(argv=None):
         parser.error("--front mtproxyl requires --config-dir for the complete SNI map")
     if args.policy is not None and args.services is not None:
         parser.error("--services cannot be combined with --policy")
+    if args.health_state is not None and args.existing_config is not None and args.existing_policy is None:
+        parser.error("existing health policy (--existing-policy) is required with --health-state and --existing-config")
 
     doh_token = (args.doh_token_file.read_text(encoding="utf-8").strip()
                  if args.doh_token_file else args.doh_token)
@@ -253,7 +357,14 @@ def main(argv=None):
             parser.error("--existing-public-ip must be IPv4")
     else:
         old_public_ip = args.public_ip
-    old_policy = load_previous_policy(args.existing_policy)
+    healthcheck = load_healthcheck() if args.health_state is not None else None
+    if healthcheck is not None and existing is not None:
+        old_policy = load_validated_previous_policy(args.existing_policy, healthcheck)
+    else:
+        old_policy = load_previous_policy(args.existing_policy)
+    health_state = healthcheck.load_json(args.health_state, {}) if healthcheck is not None else None
+    if healthcheck is not None and not isinstance(health_state, dict):
+        health_state = {}
 
     def split_services(value):
         if value is None:
@@ -263,6 +374,10 @@ def main(argv=None):
     catalog = None
     selected = []
     healthy = split_services(args.healthy_services)
+    if healthcheck is not None:
+        known_healthy = {str(key) for key, value in health_state.items()
+                         if healthcheck._health_record(value)[0] is True}
+        healthy = sorted(known_healthy) if healthy is None else [item for item in healthy if item in known_healthy]
     seeded_rewrites = []
     full_catalog = Catalog.load(args.config_dir) if args.config_dir is not None else None
     if args.policy is None:
@@ -270,6 +385,8 @@ def main(argv=None):
         selected = catalog.default_service_ids
         if args.services is not None:
             selected = split_services(args.services)
+        if healthcheck is not None:
+            healthy = [service_id for service_id in healthy if service_id in selected]
         # nginx must retain the full enabled-service union.  Health state is
         # applied later by the service-level gate to AdGuard rewrites.
         rows = catalog.enabled_policy(selected)
@@ -288,6 +405,17 @@ def main(argv=None):
             seeded_rewrites = render_rewrites(
                 [row for row in rows if row.domain in healthy_domains], args.public_ip
             )
+    if catalog is None:
+        health_policy = {
+            "enabled_services": [],
+            "services": {},
+            "domains": [
+                {"domain": row.domain, "kind": row.kind, "probe": row.probe, "services": []}
+                for row in rows
+            ],
+        }
+    else:
+        health_policy = render_service_health_policy(catalog, selected, rows)
     front_map = None
     if args.front == "mtproxyl":
         front_map = render_mtproxyl_sni_map(
@@ -299,8 +427,13 @@ def main(argv=None):
     )
     adguard_config = render_adguard_yaml(rows, password_hash, rewrites=seeded_rewrites)
     if existing is not None:
+        unknown_names = None
+        if healthcheck is not None:
+            _, unknown = healthcheck._rules_by_health(health_policy, health_state, args.public_ip)
+            unknown_names = {domain for domain, _answer in unknown}
         adguard_config = merge_existing_adguard(
-            existing, adguard_config, rows, seeded_rewrites, old_policy, args.public_ip, old_public_ip
+            existing, adguard_config, rows, seeded_rewrites, old_policy, args.public_ip, old_public_ip,
+            unknown_names,
         )
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     (args.output / "AdGuardHome.yaml").write_text(adguard_config, encoding="utf-8")
@@ -326,17 +459,6 @@ def main(argv=None):
     )
     if front_map is not None:
         (args.output / "mtproxyl-sni.map").write_text(front_map, encoding="utf-8")
-    if catalog is None:
-        health_policy = {
-            "enabled_services": [],
-            "services": {},
-            "domains": [
-                {"domain": row.domain, "kind": row.kind, "probe": row.probe, "services": []}
-                for row in rows
-            ],
-        }
-    else:
-        health_policy = render_service_health_policy(catalog, selected, rows)
     (args.output / "health-policy.json").write_text(
         json.dumps(health_policy, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",

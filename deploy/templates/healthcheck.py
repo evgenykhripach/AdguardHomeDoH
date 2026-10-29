@@ -52,9 +52,18 @@ class LockBusy(RuntimeError):
     """Raised when another health run currently owns the lock."""
 
 
+def _unique_json_object(pairs: list) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def load_json(path: Path, fallback: Any) -> Any:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object)
     except (FileNotFoundError, ValueError, OSError):
         return fallback
 
@@ -62,7 +71,7 @@ def load_json(path: Path, fallback: Any) -> Any:
 def load_policy(path: Path) -> Any:
     """Read and validate policy before changing persisted state or rewrites."""
 
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    value = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object)
     if isinstance(value, Mapping):
         if "domains" not in value or not isinstance(value["domains"], list):
             raise ValueError("invalid policy domains")
