@@ -25,3 +25,8 @@ jobs:
           sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS" CI="$CI"
           RUNNER_OS="$RUNNER_OS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
           bash tests/ubuntu_systemd_maintenance_transaction_smoke.sh "$PWD"
+      - name: Verify private reload command using a disposable transient unit
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS" CI="$CI"
+          RUNNER_OS="$RUNNER_OS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          bash tests/ubuntu_systemd_private_reload_smoke.sh "$PWD"

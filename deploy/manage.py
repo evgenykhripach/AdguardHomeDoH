@@ -13,6 +13,8 @@ import json
 import os
 import re
 import shlex
+import stat
+import types
 import shutil
 import subprocess
 import sys
@@ -177,6 +179,11 @@ PRIVATE_NGINX_STREAM_SITE = "/etc/adguardhome-doh/mtproxyl-stream-site.conf"
 FRONT_SITE_FILES = (PRIVATE_NGINX_HTTP_SITE, PRIVATE_NGINX_STREAM_SITE)
 MTPROXY_NGINX_BINARY = "/opt/mtproxyl-nginx/sbin/nginx"
 MTPROXY_NGINX_CONFIG = "/opt/mtproxyl-nginx/conf/nginx.conf"
+MTPROXY_RUNTIME_CONFIG = "/run/adguardhome-doh/mtproxyl-nginx.conf"
+MTPROXY_RELOAD_HELPER = "/usr/local/libexec/adguardhome-doh/mtproxyl_reload.py"
+MTPROXY_FRONT_LOCK = "/run/lock/adguardhome-doh-front.lock"
+MTPROXY_HELPERS = tuple("/usr/local/libexec/adguardhome-doh/" + name for name in (
+    "mtproxyl_front.py", "mtproxyl_runtime.py", "mtproxyl_controller.py", "mtproxyl_reload.py"))
 FRONT_OVERLAY_FILES = (
     "/usr/local/libexec/adguardhome-doh/mtproxyl_front.py",
     "/etc/adguardhome-doh/mtproxyl-http.conf",
@@ -810,7 +817,79 @@ def _validate_staged_adguard(
            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def _verify_mtproxyl_active_config(root: Path, runner: Callable[..., Any]) -> Optional[int]:
+
+def _read_root_owned(path: Path, mode: int) -> bytes:
+    """Read a root-owned file through root-owned, non-writable directories."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("absolute path required")
+    for directory in (path.parent, *path.parent.parents):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            raise ValueError("unsafe parent directory")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != mode or before.st_size > 1048576):
+            raise ValueError("unsafe file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(1048577)
+        after = os.fstat(fd)
+        current = path.lstat()
+        identity = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid,
+                               st.st_nlink, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if len(data) > 1048576 or identity(before) != identity(after) or identity(after) != identity(current):
+            raise ValueError("file changed")
+        return data
+    finally:
+        os.close(fd)
+
+
+def _verify_private_mtproxy(root: Path, runner: Callable[..., Any]) -> None:
+    state = _read_json(_runtime_paths(root)["install"], {})
+    domain = state.get("domain") if isinstance(state, Mapping) else None
+    admin = state.get("admin_host") if isinstance(state, Mapping) else None
+    if not isinstance(domain, str) or not _valid_domain(domain) or not isinstance(admin, str) or not _valid_domain(admin):
+        raise ValueError("shared front state is invalid")
+    helpers = {path: _read_root_owned(under_root(root, path), 0o755) for path in MTPROXY_HELPERS}
+    _read_root_owned(under_root(root, "/etc/systemd/system/mtproxyl-pq-nginx.service.d/adguardhome-doh.conf"), 0o644)
+    runtime_bytes = _read_root_owned(under_root(root, MTPROXY_RUNTIME_CONFIG), 0o600)
+    # The installed parser checks the exact overlay placement and all required
+    # includes; loading the already-read root-owned bytes avoids path races.
+    module = types.ModuleType("_doh_verified_front")
+    previous = sys.modules.get(module.__name__)
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(helpers[MTPROXY_HELPERS[0]], MTPROXY_HELPERS[0], "exec"), module.__dict__)
+        text = runtime_bytes.decode("utf-8")
+        _, overlay, admin_overlay = module._strip_with_admin(text)
+        if not overlay or not admin_overlay:
+            raise ValueError("shared overlay is missing")
+        module.unpatch(text, domain, admin)
+    finally:
+        if previous is None:
+            sys.modules.pop(module.__name__, None)
+        else:
+            sys.modules[module.__name__] = previous
+    result = runner(["systemctl", "show", "--property=ExecReload", "--value", "mtproxyl-pq-nginx"],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = result.stdout.decode("utf-8") if isinstance(result.stdout, bytes) else result.stdout
+    if not isinstance(output, str):
+        raise ValueError("ExecReload unavailable")
+    match = re.fullmatch(r"\{ path=/usr/bin/python3 ; argv\[\]=(.+?) ; ignore_errors=no ; [^{}]*\}", output.strip())
+    if not match:
+        raise ValueError("unexpected ExecReload")
+    args = shlex.split(match.group(1), comments=False, posix=True)
+    expected = ["/usr/bin/python3", MTPROXY_RELOAD_HELPER, "reload", "--source", MTPROXY_NGINX_CONFIG,
+                "--runtime", MTPROXY_RUNTIME_CONFIG, "--domain", domain, "--admin-host", admin,
+                "--nginx-bin", MTPROXY_NGINX_BINARY, "--lock", MTPROXY_FRONT_LOCK,
+                "--main-pid", "$MAINPID", "--cgroup", "/system.slice/mtproxyl-pq-nginx.service"]
+    if args != expected:
+        raise ValueError("unexpected ExecReload arguments")
+
+def _verify_mtproxyl_active_config(root: Path, runner: Callable[..., Any], *, allow_private: bool = False, include_config: bool = False) -> Any:
     """Require a stable MTProxy nginx master using the supported generated config."""
 
     if Path(root) != Path("/"):
@@ -842,21 +921,26 @@ def _verify_mtproxyl_active_config(root: Path, runner: Callable[..., Any]) -> Op
             argv = [os.fsdecode(arg) for arg in arguments]
         if (pid != checked_pid or len(argv) < 3 or any(not arg for arg in argv)
                 or executable != MTPROXY_NGINX_BINARY
-                or argv[:3] != [MTPROXY_NGINX_BINARY, "-c", MTPROXY_NGINX_CONFIG]
+                or argv[:2] != [MTPROXY_NGINX_BINARY, "-c"]
+                or argv[2] not in ((MTPROXY_NGINX_CONFIG, MTPROXY_RUNTIME_CONFIG) if allow_private else (MTPROXY_NGINX_CONFIG,))
                 or any(arg.startswith("-c") for arg in argv[3:])):
             raise ValueError("active config is custom or ambiguous")
-        return pid
-    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        if argv[2] == MTPROXY_RUNTIME_CONFIG:
+            _verify_private_mtproxy(root, runner)
+            if main_pid() != pid:
+                raise ValueError("master changed during private verification")
+        return (pid, argv[2]) if include_config else pid
+    except (OSError, UnicodeError, ValueError, SyntaxError, ImportError, AttributeError, TypeError, subprocess.SubprocessError):
         raise RuntimeError("активная конфигурация MTProxy не подтверждена; custom mode не поддерживается") from None
 
 
 def _reload_mtproxyl_map(root: Path, runner: Callable[..., Any]) -> None:
     if Path(root) != Path("/"):
         return
-    pid = _verify_mtproxyl_active_config(root, runner)
-    runner([MTPROXY_NGINX_BINARY, "-t", "-c", MTPROXY_NGINX_CONFIG],
+    pid, config = _verify_mtproxyl_active_config(root, runner, allow_private=True, include_config=True)
+    runner([MTPROXY_NGINX_BINARY, "-t", "-c", config],
            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if _verify_mtproxyl_active_config(root, runner) != pid:
+    if _verify_mtproxyl_active_config(root, runner, allow_private=True, include_config=True) != (pid, config):
         raise RuntimeError("процесс MTProxy изменился перед reload")
     runner(["systemctl", "reload", "mtproxyl-pq-nginx"], check=True)
 
@@ -1349,7 +1433,7 @@ def collect_menu_status(
     front_config_supported = True
     if front == "mtproxyl" and root == Path("/"):
         try:
-            _verify_mtproxyl_active_config(root, runner)
+            _verify_mtproxyl_active_config(root, runner, allow_private=True)
         except RuntimeError:
             front_config_supported = False
             if overall == "running":
@@ -1585,7 +1669,7 @@ def apply_service_change(
             _require_front_files(root)
             if root == Path("/"):
                 _load_healthcheck(root)
-                _verify_mtproxyl_active_config(root, subprocess.run)
+                _verify_mtproxyl_active_config(root, subprocess.run, allow_private=True)
         if renderer is None:
             try:
                 healthcheck.load_policy(paths["health_policy"])
@@ -1797,9 +1881,10 @@ def collect_system_check(root: Path = Path("/"), runner: Callable[..., Any] = su
     }
     if front == "mtproxyl":
         try:
-            _verify_mtproxyl_active_config(root, runner)
+            verified = _verify_mtproxyl_active_config(root, runner, allow_private=True, include_config=True)
+            config = verified[1] if verified is not None else MTPROXY_NGINX_CONFIG
             report["mtproxyl_config"] = _command_ok(
-                [MTPROXY_NGINX_BINARY, "-t", "-c", MTPROXY_NGINX_CONFIG], runner,
+                [MTPROXY_NGINX_BINARY, "-t", "-c", config], runner,
             )
         except RuntimeError:
             report["mtproxyl_config"] = False

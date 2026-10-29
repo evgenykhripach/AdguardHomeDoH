@@ -3117,6 +3117,59 @@ class MTProxyFrontTests(unittest.TestCase):
                 self.assertNotIn(["systemctl", "reload", "mtproxyl-pq-nginx"], commands)
                 self.assertEqual("current map", map_path.read_text())
 
+    def test_private_runtime_map_reload_checks_runtime_and_effective_command(self):
+        from deploy.lib.mtproxyl_front import patch
+        from tests.test_mtproxyl_front import ADMIN, DOMAIN, REALISTIC
+        manager = load_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.build_root(directory)
+            state_path = root / "var/lib/adguardhome-doh/install.json"
+            state = json.loads(state_path.read_text())
+            state["admin_host"] = ADMIN
+            state_path.write_text(json.dumps(state))
+            (root / "proc/123/cmdline").write_bytes(
+                b"/opt/mtproxyl-nginx/sbin/nginx\0-c\0"
+                b"/run/adguardhome-doh/mtproxyl-nginx.conf\0-g\0daemon off;\0"
+            )
+            front = (ROOT / "deploy/lib/mtproxyl_front.py").read_bytes()
+            overlay = patch(REALISTIC, DOMAIN, ADMIN).encode()
+            cmd = ["/usr/bin/python3", manager.MTPROXY_RELOAD_HELPER, "reload", "--source", manager.MTPROXY_NGINX_CONFIG,
+                   "--runtime", manager.MTPROXY_RUNTIME_CONFIG, "--domain", DOMAIN, "--admin-host", ADMIN,
+                   "--nginx-bin", manager.MTPROXY_NGINX_BINARY, "--lock", manager.MTPROXY_FRONT_LOCK,
+                   "--main-pid", "$MAINPID", "--cgroup", "/system.slice/mtproxyl-pq-nginx.service"]
+            show = ("{ path=/usr/bin/python3 ; argv[]=" + " ".join(cmd) + " ; ignore_errors=no ; "
+                    "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }").encode()
+            commands = []
+            vendor_before = (root / "opt/mtproxyl-nginx/conf/nginx.conf").read_bytes()
+            def runner(command, **_kwargs):
+                commands.append(command)
+                output = show if "--property=ExecReload" in command else b"123\n"
+                return subprocess.CompletedProcess(command, 0, output, b"")
+            def read_file(path, mode):
+                if str(path).endswith("/mtproxyl_front.py"):
+                    return front
+                if str(path).endswith("/run/adguardhome-doh/mtproxyl-nginx.conf"):
+                    return overlay
+                return b"root-owned fixture"
+            under_root = manager.under_root
+            with mock.patch.object(manager, "under_root", side_effect=lambda _r, path: under_root(root, path)), \
+                 mock.patch.object(manager, "_read_root_owned", side_effect=read_file):
+                manager._reload_mtproxyl_map(Path("/"), runner)
+                self.assertIn([manager.MTPROXY_NGINX_BINARY, "-t", "-c", manager.MTPROXY_RUNTIME_CONFIG], commands)
+                self.assertIn(["systemctl", "reload", "mtproxyl-pq-nginx"], commands)
+                commands.clear()
+                show = show.replace(b"--main-pid $MAINPID", b"--main-pid 1")
+                with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                    manager._reload_mtproxyl_map(Path("/"), runner)
+                self.assertNotIn(["systemctl", "reload", "mtproxyl-pq-nginx"], commands)
+                show = show.replace(b"--main-pid 1", b"--main-pid $MAINPID")
+                overlay = REALISTIC.encode()
+                commands.clear()
+                with self.assertRaisesRegex(RuntimeError, "custom mode не поддерживается"):
+                    manager._reload_mtproxyl_map(Path("/"), runner)
+                self.assertNotIn(["systemctl", "reload", "mtproxyl-pq-nginx"], commands)
+            self.assertEqual(vendor_before, (root / "opt/mtproxyl-nginx/conf/nginx.conf").read_bytes())
+
     def test_custom_mode_blocks_live_service_change_before_stop(self):
         manager = load_manager()
         with tempfile.TemporaryDirectory() as directory:
