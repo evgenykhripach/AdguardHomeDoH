@@ -109,45 +109,81 @@ def migrate(text: str, domain: str, webroot: str) -> str:
     return "\n".join(result).rstrip("\n") + "\n"
 
 
-def ensure_reload_hook(directory: Path, domain: str) -> Path:
+def ensure_reload_hook(directory: Path, domain: str, *, front: str = "standard") -> Path:
     """Add a lineage-specific directory hook without replacing its deploy_hook."""
 
     if not re.fullmatch(r"[a-z0-9.-]+", domain):
         raise ValueError("invalid domain for renewal hook")
+    if front not in {"standard", "mtproxyl"}:
+        raise ValueError("invalid front for renewal hook")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    directory_stat = directory.lstat()
+    if (not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != os.geteuid()
+            or directory_stat.st_mode & 0o022):
+        raise ValueError("unsafe Certbot hook directory: %s" % directory)
     path = directory / "adguardhome-doh-reload"
     header = "#!/bin/sh\n" + HOOK_MARKER + "\n"
     block = re.compile(
         r'if \[ "\$\{RENEWED_LINEAGE:-\}" = (/etc/letsencrypt/live/[a-z0-9.-]+) \]; then\n'
-        r'    systemctl reload nginx\nfi\n'
+        r'    systemctl reload (nginx|adguardhome-doh-nginx)\nfi\n'
     )
     lineages = []
-    if path.is_symlink():
-        raise ValueError("refusing to overwrite an unmanaged Certbot deploy hook: %s" % path)
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
+    original_stat = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValueError("refusing to overwrite an unmanaged Certbot deploy hook: %s" % path) from exc
+    else:
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            original_stat = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(original_stat.st_mode) or original_stat.st_nlink != 1
+                    or original_stat.st_uid != os.geteuid() or original_stat.st_mode & 0o022):
+                raise ValueError("refusing to overwrite an unmanaged Certbot deploy hook: %s" % path)
+            existing = stream.read()
         remainder = existing[len(header):] if existing.startswith(header) else existing
         while remainder:
             match = block.match(remainder)
             if match is None:
                 raise ValueError("refusing to overwrite an unmanaged Certbot deploy hook: %s" % path)
-            lineages.append(match.group(1))
+            lineages.append((match.group(1), match.group(2)))
             remainder = remainder[match.end():]
         if not existing.startswith(header) or not lineages:
             raise ValueError("refusing to overwrite an unmanaged Certbot deploy hook: %s" % path)
     expected = "/etc/letsencrypt/live/" + domain
-    if expected not in lineages:
-        lineages.append(expected)
+    unit = "adguardhome-doh-nginx" if front == "mtproxyl" else "nginx"
+    if not any(lineage == expected for lineage, _ in lineages):
+        lineages.append((expected, unit))
+    else:
+        lineages = [(lineage, unit if lineage == expected else previous)
+                    for lineage, previous in lineages]
     content = header + "".join(
         'if [ "${RENEWED_LINEAGE:-}" = ' + lineage + ' ]; then\n'
-        + "    systemctl reload nginx\nfi\n" for lineage in lineages
+        + "    systemctl reload " + selected + "\nfi\n" for lineage, selected in lineages
     )
     fd, temporary = tempfile.mkstemp(prefix=".adguardhome-doh-reload.", dir=str(directory))
     try:
         os.fchmod(fd, 0o755)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(content)
+        try:
+            current_stat = path.lstat()
+        except FileNotFoundError:
+            current_stat = None
+        identity = lambda item: None if item is None else (
+            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+        )
+        if identity(current_stat) != identity(original_stat):
+            raise ValueError("Certbot deploy hook changed during preparation: %s" % path)
+        current_dir = directory.lstat()
+        if ((current_dir.st_dev, current_dir.st_ino, current_dir.st_mode,
+             current_dir.st_uid, current_dir.st_gid) !=
+                (directory_stat.st_dev, directory_stat.st_ino, directory_stat.st_mode,
+                 directory_stat.st_uid, directory_stat.st_gid)):
+            raise ValueError("Certbot hook directory changed during preparation: %s" % directory)
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -193,11 +229,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--domain", required=True)
     parser.add_argument("--webroot", required=True)
     parser.add_argument("--hook-dir", type=Path, required=True)
+    parser.add_argument("--front", choices=("standard", "mtproxyl"), default="standard")
     args = parser.parse_args(argv)
     if not args.path.is_file():
         parser.error("renewal profile is missing: %s" % args.path)
+    # The shared lineage belongs to MTProxyL; its renewal profile, webroot,
+    # and deploy hook are managed there. Add only our private nginx reload.
+    if args.front == "mtproxyl":
+        ensure_reload_hook(args.hook_dir, args.domain, front=args.front)
+        print("shared nginx renewal hook configured; renewal profile unchanged")
+        return 0
     changed = migrate_file(args.path, args.domain, args.webroot)
-    ensure_reload_hook(args.hook_dir, args.domain)
+    ensure_reload_hook(args.hook_dir, args.domain, front=args.front)
     print("certbot renewal migrated" if changed else "certbot renewal already uses webroot")
     return 0
 

@@ -159,6 +159,71 @@ class CertbotRenewalTests(unittest.TestCase):
                 module.ensure_reload_hook(Path(directory), "dns.example.com")
             self.assertIn("custom-command", hook.read_text(encoding="utf-8"))
 
+    def test_shared_lineage_keeps_existing_profiles_and_other_hooks(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "dns.example.com.conf"
+            profile.write_text(STANDALONE_PROFILE, encoding="utf-8")
+            hooks = root / "hooks"
+            hook = module.ensure_reload_hook(hooks, "other.example.com")
+            mtproxy_hook = hooks / "mtproxyl-selfmask.sh"
+            mtproxy_hook.write_text("#!/bin/sh\n# existing MTProxyL hook\n", encoding="utf-8")
+            original_hook = mtproxy_hook.read_bytes()
+            subprocess.run([
+                "python3", str(MODULE_PATH), "--path", str(profile), "--domain", "dns.example.com",
+                "--webroot", "/var/www/mtproxyl-selfmask", "--hook-dir", str(hooks),
+                "--front", "mtproxyl",
+            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(STANDALONE_PROFILE, profile.read_text(encoding="utf-8"))
+            self.assertEqual(original_hook, mtproxy_hook.read_bytes())
+            commands = root / "commands"
+            fake = root / "systemctl"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$COMMANDS"\n', encoding="utf-8")
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", COMMANDS=str(commands))
+            env["RENEWED_LINEAGE"] = "/etc/letsencrypt/live/dns.example.com"
+            subprocess.run([str(hook)], env=env, check=True)
+            env["RENEWED_LINEAGE"] = "/etc/letsencrypt/live/other.example.com"
+            subprocess.run([str(hook)], env=env, check=True)
+            self.assertEqual("reload adguardhome-doh-nginx\nreload nginx\n", commands.read_text())
+
+    def test_shared_lineage_can_change_back_without_affecting_others(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hook = module.ensure_reload_hook(root, "dns.example.com")
+            module.ensure_reload_hook(root, "other.example.com", front="mtproxyl")
+            module.ensure_reload_hook(root, "dns.example.com", front="mtproxyl")
+            shared = hook.read_text(encoding="utf-8")
+            module.ensure_reload_hook(root, "dns.example.com", front="mtproxyl")
+            self.assertEqual(shared, hook.read_text(encoding="utf-8"))
+            module.ensure_reload_hook(root, "dns.example.com", front="standard")
+            content = hook.read_text(encoding="utf-8")
+            self.assertIn("/etc/letsencrypt/live/dns.example.com ]; then\n    systemctl reload nginx", content)
+            self.assertIn("/etc/letsencrypt/live/other.example.com ]; then\n    systemctl reload adguardhome-doh-nginx", content)
+
+    def test_refuses_unsafe_hook_file_or_directory(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hook = module.ensure_reload_hook(root, "dns.example.com")
+            original = hook.read_bytes()
+            hook.chmod(0o775)
+            with self.assertRaisesRegex(ValueError, "unmanaged"):
+                module.ensure_reload_hook(root, "dns.example.com", front="mtproxyl")
+            self.assertEqual(original, hook.read_bytes())
+            hook.chmod(0o755)
+            second = root / "hardlink"
+            os.link(hook, second)
+            with self.assertRaisesRegex(ValueError, "unmanaged"):
+                module.ensure_reload_hook(root, "dns.example.com", front="mtproxyl")
+            second.unlink()
+            root.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "unsafe Certbot hook directory"):
+                module.ensure_reload_hook(root, "dns.example.com", front="mtproxyl")
+            self.assertEqual(original, hook.read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
