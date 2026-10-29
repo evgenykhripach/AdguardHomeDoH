@@ -35,9 +35,9 @@ class MasterIdentityTest(unittest.TestCase):
         fields = [state, str(ppid)] + ['0'] * 17 + [str(start)]
         (self.node / 'stat').write_text('%d (nginx: master) %s\n' % (pid, ' '.join(fields)))
 
-    def inspect(self, **overrides):
-        # The fake /proc directory is owned by the local test user, whereas a
-        # real system nginx master must be root owned.
+    def root_proc_stat(self):
+        # Synthetic /proc lives under the test user, while a real master must
+        # be root-owned. All other stat fields remain real.
         real_stat = os.stat
         def fake_stat(path, *args, **kwargs):
             value = real_stat(path, *args, **kwargs)
@@ -46,12 +46,39 @@ class MasterIdentityTest(unittest.TestCase):
                 values[4] = 0
                 return os.stat_result(values)
             return value
-        with mock.patch.object(controller.os, 'stat', side_effect=fake_stat):
+        return mock.patch.object(controller.os, 'stat', side_effect=fake_stat)
+
+    def inspect(self, **overrides):
+        with self.root_proc_stat():
             return controller.inspect_master(
                 overrides.get('pid', 123), overrides.get('binary', self.binary),
                 overrides.get('runtime', self.runtime), overrides.get('cgroup', self.cgroup),
                 proc_root=self.proc,
             )
+
+    def write_children(self, *pids):
+        path = self.node / 'task/123'
+        path.mkdir(parents=True, exist_ok=True)
+        (path / 'children').write_text(' '.join(str(pid) for pid in pids))
+
+    def write_worker(self, pid, *, ppid=123, start=457, cgroup=None, title='nginx: worker process'):
+        node = self.proc / str(pid)
+        node.mkdir(exist_ok=True)
+        fields = ['S', str(ppid)] + ['0'] * 17 + [str(start)]
+        (node / 'stat').write_text('%d (nginx: worker) %s\n' % (pid, ' '.join(fields)))
+        (node / 'cgroup').write_text('0::' + (cgroup or self.cgroup) + '\n')
+        (node / 'cmdline').write_bytes(title.encode() + b'\0')
+        if not (node / 'exe').is_symlink():
+            (node / 'exe').symlink_to(self.binary)
+
+    def capture(self, master):
+        with self.root_proc_stat():
+            return controller.capture_workers(master, proc_root=self.proc)
+
+    def confirm(self, master, baseline, probe):
+        with self.root_proc_stat():
+            return controller.confirm_generation(master, baseline, '/private/synthetic.sock', 'a' * 32,
+                                                 proc_root=self.proc, probe=probe)
 
     def test_correct_master_identity(self):
         identity = self.inspect()
@@ -114,6 +141,74 @@ class MasterIdentityTest(unittest.TestCase):
         with mock.patch.object(controller, '_read_bounded', side_effect=changing_cgroup):
             with self.assertRaises(controller.IdentityError):
                 self.inspect()
+
+    def test_new_worker_confirmation_and_stale_worker_rejection(self):
+        self.write_worker(124)
+        self.write_children(124)
+        master = self.inspect()
+        baseline = self.capture(master)
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: 124)
+        self.write_worker(125, start=458)
+        self.write_children(124, 125)
+        result = self.confirm(master, baseline, lambda *_: 125)
+        self.assertEqual((result.pid, result.ppid, result.start_ticks), (125, 123, 458))
+
+    def test_reused_pid_never_confirms_stale_marker(self):
+        self.write_worker(124)
+        self.write_children(124)
+        master = self.inspect()
+        baseline = self.capture(master)
+        self.write_worker(124, start=999)
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: 124)
+
+    def test_foreign_disappeared_or_shutting_down_worker_rejected(self):
+        self.write_worker(124)
+        self.write_children(124)
+        master = self.inspect()
+        baseline = self.capture(master)
+        self.write_worker(125, start=458, cgroup='/foreign')
+        self.write_children(124, 125)
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: 125)
+        self.write_worker(125, start=458, ppid=999)
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: 125)
+        self.write_worker(125, start=458, title='nginx: worker process is shutting down')
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: 125)
+        (self.proc / '125/stat').unlink()
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: 125)
+
+    def test_master_change_while_probe_in_flight_rejected(self):
+        self.write_worker(124)
+        self.write_children(124)
+        master = self.inspect()
+        baseline = self.capture(master)
+        self.write_worker(125, start=458)
+        self.write_children(124, 125)
+        def probe(*_):
+            self.write_stat(start=999)
+            return 125
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, probe)
+
+    def test_capture_rejects_missing_children_and_bad_probe(self):
+        self.write_children()
+        master = self.inspect()
+        with self.assertRaises(controller.IdentityError):
+            self.capture(master)
+        self.write_worker(124)
+        self.write_children(124)
+        baseline = self.capture(master)
+        def broken(*_):
+            raise OSError('missing marker')
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, broken)
+        with self.assertRaises(controller.IdentityError):
+            self.confirm(master, baseline, lambda *_: True)
 
     def test_missing_metadata_and_invalid_inputs_rejected(self):
         (self.node / 'exe').unlink()

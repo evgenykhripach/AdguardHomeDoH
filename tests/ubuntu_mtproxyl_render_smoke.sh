@@ -169,9 +169,18 @@ try:
     assert runtime.prepare(source, target, 'dns.example.com', '/usr/sbin/nginx',
                            marker_socket=marker, generation=second) == 'overlay'
     assert runtime.probe_generation(marker, first) == old_worker
+    baseline = identity.capture_workers(original)
     os.kill(master.pid, signal.SIGHUP)
-    new_worker = wait_generation(second)
-    assert new_worker != old_worker
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            new_worker = identity.confirm_generation(original, baseline, marker, second)
+            break
+        except identity.IdentityError:
+            if master.poll() is not None or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+    assert new_worker.pid != old_worker
     assert identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original
     assert source.read_bytes() == before
     assert target.stat().st_mode & 0o777 == 0o600

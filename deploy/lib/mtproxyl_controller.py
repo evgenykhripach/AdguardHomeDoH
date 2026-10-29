@@ -17,6 +17,12 @@ import shlex
 import sys
 
 
+try:
+    from . import mtproxyl_runtime as runtime
+except ImportError:
+    import mtproxyl_runtime as runtime
+
+
 class IdentityError(RuntimeError):
     """The process identity cannot be established unambiguously."""
 
@@ -149,6 +155,130 @@ def inspect_master(pid, nginx_bin, runtime_path, expected_cgroup, *, proc_root=P
     return ProcessIdentity(pid, before_ppid, before_start, boot, cgroup,
                            actual_exe.st_dev, actual_exe.st_ino, proc_uid, argv)
 
+
+
+@dataclass(frozen=True)
+class WorkerIdentity:
+    pid: int
+    ppid: int
+    start_ticks: int
+    boot_id: str
+    cgroup: str
+    exe_device: int
+    exe_inode: int
+    owner_uid: int
+
+
+@dataclass(frozen=True)
+class WorkerSnapshot:
+    master: ProcessIdentity
+    workers: frozenset[WorkerIdentity]
+
+
+def _recheck_master(master, proc_root):
+    """Re-read all fingerprint fields, not just the reusable numeric PID."""
+    try:
+        index = master.argv.index('-c')
+        config = master.argv[index + 1]
+    except (ValueError, IndexError) as exc:
+        raise IdentityError('invalid master fingerprint') from exc
+    exe = Path(proc_root) / str(master.pid) / 'exe'
+    current = inspect_master(master.pid, exe, Path(config), master.cgroup, proc_root=proc_root)
+    if current != master:
+        raise IdentityError('master incarnation changed')
+
+
+def _children(master, proc_root):
+    path = Path(proc_root) / str(master.pid) / 'task' / str(master.pid) / 'children'
+    try:
+        tokens = _read_bounded(path).decode('ascii').split()
+        if any(not re.fullmatch(r'[1-9][0-9]*', token) for token in tokens):
+            raise ValueError('invalid child PID')
+        children = tuple(sorted(int(token) for token in tokens))
+        if len(children) != len(set(children)):
+            raise ValueError('duplicate child PID')
+        return children
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise IdentityError('children metadata unavailable') from exc
+
+
+def _child_identity(pid, master, proc_root, *, require_worker=False):
+    proc_root = Path(proc_root)
+    node = proc_root / str(pid)
+    try:
+        boot = _boot_id(proc_root)
+        ppid, start = _proc_stat(_read_bounded(node / 'stat'), pid)
+        cgroup = _cgroup(_read_bounded(node / 'cgroup'))
+        executable = os.stat(node / 'exe')
+        uid = os.stat(node, follow_symlinks=False).st_uid
+        command = _read_bounded(node / 'cmdline')
+        ppid_after, start_after = _proc_stat(_read_bounded(node / 'stat'), pid)
+        cgroup_after = _cgroup(_read_bounded(node / 'cgroup'))
+        executable_after = os.stat(node / 'exe')
+        uid_after = os.stat(node, follow_symlinks=False).st_uid
+        command_after = _read_bounded(node / 'cmdline')
+        boot_after = _boot_id(proc_root)
+    except OSError as exc:
+        raise IdentityError('worker metadata unavailable') from exc
+    if ((ppid, start, cgroup, uid, command, boot) !=
+            (ppid_after, start_after, cgroup_after, uid_after, command_after, boot_after) or
+            (executable.st_dev, executable.st_ino) != (executable_after.st_dev, executable_after.st_ino)):
+        raise IdentityError('worker changed during inspection')
+    if (ppid != master.pid or cgroup != master.cgroup or boot != master.boot_id or
+            (executable.st_dev, executable.st_ino) != (master.exe_device, master.exe_inode) or
+            start < master.start_ticks):
+        raise IdentityError('worker does not belong to master')
+    if require_worker and command.replace(b'\0', b' ').strip() != b'nginx: worker process':
+        raise IdentityError('responding process is not an active nginx worker')
+    return WorkerIdentity(pid, ppid, start, boot, cgroup, executable.st_dev, executable.st_ino, uid)
+
+
+def capture_workers(master, *, proc_root=Path('/proc')):
+    """Capture all current master child incarnations, failing on any ambiguity.
+
+    The caller must serialize its own reload and capture immediately before
+    signalling. Uncoordinated external writers and signals remain a race.
+    """
+    _recheck_master(master, proc_root)
+    before = _children(master, proc_root)
+    if not before:
+        raise IdentityError('master has no observable children')
+    workers = frozenset(_child_identity(pid, master, proc_root) for pid in before)
+    if _children(master, proc_root) != before:
+        raise IdentityError('children changed during capture')
+    _recheck_master(master, proc_root)
+    return WorkerSnapshot(master, workers)
+
+
+def confirm_generation(master, old_workers, marker_socket, generation, *,
+                       proc_root=Path('/proc'), probe=None):
+    """Verify a marker response is from a new worker of the unchanged master.
+
+    This is only a point-in-time observation. Caller must hold its shared lock,
+    signal an already captured pidfd, and handle recovery on every failure.
+    """
+    if not isinstance(old_workers, WorkerSnapshot) or old_workers.master != master or not old_workers.workers:
+        raise IdentityError('invalid worker baseline')
+    _recheck_master(master, proc_root)
+    if probe is None:
+        probe = runtime.probe_generation
+    try:
+        worker_pid = probe(marker_socket, generation)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise IdentityError('generation probe failed') from exc
+    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or worker_pid <= 0:
+        raise IdentityError('invalid worker PID')
+    worker = _child_identity(worker_pid, master, proc_root, require_worker=True)
+    if any(previous.pid == worker.pid for previous in old_workers.workers):
+        # A stale response can race an exit and PID reuse before /proc is read.
+        raise IdentityError('old or reused PID cannot confirm reload')
+    if worker.pid not in _children(master, proc_root):
+        raise IdentityError('worker is not a current master child')
+    _recheck_master(master, proc_root)
+    if _child_identity(worker_pid, master, proc_root, require_worker=True) != worker:
+        raise IdentityError('worker incarnation changed')
+    _recheck_master(master, proc_root)
+    return worker
 
 def main():
     parser = argparse.ArgumentParser(description='Read-only nginx master identity check')

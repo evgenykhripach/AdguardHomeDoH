@@ -29,6 +29,8 @@ jobs:
         run: |
           sudo apt-get install -y nginx
           sudo bash tests/ubuntu_systemd_front_smoke.sh "$PWD"
+      - name: Test systemd writer cgroup recovery boundary
+        run: bash tests/ubuntu_systemd_recovery_smoke.sh
       - name: Ubuntu 26.04 installation smoke test
         run: |
           docker run --rm -v "$PWD:/repo:ro" ubuntu:26.04 \
