@@ -68,7 +68,8 @@ class AdminRenewalTests(unittest.TestCase):
             self.invoke()
         self.assertEqual(["curl", "certbot"], [call[0] for call in calls])
         self.assertEqual(["certbot", "reconfigure", "--cert-name", self.domain,
-                          "--webroot", "--webroot-path", str(self.webroot), "--non-interactive"], calls[1])
+                          "--webroot", "--webroot-path", str(self.webroot),
+                          "--preferred-challenges", "http", "--non-interactive"], calls[1])
         self.assertEqual({"PATH", "LC_ALL"}, set(environments[0]))
         self.assertEqual({"PATH", "LC_ALL", "HOME", "XDG_CONFIG_HOME"}, set(environments[1]))
         self.assertFalse(homes[0].exists())

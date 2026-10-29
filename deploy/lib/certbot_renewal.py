@@ -676,7 +676,8 @@ def reconfigure_admin_renewal(domain: str, webroot: Path, hook_dir: Path) -> Non
         environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
                        "HOME": home, "XDG_CONFIG_HOME": home}
         subprocess.run(["certbot", "reconfigure", "--cert-name", domain,
-                        "--webroot", "--webroot-path", str(webroot), "--non-interactive"],
+                        "--webroot", "--webroot-path", str(webroot),
+                        "--preferred-challenges", "http", "--non-interactive"],
                        check=True, env=environment, timeout=300)
     updated = _admin_profile_values(profile_path.read_text(encoding="utf-8"), domain)
     if (updated.get("cert") != str(cert_path) or updated.get("authenticator") != "webroot"
