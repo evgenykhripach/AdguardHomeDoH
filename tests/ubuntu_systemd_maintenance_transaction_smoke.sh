@@ -105,45 +105,74 @@ agh.write_text('original user settings\n')
 front = root / 'etc/adguardhome-doh/mtproxyl-admin-acme.conf'
 front.parent.mkdir(parents=True)
 front.write_text('original admin\n')
-backup = maintenance.snapshot(root, 'dns.example.com', translated_runner)
-baseline = maintenance.validate(backup)['units']
-assert baseline['adguardhome-doh.service']['active']
-assert baseline['mtproxyl-pq-nginx.service']['active']
-assert not baseline['adguardhome-doh-nginx.service']['active']
-agh.write_text('changed\n')
-front.write_text('changed\n')
-result = translated_runner(['systemctl', 'show', 'mtproxyl-pq-nginx.service', '--property=MainPID', '--value'], check=True, capture_output=True, text=True)
-pid = int(result.stdout.strip())
-assert pid > 1
-os.kill(pid, signal.SIGKILL)
-translated_runner(['systemctl', 'start', '--no-block', 'adguardhome-doh-nginx.service'], check=True)
-for _ in range(100):
-    failed, _ = maintenance._stoppable_state('mtproxyl-pq-nginx.service', translated_runner)
-    starting, _ = maintenance._stoppable_state('adguardhome-doh-nginx.service', translated_runner)
-    if failed['ActiveState'] == 'failed' and starting['ActiveState'] == 'activating':
-        break
-    time.sleep(.1)
-else:
-    raise RuntimeError('failed/activating test states did not appear')
+# The fake root locks are real. No maintenance worker is started by this
+# smoke; the callbacks below do not prove the production fencing protocol.
+locks_active = False
+def locks_held():
+    return locks_active
 
-groups = {}
-for unit in maintenance.UNITS:
-    state, _ = maintenance._stoppable_state(unit, translated_runner)
-    groups[unit] = state['ControlGroup']
+def no_test_worker():
+    worker = prefix + 'worker.service'
+    result = translated_runner(['systemctl', 'show', worker, '--property=LoadState', '--value'],
+                               check=True, capture_output=True, text=True)
+    return result.stdout.strip() == 'not-found'
 
-def checked_runner(argv, **kwargs):
-    # At daemon-reload restore has stopped all units, but has not started any.
-    if argv[:2] == ['systemctl', 'daemon-reload']:
-        for unit, group in groups.items():
-            state, pid = maintenance._stoppable_state(unit, translated_runner)
-            assert state['ActiveState'] in ('inactive', 'failed') and pid == 0
-            assert maintenance._cgroup_empty(group)
-    return translated_runner(argv, **kwargs)
+with maintenance.manager.operation_lock(root), maintenance.manager.health_lock(root):
+    locks_active = True
+    backup = maintenance.snapshot(root, 'dns.example.com', translated_runner)
+    baseline = maintenance.validate(backup)['units']
+    assert baseline['adguardhome-doh.service']['active']
+    assert baseline['mtproxyl-pq-nginx.service']['active']
+    assert not baseline['adguardhome-doh-nginx.service']['active']
+    adguard_before, _ = maintenance._stoppable_state('adguardhome-doh.service', translated_runner)
+    adguard_group = adguard_before['ControlGroup']
+    maintenance.yaml_mark_stopping(backup, locks_held=locks_held, writer_fenced=no_test_worker)
+    translated_runner(['systemctl', 'stop', 'adguardhome-doh.service'], check=True)
+    def adguard_stopped():
+        state, pid = maintenance._stoppable_state('adguardhome-doh.service', translated_runner)
+        return (state['ActiveState'] == 'inactive' and pid == 0
+                and maintenance._cgroup_empty(adguard_group)
+                and maintenance._cgroup_empty(state['ControlGroup']))
+    assert adguard_stopped()
+    agh.write_text('saved at stop\n')
+    checkpoint = maintenance.yaml_settle(root, backup, locks_held=locks_held,
+                                         writer_fenced=no_test_worker, adguard_stopped=adguard_stopped)
+    assert checkpoint['phase'] == 'SETTLED'
+    agh.write_text('changed\n')
+    front.write_text('changed\n')
+    result = translated_runner(['systemctl', 'show', 'mtproxyl-pq-nginx.service', '--property=MainPID', '--value'], check=True, capture_output=True, text=True)
+    pid = int(result.stdout.strip())
+    assert pid > 1
+    os.kill(pid, signal.SIGKILL)
+    translated_runner(['systemctl', 'start', '--no-block', 'adguardhome-doh-nginx.service'], check=True)
+    for _ in range(100):
+        failed, _ = maintenance._stoppable_state('mtproxyl-pq-nginx.service', translated_runner)
+        starting, _ = maintenance._stoppable_state('adguardhome-doh-nginx.service', translated_runner)
+        if failed['ActiveState'] == 'failed' and starting['ActiveState'] == 'activating':
+            break
+        time.sleep(.1)
+    else:
+        raise RuntimeError('failed/activating test states did not appear')
 
-assert maintenance.restore(root, backup, checked_runner) == []
-assert agh.read_text() == 'original user settings\n'
-assert front.read_text() == 'original admin\n'
-for unit, expected in baseline.items():
-    assert maintenance._unit_state(unit, translated_runner) == expected, unit
+    groups = {}
+    for unit in maintenance.UNITS:
+        state, _ = maintenance._stoppable_state(unit, translated_runner)
+        groups[unit] = state['ControlGroup']
+
+    def checked_runner(argv, **kwargs):
+        # At daemon-reload restore has stopped all units, but has not started any.
+        if argv[:2] == ['systemctl', 'daemon-reload']:
+            for unit, group in groups.items():
+                state, pid = maintenance._stoppable_state(unit, translated_runner)
+                assert state['ActiveState'] in ('inactive', 'failed') and pid == 0
+                assert maintenance._cgroup_empty(group)
+        return translated_runner(argv, **kwargs)
+
+    assert maintenance.restore(root, backup, checked_runner) == []
+    assert agh.read_text() == 'saved at stop\n'
+    assert front.read_text() == 'original admin\n'
+    for unit, expected in baseline.items():
+        assert maintenance._unit_state(unit, translated_runner) == expected, unit
+    locks_active = False
 print('real systemd maintenance snapshot/restore smoke: ok')
 PY

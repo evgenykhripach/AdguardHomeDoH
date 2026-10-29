@@ -77,6 +77,103 @@ def _unit_state(unit, runner):
 
 
 
+
+def _transaction_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{32}', value):
+        raise ValueError('invalid maintenance transaction identity')
+    return value
+
+
+def _systemd_properties(unit, properties, runner):
+    result = runner(['systemctl', 'show', unit, '--property=' + ','.join(properties)],
+                    check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=30)
+    values = {}
+    for line in result.stdout.splitlines():
+        if '=' not in line:
+            raise RuntimeError('invalid systemd identity response')
+        key, value = line.split('=', 1)
+        if key in values:
+            raise RuntimeError('duplicate systemd property')
+        values[key] = value
+    if set(values) != set(properties):
+        raise RuntimeError('incomplete systemd identity')
+    return values
+
+
+def _boot_id():
+    value = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if not re.fullmatch(r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}', value):
+        raise RuntimeError('invalid boot identity')
+    return value
+
+
+def _process_start(pid):
+    # comm may itself contain parentheses. Field 3 starts after the last ')'.
+    raw = Path('/proc/%d/stat' % pid).read_text()
+    end = raw.rfind(')')
+    fields = raw[end + 2:].split()
+    if end < 0 or len(fields) < 20 or fields[0] == 'Z':
+        raise RuntimeError('writer process is unavailable')
+    ticks = int(fields[19])
+    if ticks <= 0:
+        raise RuntimeError('invalid writer start time')
+    return ticks
+
+
+
+def _process_cgroup(pid):
+    lines = Path('/proc/%d/cgroup' % pid).read_text().splitlines()
+    if len(lines) != 1 or not lines[0].startswith('0::'):
+        raise RuntimeError('writer is not in a single cgroup v2 hierarchy')
+    group = lines[0][3:]
+    if not group.startswith('/') or any(part in ('', '.', '..') for part in group[1:].split('/')):
+        raise RuntimeError('invalid process cgroup')
+    return group
+
+def writer_identity(transaction, runner=subprocess.run):
+    """Read one transient writer incarnation. This does not fence or stop it."""
+    transaction = _transaction_id(transaction)
+    unit = 'adguardhome-doh-writer-' + transaction + '.service'
+    properties = ('LoadState', 'ActiveState', 'MainPID', 'ControlGroup',
+                  'InvocationID', 'Transient', 'Description')
+    value = _systemd_properties(unit, properties, runner)
+    invocation, group = value['InvocationID'], value['ControlGroup']
+    if (value['LoadState'] != 'loaded' or value['ActiveState'] != 'active'
+            or value['Transient'] != 'yes' or value['Description'] != 'DoHDNS writer ' + transaction
+            or not re.fullmatch(r'[0-9a-f]{32}', invocation) or invocation == '0' * 32
+            or not group.startswith('/') or group.split('/')[-1] != unit
+            or any(part in ('', '.', '..') for part in group[1:].split('/'))):
+        raise RuntimeError('unknown writer identity')
+    try:
+        pid = int(value['MainPID'])
+    except ValueError:
+        raise RuntimeError('invalid writer PID') from None
+    if pid <= 1:
+        raise RuntimeError('invalid writer PID')
+    boot = _boot_id()
+    started = _process_start(pid)
+    if _process_cgroup(pid) != group:
+        raise RuntimeError('writer process cgroup does not match systemd')
+    # Check both PID1 and procfs again: the PID may be reused while observed.
+    if (_systemd_properties(unit, properties, runner) != value or _boot_id() != boot
+            or _process_start(pid) != started or _process_cgroup(pid) != group):
+        raise RuntimeError('writer identity changed')
+    return {'boot_id': boot, 'unit': unit, 'cgroup': group,
+            'invocation_id': invocation, 'main_pid': pid, 'proc_starttime': started}
+
+
+def verify_watchdog_timer(transaction, runner=subprocess.run):
+    """Check timer identity only; callers must verify its recovery command too."""
+    transaction = _transaction_id(transaction)
+    base = 'adguardhome-doh-recovery-' + transaction
+    fields = ('LoadState', 'ActiveState', 'Transient', 'Description', 'Triggers')
+    value = _systemd_properties(base + '.timer', fields, runner)
+    expected = {'LoadState': 'loaded', 'ActiveState': 'active', 'Transient': 'yes',
+                'Description': 'DoHDNS recovery ' + transaction, 'Triggers': base + '.service'}
+    if value != expected:
+        raise RuntimeError('unknown recovery timer identity')
+
 def _stoppable_state(unit, runner):
     """Read current state without treating a failed activation as a baseline."""
     result = runner(['systemctl', 'show', unit,
@@ -247,7 +344,113 @@ def validate(dest):
     return data
 
 
-def restore(root, dest, runner=subprocess.run):
+
+YAML_PATH = '/opt/AdGuardHome/AdGuardHome.yaml'
+
+
+def _checkpoint_confirm(check):
+    if not callable(check) or check() is not True:
+        raise RuntimeError('YAML checkpoint safety condition failed')
+
+
+def _checkpoint_read(dest):
+    validate(dest)
+    path = dest / 'yaml-checkpoint.json'
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeError('unsafe YAML checkpoint')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            raw = stream.read(8193)
+        if len(raw) > 8192:
+            raise RuntimeError('oversized YAML checkpoint')
+    finally:
+        os.close(fd)
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.get('version') != 1 or data.get('phase') not in ('STOPPING', 'SETTLED'):
+        raise RuntimeError('invalid YAML checkpoint')
+    if data['phase'] == 'STOPPING':
+        if set(data) != {'version', 'phase'}:
+            raise RuntimeError('invalid YAML checkpoint')
+    else:
+        if (set(data) != {'version', 'phase', 'file', 'sha256', 'dev', 'ino'}
+                or not isinstance(data['file'], str)
+                or not re.fullmatch(r'yaml-settled-[a-f0-9]{32}', data['file'])
+                or not isinstance(data['sha256'], str)
+                or not re.fullmatch(r'[a-f0-9]{64}', data['sha256'])
+                or type(data['dev']) is not int or data['dev'] < 0
+                or type(data['ino']) is not int or data['ino'] <= 0):
+            raise RuntimeError('invalid YAML checkpoint')
+        source = dest / data['file']
+        info = source.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (data['dev'], data['ino'])):
+            raise RuntimeError('unsafe settled YAML identity')
+        observed = _observe(source)
+        if observed[0][:2] != (data['dev'], data['ino']) or observed[1] != data['sha256']:
+            raise RuntimeError('settled YAML checksum mismatch')
+    return data
+
+
+def yaml_mark_stopping(dest, *, locks_held, writer_fenced):
+    """Persist STOPPING before stop; caller serializes all YAML writers.
+
+    Confirmations must remain true throughout this operation. This primitive
+    does not implement or validate a systemd writer fence itself.
+    """
+    dest = Path(dest)
+    _checkpoint_confirm(locks_held)
+    _checkpoint_confirm(writer_fenced)
+    validate(dest)
+    _sync_json(dest / 'yaml-checkpoint.json', {'version': 1, 'phase': 'STOPPING'})
+    _checkpoint_read(dest)
+
+
+def yaml_settle(root, dest, *, locks_held, writer_fenced, adguard_stopped):
+    """Seal the stopped AdGuard YAML; no writer may run until publication.
+
+    STOPPING and the live YAML remain usable if this operation is interrupted.
+    A separate orchestrator must fence workers before waiting on manager locks.
+    """
+    root, dest = Path(root), Path(dest)
+    for check in (locks_held, writer_fenced, adguard_stopped):
+        _checkpoint_confirm(check)
+    if _checkpoint_read(dest)['phase'] != 'STOPPING':
+        raise RuntimeError('YAML checkpoint is not STOPPING')
+    source = manager.under_root(root, YAML_PATH)
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError('YAML is not a regular file')
+    before = _observe(source)
+    name = 'yaml-settled-' + uuid.uuid4().hex
+    target = dest / name
+    manager._copy_path(source, target)
+    if manager._path_digest(target) != before[1] or _observe(source) != before:
+        raise RuntimeError('YAML changed during checkpoint')
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _sync_dir(dest)
+    for check in (locks_held, writer_fenced, adguard_stopped):
+        _checkpoint_confirm(check)
+    if _observe(source) != before:
+        raise RuntimeError('YAML changed before checkpoint publication')
+    settled = _observe(target)
+    if settled[1] != before[1]:
+        raise RuntimeError('settled YAML changed before publication')
+    temporary = dest / ('.yaml-intent-' + uuid.uuid4().hex)
+    _sync_json(temporary, {'version': 1, 'phase': 'SETTLED', 'file': name, 'sha256': before[1],
+                           'dev': settled[0][0], 'ino': settled[0][1]})
+    try:
+        os.replace(temporary, dest / 'yaml-checkpoint.json')
+        _sync_dir(dest)
+        return _checkpoint_read(dest)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError('YAML checkpoint publication outcome ambiguous; retain intent and settled file') from exc
+
+def restore(root, dest, runner=subprocess.run, *, yaml_checkpoint=None):
     """Restore files and unit states; caller must fence writers and own locks."""
     root, dest = Path(root), Path(dest)
     expected_parent = manager.under_root(root, '/var/backups/adguardhome-doh')
@@ -255,6 +458,12 @@ def restore(root, dest, runner=subprocess.run):
     if dest.parent != expected_parent:
         raise ValueError('snapshot outside backup root')
     data = validate(dest)
+    checkpoint_exists = os.path.lexists(dest / 'yaml-checkpoint.json')
+    if yaml_checkpoint is False and checkpoint_exists:
+        raise RuntimeError('cannot ignore existing YAML checkpoint')
+    if yaml_checkpoint is True and not checkpoint_exists:
+        raise RuntimeError('YAML checkpoint is missing')
+    checkpoint = _checkpoint_read(dest) if checkpoint_exists else None
     # Even a failed or transitioning unit can own a listener. Stop every
     # loaded unit and prove its processes are gone before touching files.
     groups = {}
@@ -280,7 +489,21 @@ def restore(root, dest, runner=subprocess.run):
     # A concurrent renewal must not be undone by this transaction.
     skipped = {target for target, _, _ in manager._restore_targets(dest / 'files', root)
                if str(target.relative_to(root)).startswith('etc/letsencrypt/')}
+    if checkpoint is not None:
+        skipped.add(manager.under_root(root, YAML_PATH))
     manager._restore_backup(dest / 'files', root, skip_targets=skipped)
+    if checkpoint is not None and checkpoint['phase'] == 'SETTLED':
+        _checkpoint_read(dest)
+        target_yaml = manager.under_root(root, YAML_PATH)
+        manager._atomic_copy(dest / checkpoint['file'], target_yaml)
+        if manager._path_digest(target_yaml) != checkpoint['sha256']:
+            raise RuntimeError('settled YAML restore differs from snapshot')
+        fd = os.open(target_yaml, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _sync_dir(target_yaml.parent)
     for entry in data['extra']:
         target = manager.under_root(root, entry['path'])
         if target.is_dir() and not target.is_symlink():
