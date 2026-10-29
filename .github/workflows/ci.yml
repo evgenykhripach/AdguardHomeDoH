@@ -18,3 +18,5 @@ jobs:
           ref: ${{ github.sha }}
       - name: Exercise FDSTORE and flock on a disposable runner
         run: sudo -n bash tests/ubuntu_systemd_fdstore_smoke.sh
+      - name: Exercise independent rollback timer on disposable files
+        run: sudo -n bash tests/ubuntu_systemd_maintenance_smoke.sh
