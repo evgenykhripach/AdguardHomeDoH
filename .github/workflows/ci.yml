@@ -1,0 +1,20 @@
+name: Systemd FDSTORE experiment
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fdstore-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Exercise FDSTORE and flock on a disposable runner
+        run: sudo -n bash tests/ubuntu_systemd_fdstore_smoke.sh
