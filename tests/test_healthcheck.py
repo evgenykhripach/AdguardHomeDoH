@@ -630,7 +630,7 @@ class HealthcheckTests(unittest.TestCase):
                 self.assertTrue(api.records[("healthy-shared.example", ip)]["enabled"])
                 updates = [body for method, path, body in api.calls if path == "/control/rewrite/update"]
                 self.assertEqual([{"target": {"domain": "bad.example", "answer": ip},
-                                   "update": {"enabled": False}}], updates)
+                                   "update": {"domain": "bad.example", "answer": ip, "enabled": False}}], updates)
 
                 recovery.add("partial.example")
                 for _ in range(health.SUCCESS_THRESHOLD - 1):
