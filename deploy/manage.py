@@ -181,7 +181,9 @@ MTPROXY_NGINX_BINARY = "/opt/mtproxyl-nginx/sbin/nginx"
 MTPROXY_NGINX_CONFIG = "/opt/mtproxyl-nginx/conf/nginx.conf"
 MTPROXY_RUNTIME_CONFIG = "/run/adguardhome-doh/mtproxyl-nginx.conf"
 MTPROXY_RELOAD_HELPER = "/usr/local/libexec/adguardhome-doh/mtproxyl_reload.py"
-MTPROXY_FRONT_LOCK = "/run/lock/adguardhome-doh-front.lock"
+# /run/lock is commonly world-writable; the runtime builder requires the
+# immediate lock directory to be root-owned and not group/world-writable.
+MTPROXY_FRONT_LOCK = "/run/adguardhome-doh/front.lock"
 MTPROXY_HELPERS = tuple("/usr/local/libexec/adguardhome-doh/" + name for name in (
     "mtproxyl_front.py", "mtproxyl_runtime.py", "mtproxyl_controller.py", "mtproxyl_reload.py"))
 FRONT_OVERLAY_FILES = (

@@ -42,6 +42,18 @@ class StartupTest(unittest.TestCase):
         self.assertEqual(self.target.read_text(), front.patch(REALISTIC, DOMAIN, ADMIN))
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o600)
 
+    def test_lock_requires_private_immediate_directory(self):
+        shared = self.root / 'shared'
+        private = self.root / 'private'
+        shared.mkdir(mode=0o777)
+        shared.chmod(0o1777)
+        private.mkdir(mode=0o700)
+        self.lock = shared / 'front.lock'
+        with self.assertRaises(ValueError):
+            self.run_prepare()
+        self.lock = private / 'front.lock'
+        self.assertEqual(self.run_prepare(), 'overlay')
+
     def test_invalid_vendor_uses_validated_previous(self):
         old = self.target.read_bytes()
         self.source.write_text('broken')
