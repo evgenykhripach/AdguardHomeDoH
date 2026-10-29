@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only process identity checks for a future MTProxyL runtime controller.
+"""MTProxyL nginx identity checks and guarded reload primitives.
 
-This module deliberately does not send signals or change configuration. A
-reload controller additionally requires a durable journal, a shared lock, a
-mandatory recovery entrypoint, and acknowledgement from a new nginx worker.
-PID observations alone are not a reload confirmation. Linux /proc and cgroup
-v2 are required; unsupported systems fail closed.
+The guarded reload sends HUP only after a caller provides a durable journal,
+holds the shared lock and supplies recovery and business-verification callbacks.
+It is not an installer or an independent crash watchdog. Linux /proc and
+cgroup v2 are required; unsupported systems fail closed.
 """
 import argparse
 import hashlib

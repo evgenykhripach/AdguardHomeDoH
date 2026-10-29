@@ -142,6 +142,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from deploy.lib import mtproxyl_controller as identity
 from deploy.lib import mtproxyl_runtime as runtime
+from deploy.lib import mtproxyl_journal as journal_module
 
 root = Path('/tmp/shared-front/generation')
 root.mkdir(mode=0o700)
@@ -186,45 +187,6 @@ try:
             time.sleep(0.05)
     assert new_worker.pid != old_worker
     assert identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original
-    backups = {}
-
-    def record(item):
-        backup = root / ('backup-' + item.transaction_id)
-        with backup.open('xb') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(item.previous_identity[-1])
-            stream.flush()
-            os.fsync(stream.fileno())
-        journal = root / ('journal-' + item.transaction_id)
-        with journal.open('x') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            json.dump({'id': item.transaction_id, 'old': item.previous_generation,
-                       'new': item.next_generation, 'candidate_sha256': item.candidate_sha256}, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        backups[item.transaction_id] = backup
-        return identity.JournalReceipt(item.transaction_id, True)
-
-    def restore(item):
-        staged = root / ('restore-' + item.transaction_id)
-        with staged.open('xb') as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(backups[item.transaction_id].read_bytes())
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(staged, target)
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        return item.previous_generation
-
     def selfmask(_record, _worker):
         context = ssl.create_default_context()
         with socket.create_connection(('127.0.0.1', 8444), timeout=3) as raw:
@@ -238,23 +200,120 @@ try:
                     response += chunk
         return b'200 OK' in response and response.endswith(b'selfmask-ok\n')
 
+    def master_check(record):
+        return (record.master == original and
+                identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup) == original)
+
+    def terminal_business(record, generation):
+        worker_pid = runtime.probe_generation(marker, generation)
+        worker = identity._child_identity(worker_pid, original, Path('/proc'), require_worker=True)
+        return master_check(record) and selfmask(record, worker)
+
+    # TEST STUB ONLY: no non-cooperating vendor-writer barrier is implemented.
+    def barrier_stub():
+        return True
+
+    print('journal smoke: writer barrier is a TEST STUB, not production proof')
+    journal_dir = root / 'journal'
+    journal_dir.mkdir(mode=0o700)
     lock_path = root / 'front.lock'
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    try:
-        common = dict(source=source, runtime_path=target, domain='dns.example.com',
-                      nginx_bin='/usr/sbin/nginx', marker_socket=marker, master=original,
-                      lock_fd=lock_fd, lock_path=lock_path, record_before_publish=record,
-                      restore_previous=restore, verify_previous=selfmask, timeout=10)
-        next_generation = identity.strict_reload(previous_generation=second,
-                                                  verify_business=selfmask, **common)
+    def create_journal(fd):
+        return journal_module.Journal(journal_dir, lock_fd=fd, lock_path=lock_path,
+                                      barrier=barrier_stub, master=master_check)
+
+    def strict(journal, fd, previous_generation, verify_business, record_callback=None):
+        captured = []
+        def record(item):
+            captured.append(item)
+            if record_callback is not None:
+                return record_callback(journal, item)
+            return journal.record_before_publish(item)
+        args = dict(source=source, runtime_path=target, domain='dns.example.com',
+                    nginx_bin='/usr/sbin/nginx', marker_socket=marker, master=original,
+                    lock_fd=fd, lock_path=lock_path, record_before_publish=record,
+                    restore_previous=journal.restore_previous, verify_previous=selfmask, timeout=10)
         try:
-            identity.strict_reload(previous_generation=next_generation,
-                                   verify_business=lambda *_: False, **common)
-            raise AssertionError('failed verification accepted')
+            result = identity.strict_reload(previous_generation=previous_generation,
+                                            verify_business=verify_business, **args)
+            return result, captured[0]
         except identity.ReloadFailed:
-            pass
-        assert len(list(root.glob('journal-*'))) == 2
+            return None, captured[0]
+
+    def confirm_restored(journal, record, fd):
+        assert journal.restore_previous(record) == record.previous_generation
+        assert journal.restore_previous(record) == record.previous_generation  # idempotent
+        baseline = identity._capture_stable_workers(original, fd, lock_path,
+                                                    proc_root=Path('/proc'), timeout=10)
+        identity._signal_checked(original, fd, lock_path)
+        worker = identity._wait_generation(original, baseline, marker, record.previous_generation,
+                                           fd, lock_path, proc_root=Path('/proc'), timeout=10)
+        assert selfmask(record, worker)
+        journal.confirm_rollback(record, business=terminal_business)
+        journal.retire(record, business=terminal_business)
+        assert not (journal_dir / 'intent.json').exists()
+
+    try:
+        journal = create_journal(lock_fd)
+        next_generation, first_record = strict(journal, lock_fd, second, selfmask)
+        assert next_generation == first_record.next_generation
+        journal.commit(first_record, business=terminal_business)
+        journal.retire(first_record, business=terminal_business)
+        assert not (journal_dir / 'intent.json').exists()
+
+        failed, second_record = strict(journal, lock_fd, next_generation, lambda *_: False)
+        assert failed is None
+        assert journal.read_pending(second_record)['phase'] == 'RESTORED_FILE'
+        journal.confirm_rollback(second_record, business=terminal_business)
+        journal.retire(second_record, business=terminal_business)
+        assert not (journal_dir / 'intent.json').exists()
+        print('journal strict commit/retire and rollback/retire: ok')
+
+        def crash_transaction(kind, previous_generation):
+            # Parent releases its lock; child owns a distinct lock description.
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            child = os.fork()
+            if child == 0:
+                try:
+                    os.close(lock_fd)
+                    child_fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+                    fcntl.flock(child_fd, fcntl.LOCK_EX)
+                    child_journal = create_journal(child_fd)
+                    if kind == 'prepared':
+                        def die_after_prepared(j, item):
+                            j.record_before_publish(item)
+                            os.kill(os.getpid(), signal.SIGKILL)
+                        strict(child_journal, child_fd, previous_generation, selfmask,
+                               record_callback=die_after_prepared)
+                    elif kind == 'restore-rename':
+                        actual_replace = os.replace
+                        def die_after_restore(src, dst, *args, **kwargs):
+                            actual_replace(src, dst, *args, **kwargs)
+                            if (isinstance(src, str) and '.restore-' in src and
+                                    dst == target.name):
+                                os.kill(os.getpid(), signal.SIGKILL)
+                        journal_module.os.replace = die_after_restore
+                        strict(child_journal, child_fd, previous_generation, lambda *_: False)
+                    os._exit(97)
+                except BaseException:
+                    os._exit(98)
+            _, status = os.waitpid(child, 0)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, (kind, status)
+            fresh = create_journal(lock_fd)
+            pending = fresh.inspect_pending()
+            expected_phase = 'PREPARED' if kind == 'prepared' else 'RESTORE_READY'
+            assert pending['phase'] == expected_phase, (kind, pending['phase'])
+            fresh_master = identity.inspect_master(master.pid, '/usr/sbin/nginx', target, cgroup)
+            assert fresh_master == original
+            rebuilt = fresh.reconstruct(fresh_master)
+            assert rebuilt.previous_generation == previous_generation
+            confirm_restored(fresh, rebuilt, lock_fd)
+            print('journal %s SIGKILL, reconstruct and idempotent recovery: ok' % kind)
+
+        crash_transaction('prepared', next_generation)
+        crash_transaction('restore-rename', next_generation)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
